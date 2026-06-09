@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com>
 /*
  * Virtual DualSense host controller frontend.
@@ -96,6 +96,7 @@ struct vds_hcd_dev {
 	u64 next_sequence;
 	ktime_t next_iso_out_ready;
 	ktime_t next_iso_in_ready;
+	ktime_t next_hid_in_ready;
 	u32 event_count;
 	u32 status_flags;
 	u32 port_status;
@@ -361,6 +362,17 @@ static bool vds_queue_urb_giveback_locked(struct vds_hcd_dev *dev,
 				return true;
 			}
 		}
+	} else {
+		struct vds_urb_context *pos;
+
+		list_for_each_entry(pos, &dev->completed_urbs, list) {
+			if (!pos->ready_time)
+				continue;
+			if (ktime_after(pos->ready_time, context->ready_time)) {
+				list_add_tail(&context->list, &pos->list);
+				return true;
+			}
+		}
 	}
 
 	list_add_tail(&context->list, &dev->completed_urbs);
@@ -545,51 +557,82 @@ static void vds_fill_hid_in_urb(struct urb *urb, const u8 *payload, u32 length)
 	urb->actual_length = copy_len;
 }
 
-static int vds_queue_or_complete_input(struct vds_hcd_dev *dev,
-				       const u8 *payload, u32 length)
+static void vds_schedule_hid_in_giveback_locked(struct vds_hcd_dev *dev,
+						struct vds_urb_context *context)
+{
+	const struct vds_controller_profile *profile =
+		vds_usb_device_profile(&dev->usb);
+	ktime_t now = ktime_get();
+	ktime_t base = ktime_after(dev->next_hid_in_ready, now) ?
+			       dev->next_hid_in_ready :
+			       now;
+
+	context->ready_time = ktime_add_us(base, profile->hid_in_interval_us);
+	dev->next_hid_in_ready = context->ready_time;
+}
+
+static bool vds_complete_pending_input_locked(struct vds_hcd_dev *dev,
+					      const u8 *payload, u32 length,
+					      bool *wake_giveback)
+{
+	struct vds_urb_context *pending;
+
+	if (list_empty(&dev->pending_hid_in))
+		return false;
+
+	pending = list_first_entry(&dev->pending_hid_in, struct vds_urb_context,
+				   list);
+	vds_fill_hid_in_urb(pending->urb, payload, length);
+	vds_schedule_hid_in_giveback_locked(dev, pending);
+	*wake_giveback |= vds_queue_urb_giveback_locked(dev, pending, 0);
+	return true;
+}
+
+static int vds_queue_input_packet_locked(struct vds_hcd_dev *dev,
+					 const u8 *payload, u32 length)
 {
 	struct vds_input_packet *packet;
+
+	/* Keep at most 32 HID IN reports without a pending URB. */
+	if (dev->input_packet_count >= 32)
+		return -ENOSPC;
+
+	packet = kmalloc_obj(*packet, GFP_ATOMIC);
+	if (!packet)
+		return -ENOMEM;
+
+	packet->length = length;
+	memcpy(packet->payload, payload, length);
+	list_add_tail(&packet->list, &dev->input_packets);
+	dev->input_packet_count++;
+	return 0;
+}
+
+static int vds_write_input_frame(struct vds_hcd_dev *dev, const u8 *payload,
+				 u32 length)
+{
 	unsigned long flags;
 	bool wake_giveback = false;
+	int ret = 0;
 
 	if (!length || length > VDS_CONTROLLER_HID_PACKET_SIZE)
 		return -EINVAL;
 
 	spin_lock_irqsave(&dev->lock, flags);
 	if (dev->stopping) {
-		spin_unlock_irqrestore(&dev->lock, flags);
-		return -ESHUTDOWN;
+		ret = -ESHUTDOWN;
+	} else if (!vds_complete_pending_input_locked(dev, payload, length,
+						      &wake_giveback)) {
+		ret = vds_queue_input_packet_locked(dev, payload, length);
 	}
-	if (!list_empty(&dev->pending_hid_in)) {
-		struct vds_urb_context *pending =
-			list_first_entry(&dev->pending_hid_in,
-					 struct vds_urb_context, list);
-
-		vds_fill_hid_in_urb(pending->urb, payload, length);
-		wake_giveback = vds_queue_urb_giveback_locked(dev, pending, 0);
-	} else {
-		/* Keep at most 32 HID IN reports without a pending URB. */
-		if (dev->input_packet_count >= 32) {
-			spin_unlock_irqrestore(&dev->lock, flags);
-			return -ENOSPC;
-		}
-		packet = kmalloc(sizeof(*packet), GFP_ATOMIC);
-		if (!packet) {
-			spin_unlock_irqrestore(&dev->lock, flags);
-			return -ENOMEM;
-		}
-		packet->length = length;
-		memcpy(packet->payload, payload, length);
-		list_add_tail(&packet->list, &dev->input_packets);
-		dev->input_packet_count++;
-	}
-	dev->frames_from_user++;
+	if (!ret)
+		dev->frames_from_user++;
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	if (wake_giveback)
 		wake_up_interruptible(&dev->giveback_wq);
 
-	return 0;
+	return ret;
 }
 
 static int vds_fill_feature_urb(struct urb *urb, const u8 *payload, u32 length)
@@ -604,26 +647,15 @@ static int vds_fill_feature_urb(struct urb *urb, const u8 *payload, u32 length)
 	return 0;
 }
 
-static int vds_queue_or_complete_feature_reply(struct vds_hcd_dev *dev,
-					       const u8 *payload, u32 length)
+static void vds_complete_pending_feature_replies_locked(struct vds_hcd_dev *dev,
+							const u8 *payload,
+							u32 length,
+							bool *wake_giveback)
 {
 	struct vds_urb_context *context, *tmp;
-	unsigned long flags;
-	bool wake_giveback = false;
 	u8 report_id;
-	int ret;
-
-	ret = vds_usb_device_update_feature_reply(&dev->usb, payload, length);
-	if (ret)
-		return ret;
 
 	report_id = payload[0];
-	spin_lock_irqsave(&dev->lock, flags);
-	if (dev->stopping) {
-		spin_unlock_irqrestore(&dev->lock, flags);
-		return -ESHUTDOWN;
-	}
-
 	list_for_each_entry_safe(context, tmp, &dev->pending_feature_get,
 				 list) {
 		int status;
@@ -632,9 +664,29 @@ static int vds_queue_or_complete_feature_reply(struct vds_hcd_dev *dev,
 			continue;
 
 		status = vds_fill_feature_urb(context->urb, payload, length);
-		wake_giveback |=
+		*wake_giveback |=
 			vds_queue_urb_giveback_locked(dev, context, status);
 	}
+}
+
+static int vds_write_feature_reply(struct vds_hcd_dev *dev, const u8 *payload,
+				   u32 length)
+{
+	unsigned long flags;
+	bool wake_giveback = false;
+	int ret;
+
+	ret = vds_usb_device_update_feature_reply(&dev->usb, payload, length);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&dev->lock, flags);
+	if (dev->stopping) {
+		spin_unlock_irqrestore(&dev->lock, flags);
+		return -ESHUTDOWN;
+	}
+	vds_complete_pending_feature_replies_locked(dev, payload, length,
+						    &wake_giveback);
 	dev->frames_from_user++;
 	spin_unlock_irqrestore(&dev->lock, flags);
 
@@ -675,10 +727,9 @@ static ssize_t vds_write(struct file *file, const char __user *buf,
 	}
 
 	if (header.type == VDS_FRAME_USB_HID_IN) {
-		ret = vds_queue_or_complete_input(dev, payload, header.length);
+		ret = vds_write_input_frame(dev, payload, header.length);
 	} else if (header.type == VDS_FRAME_USB_FEATURE_REPLY) {
-		ret = vds_queue_or_complete_feature_reply(dev, payload,
-							  header.length);
+		ret = vds_write_feature_reply(dev, payload, header.length);
 	}
 
 	kfree(payload);
@@ -715,6 +766,7 @@ static void vds_set_connection(struct vds_hcd_dev *dev, bool connected)
 		vds_flush_buffered_frames_locked(dev);
 		dev->next_iso_out_ready = 0;
 		dev->next_iso_in_ready = 0;
+		dev->next_hid_in_ready = 0;
 		vds_status_set_locked(dev,
 				      VDS_STATUS_CONNECTED |
 					      VDS_STATUS_CONFIGURED |
@@ -947,6 +999,7 @@ static int vds_interrupt_in_urb(struct vds_hcd_dev *dev, struct urb *urb,
 	packet = vds_pop_input_packet_locked(dev);
 	if (packet) {
 		vds_fill_hid_in_urb(urb, packet->payload, packet->length);
+		vds_schedule_hid_in_giveback_locked(dev, context);
 		kfree(packet);
 		spin_unlock_irqrestore(&dev->lock, flags);
 		return 0;
@@ -1230,6 +1283,7 @@ static int vds_hcd_start(struct usb_hcd *hcd)
 	dev->stopping = false;
 	dev->next_iso_out_ready = 0;
 	dev->next_iso_in_ready = 0;
+	dev->next_hid_in_ready = 0;
 	dev->port_status = USB_PORT_STAT_POWER;
 	vds_status_set_locked(dev, VDS_STATUS_CONNECTED, false);
 	spin_unlock_irqrestore(&dev->lock, flags);
@@ -1418,5 +1472,5 @@ module_exit(vds_hcd_exit);
 
 MODULE_DESCRIPTION("Virtual DualSense host controller");
 MODULE_AUTHOR("Jihong Min <hurryman2212@gmail.com>");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("Dual MIT/GPL");
 MODULE_VERSION(VDS_VERSION);

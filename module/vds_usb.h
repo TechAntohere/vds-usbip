@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com> */
 #ifndef VDS_USB_H
 #define VDS_USB_H

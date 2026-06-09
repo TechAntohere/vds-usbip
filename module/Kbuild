@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: MIT
 obj-m += vds_hcd.o
 
 vds_hcd-y := vds_hcd_core.o vds_usb_core.o dualsense.o dualsense_edge.o

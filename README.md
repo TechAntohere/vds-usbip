@@ -4,30 +4,15 @@
 
 Linux virtual USB-to-Bluetooth bridge for DualSense and DualSense Edge Wireless
 Controllers, focused on USB-only features such as 4-channel audio-based haptic
-feedback and adaptive triggers, but not limited to them. Currently, all
-USB-based features are supported except headset output, microphone input, and
-firmware updates (firmware updates are not possible).
+feedback, but not limited to it. Currently, all USB-based features are
+supported except headset output, microphone input, and firmware updates
+(firmware updates are not possible).
 
 Detailed DualSense output and haptics packet handling is based on
 [DS5Dongle](https://github.com/awalol/DS5Dongle) and protocol capture research.
 In theory, other physical gamepad controllers could be implemented as vDS
 backends and attached to vDS, as long as they can provide the
 DualSense-specific features required by games.
-
-> [!WARNING]
-> This project is still in development. Performance has not been tuned, and
-> race conditions may still exist. Many components currently run in userspace,
-> so continuous context switching can add significant overhead.
->
-> ```text
-> Application
->   -> Userspace audio server (e.g. PipeWire)
->   -(ALSA PCM)-> Linux ALSA stack [snd-usb-audio.ko]
->   -(USB isochronous OUT URBs)-> **Linux USB stack [vds_hcd.ko]**
->   **-(/dev/vdsX)-> vdsd (implements raw Bluetooth HID handling)**
->   **-(AF_BLUETOOTH L2CAP socket)->** Linux Bluetooth stack
->   -(Bluetooth HID Control/Interrupt)-> DualSense (Edge) controller
-> ```
 
 This project includes a custom virtual USB HCD primarily because Linux's
 `dummy_hcd` module does not support isochronous transfers, which are required
@@ -36,7 +21,17 @@ hosts the `/dev/vdsX` bridge and virtual port lifecycle, but that architecture
 may be revisited if `dummy_hcd` gains suitable isochronous transfer support.
 The current architecture should therefore be treated as temporary. Future work
 will move more of the bridge from userspace into the kernel to reduce
-context-switching overhead.
+context-switching overhead from the current flow:
+
+```text
+Application
+  -> Userspace audio server (e.g. PipeWire)
+  -(ALSA PCM)-> Linux ALSA stack [snd-usb-audio.ko]
+  -(USB isochronous OUT URBs)-> **Linux USB stack [vds_hcd.ko]**
+  **-(/dev/vdsX)-> vdsd (implements raw Bluetooth HID handling)**
+  **-(AF_BLUETOOTH L2CAP socket)->** Linux Bluetooth stack
+  -(Bluetooth HID Control/Interrupt)-> DualSense (Edge) controller
+```
 
 Currently, the virtual USB HID polling intervals match each controller's USB
 HID specification: DualSense HID IN/OUT run at 250 Hz, while DualSense Edge HID
@@ -171,11 +166,42 @@ Configure the virtual controller audio output as 48 kHz 4-channel S16_LE PCM.
 The exact setup differs by audio stack, such as PipeWire, PulseAudio, ALSA, or
 JACK.
 
-For PipeWire/WirePlumber, install the included rule:
+For PipeWire/WirePlumber, set the controller card profile to `pro-audio`.
+Find the WirePlumber device id:
+
+```sh
+wpctl status
+```
+
+List the available profile indexes for that device:
+
+```sh
+pw-cli e <device-id> EnumProfile | awk '/Profile:index/{getline; idx=$2} /Profile:name/{getline; gsub(/"/, "", $2); print idx, $2}'
+```
+
+Set the `pro-audio` profile:
+
+```sh
+wpctl set-profile <device-id> <pro-audio-profile-index>
+```
+
+> [!WARNING]
+> The microphone/source node is disabled on purpose. vDS currently supports
+> controller speaker and haptics output, but not microphone input. If
+> WirePlumber, games, or tools such as `pavucontrol` open the capture endpoint,
+> the extra USB audio traffic can disrupt controller speaker and haptics
+> output, as well as main audio playback. Each system needs an audio-stack
+> specific setting like the one below to disable the controller capture/source
+> endpoint.
+
+After setting the `pro-audio` profile, install the included PipeWire/WirePlumber
+rule. It gives the virtual controller stable display names, sets the output
+node to 4 channels, disables channelmix normalization, disables the unsupported
+microphone source node, and lowers its priority:
 
 ```sh
 mkdir -p ~/.config/wireplumber/wireplumber.conf.d
-cp 99-vds-dualsense.conf ~/.config/wireplumber/wireplumber.conf.d/
+cp 99-vds-dualsense-wireplumber.conf ~/.config/wireplumber/wireplumber.conf.d/
 ```
 
 Restart the user audio services after changing this file:
@@ -184,12 +210,19 @@ Restart the user audio services after changing this file:
 systemctl --user restart pipewire pipewire-pulse wireplumber
 ```
 
-> [!IMPORTANT]
-> The microphone/source node is disabled on purpose. vDS currently supports
-> controller speaker and haptics output, but not microphone input. If
-> WirePlumber, games, or tools such as `pavucontrol` open the capture endpoint,
-> the extra USB audio traffic can disrupt controller speaker and haptics
-> output. Disabling the source node avoids that conflict.
+## Input Setup
+
+This step may not be strictly required on every system, but `vds_hcd` is a
+platform controller. Without an override, a DualSense touchpad connected through
+vDS can be classified as an `internal` touchpad instead of an `external`
+touchpad like a USB-connected controller. Install the included udev rule so the
+virtual controller touchpad is classified like the real USB controller:
+
+```sh
+sudo cp 99-vds-dualsense-udev.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=input
+```
 
 ## Testing
 

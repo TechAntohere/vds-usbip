@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com> */
 #ifndef VDS_CONTROLLER_H
 #define VDS_CONTROLLER_H
@@ -48,6 +48,7 @@ struct vds_controller_profile {
 	u8 audio_in_endpoint;
 	u8 hid_in_endpoint;
 	u8 hid_out_endpoint;
+	u32 hid_in_interval_us;
 	u8 speaker_feature_unit;
 	u8 mic_feature_unit;
 };

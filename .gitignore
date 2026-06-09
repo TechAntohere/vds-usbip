@@ -5,6 +5,7 @@
 !/LICENSE
 !/README.md
 !/*.conf
+!/*.rules
 
 !/include/
 !/include/**/

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com> */
 #ifndef _UAPI_VDS_H
 #define _UAPI_VDS_H
