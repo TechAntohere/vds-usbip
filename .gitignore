@@ -4,6 +4,7 @@
 !/CMakeLists.txt
 !/LICENSE
 !/README.md
+!/*.conf
 
 !/include/
 !/include/**/

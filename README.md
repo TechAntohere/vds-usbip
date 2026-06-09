@@ -5,8 +5,8 @@
 Linux virtual USB-to-Bluetooth bridge for DualSense and DualSense Edge Wireless
 Controllers, focused on USB-only features such as 4-channel audio-based haptic
 feedback and adaptive triggers, but not limited to them. Currently, all
-USB-based features are supported except the microphone and firmware updates
-(not possible).
+USB-based features are supported except headset output, microphone input, and
+firmware updates (firmware updates are not possible).
 
 Detailed DualSense output and haptics packet handling is based on
 [DS5Dongle](https://github.com/awalol/DS5Dongle) and protocol capture research.
@@ -144,11 +144,6 @@ sudo vdsctl attach aa:bb:cc:dd:ee:01 --identity ds5 --limit-dev /dev/vds0
 sudo vdsctl attach aa:bb:cc:dd:ee:02 --identity dse --limit-dev /dev/vds1
 ```
 
-> [!IMPORTANT]
-> Configure the virtual controller audio device as 48 kHz 4-channel S16_LE PCM.
-> The exact setup differs by audio stack, such as PipeWire, PulseAudio, ALSA, or
-> JACK.
-
 List persistent bindings:
 
 ```sh
@@ -169,6 +164,32 @@ Detach each binding:
 ```sh
 sudo vdsctl detach aa:bb:cc:dd:ee:XX
 ```
+
+## Audio Setup
+
+Configure the virtual controller audio output as 48 kHz 4-channel S16_LE PCM.
+The exact setup differs by audio stack, such as PipeWire, PulseAudio, ALSA, or
+JACK.
+
+For PipeWire/WirePlumber, install the included rule:
+
+```sh
+mkdir -p ~/.config/wireplumber/wireplumber.conf.d
+cp 99-vds-dualsense.conf ~/.config/wireplumber/wireplumber.conf.d/
+```
+
+Restart the user audio services after changing this file:
+
+```sh
+systemctl --user restart pipewire pipewire-pulse wireplumber
+```
+
+> [!IMPORTANT]
+> The microphone/source node is disabled on purpose. vDS currently supports
+> controller speaker and haptics output, but not microphone input. If
+> WirePlumber, games, or tools such as `pavucontrol` open the capture endpoint,
+> the extra USB audio traffic can disrupt controller speaker and haptics
+> output. Disabling the source node avoids that conflict.
 
 ## Testing
 

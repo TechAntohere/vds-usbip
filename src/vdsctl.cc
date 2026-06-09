@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "unique_fd.hh"
+#include "vds_build_version.hh"
 #include "vds_config.hh"
 
 namespace {
@@ -25,8 +26,8 @@ namespace {
 constexpr const char *kDefaultControlSocket = "/run/vdsd.sock";
 
 void usage() {
-  std::cerr << "vdsctl (" << VDS_VERSION
-            << "): vDS management utility - Copyright (C) " << VDS_BUILD_YEAR
+  std::cerr << "vdsctl (" << vds::kVersion
+            << "): vDS management utility - Copyright (C) " << vds::kBuildYear
             << " Jihong Min\n"
             << "usage:\n"
             << "  vdsctl attach <bt-address> [--identity ds5|dse] "

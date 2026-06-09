@@ -38,6 +38,21 @@ constexpr std::size_t kSpeakerBlockOffset = 142;
 constexpr std::size_t kSpeakerDataOffset = 144;
 constexpr int kSpeakerOpusBitrate = kSpeakerOpusSize * 8 * 100;
 constexpr std::uint8_t kBtHapticsAudioBufferLength = 128;
+constexpr std::size_t kOutputFlag0Offset = 0;
+constexpr std::size_t kOutputFlag1Offset = 1;
+constexpr std::size_t kOutputHeadphoneVolumeOffset = 4;
+constexpr std::size_t kOutputSpeakerVolumeOffset = 5;
+constexpr std::size_t kOutputAudioControlOffset = 7;
+constexpr std::size_t kOutputAudioControl2Offset = 37;
+constexpr std::uint8_t kOutputFlag0HeadphoneVolumeEnable = 0x10;
+constexpr std::uint8_t kOutputFlag0SpeakerVolumeEnable = 0x20;
+constexpr std::uint8_t kOutputFlag0AudioControlEnable = 0x80;
+constexpr std::uint8_t kOutputFlag1AudioControl2Enable = 0x80;
+constexpr std::uint8_t kOutputHeadphoneVolumeMax = 0x7f;
+constexpr std::uint8_t kOutputSpeakerVolumeMax = 0x64;
+constexpr std::uint8_t kOutputPathHeadphones = 0x00;
+constexpr std::uint8_t kOutputPathSpeaker = 0x30;
+constexpr std::uint8_t kOutputSpeakerPreampGain = 0x02;
 constexpr DsState kInitialDsState{
     0xfd, 0xf7, 0x00, 0x00, 0x7f, 0x64, 0xff, 0x09, 0x00, 0x0f, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -272,6 +287,33 @@ bool DsOutputState::apply_usb_output_report(
     copy_state_bytes(state_, update,
                      offsetof(vds_set_state_data, rumble_emulation_right), 2);
   }
+  if (decoded.allow_headphone_volume) {
+    state_[kOutputFlag0Offset] |= kOutputFlag0HeadphoneVolumeEnable;
+    copy_state_bytes(state_, update,
+                     offsetof(vds_set_state_data, volume_headphones),
+                     sizeof(decoded.volume_headphones));
+  }
+  if (decoded.allow_speaker_volume) {
+    state_[kOutputFlag0Offset] |= kOutputFlag0SpeakerVolumeEnable;
+    copy_state_bytes(state_, update,
+                     offsetof(vds_set_state_data, volume_speaker),
+                     sizeof(decoded.volume_speaker));
+  }
+  if (decoded.allow_audio_control) {
+    state_[kOutputFlag0Offset] |= kOutputFlag0AudioControlEnable;
+    copy_state_bytes(state_, update, kOutputAudioControlOffset, 1);
+  }
+  if (decoded.allow_audio_control2) {
+    state_[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
+    copy_state_bytes(state_, update, kOutputAudioControl2Offset, 1);
+  }
+  if (decoded.allow_speaker_volume && decoded.volume_speaker != 0) {
+    state_[kOutputFlag0Offset] |=
+        kOutputFlag0AudioControlEnable | kOutputFlag0SpeakerVolumeEnable;
+    state_[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
+    state_[kOutputAudioControlOffset] = kOutputPathSpeaker;
+    state_[kOutputAudioControl2Offset] = kOutputSpeakerPreampGain;
+  }
   if (decoded.allow_mute_light) {
     copy_state_bytes(state_, update,
                      offsetof(vds_set_state_data, mute_light_mode),
@@ -306,6 +348,26 @@ bool DsOutputState::apply_usb_output_report(
     copy_state_bytes(state_, update, offsetof(vds_set_state_data, led_red), 3);
   }
   return true;
+}
+
+void DsOutputState::set_audio_out_stream_active(bool active) {
+  state_[kOutputFlag0Offset] |= kOutputFlag0AudioControlEnable;
+  state_[kOutputHeadphoneVolumeOffset] = kOutputHeadphoneVolumeMax;
+
+  if (active) {
+    state_[kOutputFlag0Offset] |= kOutputFlag0SpeakerVolumeEnable;
+    state_[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
+    state_[kOutputSpeakerVolumeOffset] = kOutputSpeakerVolumeMax;
+    state_[kOutputAudioControlOffset] = kOutputPathSpeaker;
+    state_[kOutputAudioControl2Offset] = kOutputSpeakerPreampGain;
+    return;
+  }
+
+  state_[kOutputFlag0Offset] &= ~kOutputFlag0SpeakerVolumeEnable;
+  state_[kOutputFlag1Offset] &= ~kOutputFlag1AudioControl2Enable;
+  state_[kOutputSpeakerVolumeOffset] = 0;
+  state_[kOutputAudioControlOffset] = kOutputPathHeadphones;
+  state_[kOutputAudioControl2Offset] = 0;
 }
 
 BtStateReport DsOutputState::build_bt_state_report() {

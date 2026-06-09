@@ -5,6 +5,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +39,7 @@
 #include "unique_fd.hh"
 #include "vds/ds5.h"
 #include "vds_bt.hh"
+#include "vds_build_version.hh"
 #include "vds_config.hh"
 #include "vds_log.hh"
 #include "vds_protocol.hh"
@@ -62,8 +64,9 @@ constexpr auto kOutputTraceSlowWarn = std::chrono::milliseconds(5);
 constexpr auto kOutputTraceFeatureSlowWarn = std::chrono::milliseconds(20);
 /*
  * 0x36 carries both a haptics block and a 10 ms Opus speaker block. Pace the
- * combined packet on the speaker cadence; using the 64-byte haptics duration
- * here lets speaker audio drift into periodic underruns after a few seconds.
+ * combined packet at the speaker frame interval; using the 64-byte haptics
+ * duration here lets speaker audio drift into periodic underruns after a few
+ * seconds.
  */
 constexpr auto kAudioOutputInterval = std::chrono::milliseconds(10);
 constexpr auto kHapticsOutputBlockedRetry = std::chrono::milliseconds(2);
@@ -72,6 +75,19 @@ constexpr auto kBluetoothPreemptPoll = std::chrono::milliseconds(100);
 constexpr auto kPortScanInterval = std::chrono::milliseconds(2000);
 constexpr int kInitialFeatureReportPollMs = 5000;
 constexpr std::size_t kMaxPendingAudioChunks = 8;
+constexpr std::uint8_t kTestCommandReportId = 0x80;
+constexpr std::uint8_t kTestCommandResultReportId = 0x81;
+constexpr std::uint8_t kTestCommandCompleteStatus = 0x02;
+constexpr std::uint8_t kTestCommandAudioDevice = 0x06;
+constexpr std::uint8_t kTestCommandWaveoutPrepare = 0x04;
+constexpr std::uint8_t kTestCommandWaveoutControl = 0x02;
+constexpr std::uint8_t kTestCommandSpeakerParam = 0x08;
+constexpr std::uint32_t kSpeakerWaveoutFrequencyHz = 1000;
+constexpr std::uint32_t kSpeakerWaveoutPeriodFrames =
+    VDS_AUDIO_SAMPLE_RATE / kSpeakerWaveoutFrequencyHz;
+constexpr double kSpeakerWaveoutTwoPi = 6.28318530717958647692;
+/* Arbitrary fixed amplitude used only for synthetic speaker test output. */
+constexpr std::int16_t kSpeakerWaveoutAmplitude = 12000;
 constexpr std::array<std::uint8_t, 3> kInitialFeatureReportIds = {0x09, 0x20,
                                                                   0x05};
 
@@ -129,6 +145,7 @@ struct VirtualPort {
   std::string path;
   vds::UniqueFd fd;
   vds::PcmAudioExtractor extractor;
+  vds::PcmAudioExtractor waveout_extractor;
   vds::HapticsPacketBuilder haptics_builder;
   vds::DsOutputState output_state;
   std::deque<vds::AudioChunk> pending_audio_chunks;
@@ -137,6 +154,9 @@ struct VirtualPort {
   std::optional<vds::BtStateReport> pending_bt_state_report;
   Clock::time_point next_haptics_send_time{};
   bool audio_signal_active = false;
+  bool speaker_waveout_selected = true;
+  bool speaker_waveout_active = false;
+  std::uint32_t speaker_waveout_phase = 0;
   std::array<std::vector<std::uint8_t>, 256> feature_cache;
   std::array<bool, 256> feature_cached;
   std::vector<std::uint8_t> pending_feature_reports;
@@ -183,8 +203,8 @@ private:
 void signal_handler(int) { g_stop_requested = 1; }
 
 void usage() {
-  std::cerr << "vdsd (" << VDS_VERSION << "): vDS daemon - Copyright (C) "
-            << VDS_BUILD_YEAR << " Jihong Min\n"
+  std::cerr << "vdsd (" << vds::kVersion << "): vDS daemon - Copyright (C) "
+            << vds::kBuildYear << " Jihong Min\n"
             << "usage: vdsd [--socket /run/vdsd.sock] "
                "[--log /var/log/vdsd.log]\n";
 }
@@ -691,6 +711,23 @@ bool write_vds_frame(VirtualPort &port, std::span<const std::uint8_t> bytes,
   }
 }
 
+void cache_feature_report(VirtualPort &port,
+                          std::span<const std::uint8_t> report, bool trace,
+                          vds::Logger &logger) {
+  if (report.empty()) {
+    return;
+  }
+
+  const std::uint8_t report_id = report[0];
+  port.feature_cache[report_id] =
+      std::vector<std::uint8_t>(report.begin(), report.end());
+  port.feature_cached[report_id] = true;
+
+  const auto frame = vds::frame_bytes(VDS_FRAME_USB_FEATURE_REPLY,
+                                      port.feature_cache[report_id]);
+  (void)write_vds_frame(port, frame, trace, logger);
+}
+
 bool flush_pending_bt_state_report(VirtualPort &port,
                                    vds::BtL2capBackend &bt_backend,
                                    std::uint32_t trace_flags,
@@ -723,6 +760,66 @@ bool flush_pending_bt_state_report(VirtualPort &port,
   return false;
 }
 
+void forward_bt_state_if_changed(VirtualPort &port,
+                                 vds::BtL2capBackend &bt_backend,
+                                 std::uint32_t trace_flags, vds::Logger &logger,
+                                 std::string_view reason) {
+  const bool output_trace = trace_enabled(trace_flags, kTraceOutput);
+
+  (void)flush_pending_bt_state_report(port, bt_backend, trace_flags, logger);
+
+  const vds::DsState state = port.output_state.state();
+  if (port.last_sent_bt_state && *port.last_sent_bt_state == state) {
+    if (port.pending_bt_state) {
+      port.pending_bt_state.reset();
+      port.pending_bt_state_report.reset();
+      ++port.trace_state.coalesced_bt_state_count;
+    }
+    if (output_trace) {
+      logger.log("hid", vds::LogLevel::Debug,
+                 port.path + " " + std::string(reason) +
+                     " skipped: BT state unchanged");
+    }
+    return;
+  }
+  if (port.pending_bt_state && *port.pending_bt_state == state) {
+    if (output_trace) {
+      logger.log("hid", vds::LogLevel::Debug,
+                 port.path + " " + std::string(reason) +
+                     " skipped: BT state already pending");
+    }
+    return;
+  }
+
+  const auto packet = port.output_state.build_bt_state_report();
+  if (bt_backend.try_send_output_report(packet)) {
+    port.last_sent_bt_state = state;
+    port.pending_bt_state.reset();
+    port.pending_bt_state_report.reset();
+    if (output_trace) {
+      logger.log("hid", vds::LogLevel::Debug,
+                 port.path + " " + std::string(reason) +
+                     " forwarded as BT 0x31 state report");
+    }
+    return;
+  }
+
+  if (port.pending_bt_state) {
+    ++port.trace_state.coalesced_bt_state_count;
+  }
+  ++port.trace_state.deferred_bt_state_count;
+  port.pending_bt_state = state;
+  port.pending_bt_state_report = packet;
+  if (output_trace && (port.trace_state.deferred_bt_state_count == 1 ||
+                       port.trace_state.deferred_bt_state_count % 1000 == 0)) {
+    logger.log("hid", vds::LogLevel::Warn,
+               port.path + " deferred BT 0x31 state report count=" +
+                   std::to_string(port.trace_state.deferred_bt_state_count) +
+                   " coalesced=" +
+                   std::to_string(port.trace_state.coalesced_bt_state_count));
+  }
+}
+
 void ioctl_noarg(int fd, unsigned long request, const char *name) {
   if (::ioctl(fd, request) < 0) {
     throw std::runtime_error(std::string(name) +
@@ -743,6 +840,7 @@ void ioctl_set_identity(int fd, std::uint32_t identity) {
 
 void reset_virtual_port(VirtualPort &port) {
   port.extractor = vds::PcmAudioExtractor{};
+  port.waveout_extractor = vds::PcmAudioExtractor{};
   port.haptics_builder = vds::HapticsPacketBuilder{};
   port.output_state = vds::DsOutputState{};
   port.pending_audio_chunks.clear();
@@ -751,6 +849,9 @@ void reset_virtual_port(VirtualPort &port) {
   port.pending_bt_state_report.reset();
   port.next_haptics_send_time = {};
   port.audio_signal_active = false;
+  port.speaker_waveout_selected = true;
+  port.speaker_waveout_active = false;
+  port.speaker_waveout_phase = 0;
   port.feature_cache = {};
   port.feature_cached = {};
   port.pending_feature_reports.clear();
@@ -761,6 +862,8 @@ void disconnect_virtual_port(VirtualPort &port, vds::Logger &logger) {
   port.pending_audio_chunks.clear();
   port.next_haptics_send_time = {};
   port.audio_signal_active = false;
+  port.speaker_waveout_active = false;
+  port.speaker_waveout_phase = 0;
   try {
     ioctl_noarg(port.fd.get(), VDS_IOC_DISCONNECT, "VDS_IOC_DISCONNECT");
     logger.log("usb", vds::LogLevel::Info,
@@ -859,55 +962,8 @@ void handle_frame(const vds_frame_header &header,
     }
 
     if (bt_backend) {
-      (void)flush_pending_bt_state_report(port, *bt_backend, trace_flags,
-                                          logger);
-
-      const vds::DsState state = port.output_state.state();
-      if (port.last_sent_bt_state && *port.last_sent_bt_state == state) {
-        if (port.pending_bt_state) {
-          port.pending_bt_state.reset();
-          port.pending_bt_state_report.reset();
-          ++port.trace_state.coalesced_bt_state_count;
-        }
-        if (output_trace) {
-          logger.log("hid", vds::LogLevel::Debug,
-                     port.path + " hid out skipped: BT state unchanged");
-        }
-      } else if (port.pending_bt_state && *port.pending_bt_state == state) {
-        if (output_trace) {
-          logger.log("hid", vds::LogLevel::Debug,
-                     port.path + " hid out skipped: BT state already pending");
-        }
-      } else {
-        const auto packet = port.output_state.build_bt_state_report();
-        if (bt_backend->try_send_output_report(packet)) {
-          port.last_sent_bt_state = state;
-          port.pending_bt_state.reset();
-          port.pending_bt_state_report.reset();
-          if (output_trace) {
-            logger.log("hid", vds::LogLevel::Debug,
-                       port.path +
-                           " hid out forwarded as BT 0x31 state report");
-          }
-        } else {
-          if (port.pending_bt_state) {
-            ++port.trace_state.coalesced_bt_state_count;
-          }
-          ++port.trace_state.deferred_bt_state_count;
-          port.pending_bt_state = state;
-          port.pending_bt_state_report = packet;
-          if (output_trace &&
-              (port.trace_state.deferred_bt_state_count == 1 ||
-               port.trace_state.deferred_bt_state_count % 1000 == 0)) {
-            logger.log(
-                "hid", vds::LogLevel::Warn,
-                port.path + " deferred BT 0x31 state report count=" +
-                    std::to_string(port.trace_state.deferred_bt_state_count) +
-                    " coalesced=" +
-                    std::to_string(port.trace_state.coalesced_bt_state_count));
-          }
-        }
-      }
+      forward_bt_state_if_changed(port, *bt_backend, trace_flags, logger,
+                                  "hid out");
     }
 
     if (output_trace) {
@@ -975,6 +1031,61 @@ void handle_frame(const vds_frame_header &header,
                  port.path + " feature set payload=" +
                      hex_bytes(payload, kTraceDumpMaxBytes));
     }
+    if (payload.size() >= 3 && payload[0] == kTestCommandReportId) {
+      std::array<std::uint8_t, VDS_USB_INPUT_REPORT_SIZE> test_result{};
+      test_result[0] = kTestCommandResultReportId;
+      test_result[1] = payload[1];
+      test_result[2] = payload[2];
+      test_result[3] = kTestCommandCompleteStatus;
+      cache_feature_report(port, test_result, output_trace, logger);
+      if (output_trace) {
+        logger.log("hid", vds::LogLevel::Debug,
+                   port.path + " cached WebHID test result device=" +
+                       hex_byte(payload[1]) +
+                       " action=" + hex_byte(payload[2]) + " status=complete");
+      }
+
+      if (payload[1] == kTestCommandAudioDevice &&
+          payload[2] == kTestCommandWaveoutPrepare) {
+        port.speaker_waveout_selected =
+            payload.size() > 5 && payload[5] == kTestCommandSpeakerParam;
+        if (output_trace) {
+          logger.log("audio", vds::LogLevel::Debug,
+                     port.path + " WebHID waveout target=" +
+                         std::string(port.speaker_waveout_selected
+                                         ? "speaker"
+                                         : "headphone"));
+        }
+      } else if (payload[1] == kTestCommandAudioDevice &&
+                 payload[2] == kTestCommandWaveoutControl &&
+                 payload.size() >= 4) {
+        const bool enable = payload[3] != 0;
+        const bool speaker_waveout = enable && port.speaker_waveout_selected;
+        port.speaker_waveout_active = speaker_waveout;
+        port.speaker_waveout_phase = 0;
+        port.waveout_extractor = vds::PcmAudioExtractor{};
+        port.output_state.set_audio_out_stream_active(speaker_waveout);
+        if (!speaker_waveout) {
+          port.pending_audio_chunks.clear();
+          port.audio_signal_active = false;
+        }
+        if (bt_backend) {
+          forward_bt_state_if_changed(port, *bt_backend, trace_flags, logger,
+                                      speaker_waveout
+                                          ? "WebHID speaker waveout route on"
+                                          : "WebHID waveout route off");
+        }
+        if (output_trace) {
+          logger.log("audio", vds::LogLevel::Info,
+                     port.path + " WebHID waveout " +
+                         std::string(enable ? "on" : "off") + " target=" +
+                         std::string(port.speaker_waveout_selected
+                                         ? "speaker"
+                                         : "headphone") +
+                         " synthesized=" + (speaker_waveout ? "yes" : "no"));
+        }
+      }
+    }
     if (bt_backend) {
       bt_backend->send_feature_set(payload);
     }
@@ -1009,8 +1120,9 @@ void handle_frame(const vds_frame_header &header,
 
     /*
      * USB isochronous URBs can arrive in bursts. Queue completed 0x36 audio
-     * chunks here and let flush_pending_outputs() send them at the controller
-     * cadence, otherwise speaker/haptics audio turns into audible bursts.
+     * chunks here and let flush_pending_outputs() send them at the 10 ms
+     * speaker frame interval, otherwise speaker/haptics audio turns into
+     * audible bursts.
      */
     if (port.pending_audio_chunks.size() >= kMaxPendingAudioChunks) {
       port.pending_audio_chunks.pop_front();
@@ -1228,23 +1340,6 @@ bool is_bluetooth_error(const std::exception &error) {
                  .rfind("failed to connect Bluetooth", 0) == 0;
 }
 
-void cache_feature_report(VirtualPort &port,
-                          std::span<const std::uint8_t> report, bool trace,
-                          vds::Logger &logger) {
-  if (report.empty()) {
-    return;
-  }
-
-  const std::uint8_t report_id = report[0];
-  port.feature_cache[report_id] =
-      std::vector<std::uint8_t>(report.begin(), report.end());
-  port.feature_cached[report_id] = true;
-
-  const auto frame = vds::frame_bytes(VDS_FRAME_USB_FEATURE_REPLY,
-                                      port.feature_cache[report_id]);
-  (void)write_vds_frame(port, frame, trace, logger);
-}
-
 void initialize_bt_controller(vds::BtL2capBackend &bt_backend,
                               VirtualPort &port, vds::Logger &logger) {
   for (const std::uint8_t report_id : kInitialFeatureReportIds) {
@@ -1404,6 +1499,7 @@ void sync_virtual_ports(std::vector<VirtualPort> &ports,
         .path = device,
         .fd = std::move(fd),
         .extractor = {},
+        .waveout_extractor = {},
         .haptics_builder = {},
         .output_state = {},
         .pending_audio_chunks = {},
@@ -1412,6 +1508,9 @@ void sync_virtual_ports(std::vector<VirtualPort> &ports,
         .pending_bt_state_report = std::nullopt,
         .next_haptics_send_time = {},
         .audio_signal_active = false,
+        .speaker_waveout_selected = true,
+        .speaker_waveout_active = false,
+        .speaker_waveout_phase = 0,
         .feature_cache = {},
         .feature_cached = {},
         .pending_feature_reports = {},
@@ -1593,7 +1692,8 @@ bool has_pending_bt_output(std::span<const VirtualPort> ports,
     }
     const auto port_index = find_port_index(ports, binding.device);
     if (port_index && (ports[*port_index].pending_bt_state_report ||
-                       !ports[*port_index].pending_audio_chunks.empty())) {
+                       !ports[*port_index].pending_audio_chunks.empty() ||
+                       ports[*port_index].speaker_waveout_active)) {
       return true;
     }
   }
@@ -1686,6 +1786,47 @@ bool flush_pending_audio_chunk(VirtualPort &port,
   return true;
 }
 
+void enqueue_speaker_waveout_chunk(VirtualPort &port, std::uint32_t trace_flags,
+                                   vds::Logger &logger) {
+  if (!port.speaker_waveout_active || !port.pending_audio_chunks.empty()) {
+    return;
+  }
+
+  std::array<std::uint8_t, vds::kSpeakerInputFrames * VDS_AUDIO_CHANNELS *
+                               sizeof(std::int16_t)>
+      pcm{};
+  for (std::size_t frame = 0; frame < vds::kSpeakerInputFrames; ++frame) {
+    const double angle = kSpeakerWaveoutTwoPi *
+                         static_cast<double>(port.speaker_waveout_phase) /
+                         static_cast<double>(kSpeakerWaveoutPeriodFrames);
+    const auto sample = static_cast<std::int16_t>(
+        std::sin(angle) * static_cast<double>(kSpeakerWaveoutAmplitude));
+    port.speaker_waveout_phase =
+        (port.speaker_waveout_phase + 1) % kSpeakerWaveoutPeriodFrames;
+
+    for (std::size_t channel = 0; channel < vds::kSpeakerChannels; ++channel) {
+      const std::size_t offset =
+          (frame * VDS_AUDIO_CHANNELS + channel) * sizeof(std::int16_t);
+      const auto value = static_cast<std::uint16_t>(sample);
+      pcm[offset + 0] = static_cast<std::uint8_t>(value & 0xff);
+      pcm[offset + 1] = static_cast<std::uint8_t>((value >> 8) & 0xff);
+    }
+  }
+
+  const auto chunks = port.waveout_extractor.push_usb_audio(pcm);
+  for (const auto &chunk : chunks) {
+    if (port.pending_audio_chunks.size() >= kMaxPendingAudioChunks) {
+      break;
+    }
+    port.pending_audio_chunks.push_back(chunk);
+  }
+  if (trace_enabled(trace_flags, kTraceOutput) && !chunks.empty()) {
+    logger.log("audio", vds::LogLevel::Debug,
+               port.path + " queued WebHID speaker waveout chunk pending=" +
+                   std::to_string(port.pending_audio_chunks.size()));
+  }
+}
+
 void flush_pending_outputs(std::vector<VirtualPort> &ports,
                            std::vector<ControllerBinding> &bindings,
                            std::uint32_t trace_flags, vds::Logger &logger,
@@ -1711,6 +1852,7 @@ void flush_pending_outputs(std::vector<VirtualPort> &ports,
                                          logger)) {
         continue;
       }
+      enqueue_speaker_waveout_chunk(port, trace_flags, logger);
       (void)flush_pending_audio_chunk(port, *binding.backend, trace_flags,
                                       logger);
     } catch (const std::exception &error) {

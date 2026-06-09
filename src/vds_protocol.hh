@@ -61,6 +61,7 @@ public:
   DsOutputState();
 
   bool apply_usb_output_report(std::span<const std::uint8_t> report);
+  void set_audio_out_stream_active(bool active);
   BtInitReport build_bt_init_report();
   BtStateReport build_bt_state_report();
   const DsState &state() const { return state_; }

@@ -7,7 +7,6 @@
 #include <linux/types.h>
 
 #define VDS_IOC_MAGIC 'V'
-#define VDS_NAME_MAX 32
 #define VDS_FRAME_MAX_PAYLOAD 4096
 
 enum vds_identity {
@@ -58,7 +57,6 @@ struct vds_status {
 	__u32 identity;
 	__u64 frames_to_user;
 	__u64 frames_from_user;
-	char backend[VDS_NAME_MAX];
 };
 
 struct vds_identity_config {
@@ -71,7 +69,7 @@ static_assert(sizeof(struct vds_frame_header) == 16,
 	      "vds_frame_header is part of the /dev/vds0 ABI");
 static_assert(sizeof(struct vds_usb_interface_event) == 4,
 	      "vds_usb_interface_event is part of the /dev/vds0 ABI");
-static_assert(sizeof(struct vds_status) == 56,
+static_assert(sizeof(struct vds_status) == 24,
 	      "vds_status is part of the /dev/vds0 ABI");
 static_assert(sizeof(struct vds_identity_config) == 8,
 	      "vds_identity_config is part of the /dev/vds0 ABI");

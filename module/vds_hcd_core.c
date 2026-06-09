@@ -752,8 +752,6 @@ static long vds_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		status.identity = vds_usb_device_identity(&dev->usb);
 		status.frames_to_user = dev->frames_to_user;
 		status.frames_from_user = dev->frames_from_user;
-		strscpy(status.backend, "kernel-vds-hcd",
-			sizeof(status.backend));
 		spin_unlock_irqrestore(&dev->lock, flags);
 		if (copy_to_user((void __user *)arg, &status, sizeof(status)))
 			return -EFAULT;
