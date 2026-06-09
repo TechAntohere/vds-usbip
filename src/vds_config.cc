@@ -26,6 +26,8 @@
 
 namespace {
 
+constexpr mode_t kVdsFileMode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP;
+
 bool is_hex_digit(char ch) {
   return std::isxdigit(static_cast<unsigned char>(ch)) != 0;
 }
@@ -73,18 +75,34 @@ void ensure_db_directory(const std::filesystem::path &path) {
   }
 }
 
-vds::UniqueFd lock_db(const std::filesystem::path &db_path) {
-  const std::filesystem::path lock_path = db_path.string() + ".lock";
-  vds::UniqueFd fd(::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC,
-                          S_IRUSR | S_IWUSR));
-  if (!fd) {
-    throw std::runtime_error("failed to open " + lock_path.string() + ": " +
+std::filesystem::path db_directory(const std::filesystem::path &db_path) {
+  const std::filesystem::path directory = db_path.parent_path();
+  if (directory.empty()) {
+    return ".";
+  }
+  return directory;
+}
+
+void chmod_db_file_if_exists(const std::filesystem::path &db_path) {
+  if (::chmod(db_path.c_str(), kVdsFileMode) < 0 && errno != ENOENT) {
+    throw std::runtime_error("failed to chmod " + db_path.string() + ": " +
                              std::strerror(errno));
+  }
+}
+
+vds::UniqueFd lock_db_directory(const std::filesystem::path &db_path) {
+  const std::filesystem::path directory = db_directory(db_path);
+  vds::UniqueFd fd(
+      ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+  if (!fd) {
+    throw std::runtime_error("failed to open DB directory " +
+                             directory.string() + ": " + std::strerror(errno));
   }
   if (::flock(fd.get(), LOCK_EX) < 0) {
-    throw std::runtime_error("failed to lock " + lock_path.string() + ": " +
-                             std::strerror(errno));
+    throw std::runtime_error("failed to lock DB directory " +
+                             directory.string() + ": " + std::strerror(errno));
   }
+  chmod_db_file_if_exists(db_path);
   return fd;
 }
 
@@ -117,60 +135,251 @@ std::string serialize_limit_devices(const std::vector<std::string> &devices) {
   return text;
 }
 
+void skip_json_space(std::string_view text, std::size_t &offset) {
+  while (offset < text.size() &&
+         std::isspace(static_cast<unsigned char>(text[offset])) != 0) {
+    ++offset;
+  }
+}
+
+void require_json_char(std::string_view text, std::size_t &offset,
+                       char expected, std::size_t line_number) {
+  skip_json_space(text, offset);
+  if (offset >= text.size() || text[offset] != expected) {
+    throw std::runtime_error("invalid JSON binding record at line " +
+                             std::to_string(line_number));
+  }
+  ++offset;
+}
+
+char parse_json_escape(char escape, std::size_t line_number) {
+  switch (escape) {
+  case '"':
+  case '\\':
+  case '/':
+    return escape;
+  case 'b':
+    return '\b';
+  case 'f':
+    return '\f';
+  case 'n':
+    return '\n';
+  case 'r':
+    return '\r';
+  case 't':
+    return '\t';
+  default:
+    throw std::runtime_error("unsupported JSON escape at line " +
+                             std::to_string(line_number));
+  }
+}
+
+int parse_json_hex_digit(char ch, std::size_t line_number) {
+  if (ch >= '0' && ch <= '9') {
+    return ch - '0';
+  }
+  if (ch >= 'a' && ch <= 'f') {
+    return ch - 'a' + 10;
+  }
+  if (ch >= 'A' && ch <= 'F') {
+    return ch - 'A' + 10;
+  }
+  throw std::runtime_error("invalid JSON unicode escape at line " +
+                           std::to_string(line_number));
+}
+
+std::string parse_json_string(std::string_view text, std::size_t &offset,
+                              std::size_t line_number) {
+  skip_json_space(text, offset);
+  if (offset >= text.size() || text[offset] != '"') {
+    throw std::runtime_error("expected JSON string at line " +
+                             std::to_string(line_number));
+  }
+  ++offset;
+
+  std::string value;
+  while (offset < text.size()) {
+    const char ch = text[offset++];
+    if (ch == '"') {
+      return value;
+    }
+    if (ch == '\\') {
+      if (offset >= text.size()) {
+        throw std::runtime_error("unterminated JSON escape at line " +
+                                 std::to_string(line_number));
+      }
+      const char escape = text[offset++];
+      if (escape == 'u') {
+        if (offset + 4 > text.size()) {
+          throw std::runtime_error("unterminated JSON unicode escape at line " +
+                                   std::to_string(line_number));
+        }
+        unsigned int code_point = 0;
+        for (int i = 0; i < 4; ++i) {
+          code_point = (code_point << 4) |
+                       parse_json_hex_digit(text[offset++], line_number);
+        }
+        if (code_point > 0x7f) {
+          throw std::runtime_error("unsupported JSON unicode escape at line " +
+                                   std::to_string(line_number));
+        }
+        value.push_back(static_cast<char>(code_point));
+      } else {
+        value.push_back(parse_json_escape(escape, line_number));
+      }
+      continue;
+    }
+    if (static_cast<unsigned char>(ch) < 0x20) {
+      throw std::runtime_error("invalid control character at line " +
+                               std::to_string(line_number));
+    }
+    value.push_back(ch);
+  }
+
+  throw std::runtime_error("unterminated JSON string at line " +
+                           std::to_string(line_number));
+}
+
+std::vector<std::pair<std::string, std::string>>
+parse_json_object(std::string_view line, std::size_t line_number) {
+  std::vector<std::pair<std::string, std::string>> fields;
+  std::size_t offset = 0;
+
+  require_json_char(line, offset, '{', line_number);
+  skip_json_space(line, offset);
+  if (offset < line.size() && line[offset] == '}') {
+    ++offset;
+    skip_json_space(line, offset);
+    if (offset != line.size()) {
+      throw std::runtime_error("trailing data after JSON object at line " +
+                               std::to_string(line_number));
+    }
+    return fields;
+  }
+
+  while (true) {
+    std::string key = parse_json_string(line, offset, line_number);
+    require_json_char(line, offset, ':', line_number);
+    std::string value = parse_json_string(line, offset, line_number);
+    fields.emplace_back(std::move(key), std::move(value));
+
+    skip_json_space(line, offset);
+    if (offset >= line.size()) {
+      throw std::runtime_error("unterminated JSON object at line " +
+                               std::to_string(line_number));
+    }
+    if (line[offset] == '}') {
+      ++offset;
+      skip_json_space(line, offset);
+      if (offset != line.size()) {
+        throw std::runtime_error("trailing data after JSON object at line " +
+                                 std::to_string(line_number));
+      }
+      return fields;
+    }
+    if (line[offset] != ',') {
+      throw std::runtime_error("expected JSON field separator at line " +
+                               std::to_string(line_number));
+    }
+    ++offset;
+  }
+}
+
+std::string escape_json_string(std::string_view text) {
+  std::string escaped;
+  for (const char ch : text) {
+    switch (ch) {
+    case '"':
+      escaped += "\\\"";
+      break;
+    case '\\':
+      escaped += "\\\\";
+      break;
+    case '\b':
+      escaped += "\\b";
+      break;
+    case '\f':
+      escaped += "\\f";
+      break;
+    case '\n':
+      escaped += "\\n";
+      break;
+    case '\r':
+      escaped += "\\r";
+      break;
+    case '\t':
+      escaped += "\\t";
+      break;
+    default:
+      if (static_cast<unsigned char>(ch) < 0x20) {
+        char code[7];
+        std::snprintf(code, sizeof(code), "\\u%04x",
+                      static_cast<unsigned char>(ch));
+        escaped += code;
+      } else {
+        escaped.push_back(ch);
+      }
+      break;
+    }
+  }
+  return escaped;
+}
+
 std::string serialize_binding_db(const vds::BindingDb &db) {
   std::string text;
   for (const auto &controller : db.controllers) {
-    text += "controller ";
-    text += controller.address;
-    text += " identity=";
-    text += vds::binding_identity_name(controller.identity);
-    text += " limit=";
-    text += serialize_limit_devices(controller.limit_devices);
-    text += '\n';
+    text += "{\"address\": \"";
+    text += escape_json_string(controller.address);
+    text += "\", \"identity\": \"";
+    text += escape_json_string(vds::binding_identity_name(controller.identity));
+    text += "\", \"limit\": \"";
+    text +=
+        escape_json_string(serialize_limit_devices(controller.limit_devices));
+    text += "\"}\n";
   }
   return text;
 }
 
-std::vector<std::string> split_words(const std::string &line) {
-  std::istringstream stream(line);
-  std::vector<std::string> words;
-  std::string word;
-  while (stream >> word) {
-    words.push_back(word);
-  }
-  return words;
-}
-
 vds::ControllerBindingConfig parse_controller_line(const std::string &line,
                                                    std::size_t line_number) {
-  const std::vector<std::string> words = split_words(line);
-  if (words.size() != 4 || words[0] != "controller") {
-    throw std::runtime_error("invalid controller record at line " +
-                             std::to_string(line_number));
-  }
-
   vds::ControllerBindingConfig binding{
-      .address = vds::normalize_bluetooth_address(words[1]),
+      .address = {},
       .identity = vds::BindingIdentity::Auto,
       .limit_devices = {},
   };
+  bool have_address = false;
   bool have_identity = false;
   bool have_limit = false;
 
-  for (std::size_t i = 2; i < words.size(); ++i) {
-    if (words[i].rfind("identity=", 0) == 0) {
-      binding.identity = vds::parse_binding_identity(words[i].substr(9));
+  for (const auto &[key, value] : parse_json_object(line, line_number)) {
+    if (key == "address") {
+      if (have_address) {
+        throw std::runtime_error("duplicate address field at line " +
+                                 std::to_string(line_number));
+      }
+      binding.address = vds::normalize_bluetooth_address(value);
+      have_address = true;
+    } else if (key == "identity") {
+      if (have_identity) {
+        throw std::runtime_error("duplicate identity field at line " +
+                                 std::to_string(line_number));
+      }
+      binding.identity = vds::parse_binding_identity(value);
       have_identity = true;
-    } else if (words[i].rfind("limit=", 0) == 0) {
-      binding.limit_devices = vds::parse_limit_devices(words[i].substr(6));
+    } else if (key == "limit") {
+      if (have_limit) {
+        throw std::runtime_error("duplicate limit field at line " +
+                                 std::to_string(line_number));
+      }
+      binding.limit_devices = vds::parse_limit_devices(value);
       have_limit = true;
     } else {
-      throw std::runtime_error("unknown controller field at line " +
-                               std::to_string(line_number) + ": " + words[i]);
+      throw std::runtime_error("unknown JSON binding field at line " +
+                               std::to_string(line_number) + ": " + key);
     }
   }
 
-  if (!have_identity || !have_limit) {
+  if (!have_address || !have_identity || !have_limit) {
     throw std::runtime_error("missing controller field at line " +
                              std::to_string(line_number));
   }
@@ -213,9 +422,13 @@ void write_file_atomic(const std::filesystem::path &path,
   {
     vds::UniqueFd fd(::open(tmp_path.c_str(),
                             O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
-                            S_IRUSR | S_IWUSR));
+                            kVdsFileMode));
     if (!fd) {
       throw std::runtime_error("failed to open " + tmp_path.string() + ": " +
+                               std::strerror(errno));
+    }
+    if (::fchmod(fd.get(), kVdsFileMode) < 0) {
+      throw std::runtime_error("failed to chmod " + tmp_path.string() + ": " +
                                std::strerror(errno));
     }
     const char *data = text.data();
@@ -245,9 +458,7 @@ void write_file_atomic(const std::filesystem::path &path,
     throw std::runtime_error("failed to rename " + tmp_path.string() + " to " +
                              path.string() + ": " + std::strerror(errno));
   }
-  const std::filesystem::path directory = path.parent_path().empty()
-                                              ? std::filesystem::path(".")
-                                              : path.parent_path();
+  const std::filesystem::path directory = db_directory(path);
   const vds::UniqueFd directory_fd(
       ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
   if (!directory_fd) {
@@ -336,26 +547,10 @@ std::vector<std::string> parse_limit_devices(std::string_view text) {
   return devices;
 }
 
-std::vector<std::string> discover_vds_devices() {
-  std::vector<std::string> devices;
-  std::error_code error;
-  for (const auto &entry : std::filesystem::directory_iterator("/dev", error)) {
-    if (error) {
-      return {};
-    }
-    const std::string path = entry.path().string();
-    if (is_vds_device_path(path)) {
-      devices.push_back(path);
-    }
-  }
-  std::sort(devices.begin(), devices.end());
-  return devices;
-}
-
 BindingDb load_binding_db(const std::string &path) {
   const std::filesystem::path db_path(path);
   ensure_db_directory(db_path);
-  const UniqueFd lock = lock_db(db_path);
+  const UniqueFd lock = lock_db_directory(db_path);
   (void)lock;
   return parse_binding_db(read_file_if_exists(db_path));
 }
@@ -364,7 +559,7 @@ BindingDb update_binding_db(const std::string &path,
                             const std::function<void(BindingDb &)> &update) {
   const std::filesystem::path db_path(path);
   ensure_db_directory(db_path);
-  const UniqueFd lock = lock_db(db_path);
+  const UniqueFd lock = lock_db_directory(db_path);
   (void)lock;
   BindingDb db = parse_binding_db(read_file_if_exists(db_path));
   update(db);

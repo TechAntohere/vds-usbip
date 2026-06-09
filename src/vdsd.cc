@@ -11,8 +11,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <optional>
@@ -38,11 +36,13 @@
 #include "uapi/vds.h"
 #include "unique_fd.hh"
 #include "vds/ds5.h"
+#include "vds_bluez.hh"
 #include "vds_bt.hh"
-#include "vds_build_version.hh"
+#include "vds_build_info.hh"
 #include "vds_config.hh"
 #include "vds_log.hh"
 #include "vds_protocol.hh"
+#include "vds_udev.hh"
 
 namespace {
 
@@ -72,7 +72,6 @@ constexpr auto kAudioOutputInterval = std::chrono::milliseconds(10);
 constexpr auto kHapticsOutputBlockedRetry = std::chrono::milliseconds(2);
 constexpr auto kBluetoothPreemptWait = std::chrono::milliseconds(2000);
 constexpr auto kBluetoothPreemptPoll = std::chrono::milliseconds(100);
-constexpr auto kPortScanInterval = std::chrono::milliseconds(2000);
 constexpr int kInitialFeatureReportPollMs = 5000;
 constexpr std::size_t kMaxPendingAudioChunks = 8;
 constexpr std::uint8_t kTestCommandReportId = 0x80;
@@ -105,6 +104,7 @@ struct DeviceId {
 struct Options {
   std::string socket = kDefaultControlSocket;
   std::string log_path = kDefaultLogPath;
+  std::string db_path = vds::kDefaultBindingDbPath;
 };
 
 struct LatencyTraceStats {
@@ -181,6 +181,7 @@ enum class EventKind : std::uint32_t {
   BtInterrupt = 4,
   BtAcceptControl = 5,
   BtAcceptInterrupt = 6,
+  Udev = 7,
 };
 
 struct EventSource {
@@ -205,8 +206,9 @@ void signal_handler(int) { g_stop_requested = 1; }
 void usage() {
   std::cerr << "vdsd (" << vds::kVersion << "): vDS daemon - Copyright (C) "
             << vds::kBuildYear << " Jihong Min\n"
-            << "usage: vdsd [--socket /run/vdsd.sock] "
-               "[--log /var/log/vdsd.log]\n";
+            << "usage: vdsd [--db-path /var/lib/vds/vdsd.db] "
+               "[--log /var/log/vdsd.log] "
+               "[--socket /run/vdsd.sock]\n";
 }
 
 Options parse_args(int argc, char **argv) {
@@ -217,6 +219,8 @@ Options parse_args(int argc, char **argv) {
       options.socket = argv[++i];
     } else if (arg == "--log" && i + 1 < argc) {
       options.log_path = argv[++i];
+    } else if (arg == "--db-path" && i + 1 < argc) {
+      options.db_path = argv[++i];
     } else if (arg == "--help" || arg == "-h") {
       usage();
       std::exit(0);
@@ -263,50 +267,6 @@ std::optional<unsigned int> parse_hex_token(std::string_view text,
   return value;
 }
 
-std::optional<std::string_view> line_with_prefix(std::string_view text,
-                                                 std::string_view prefix) {
-  std::size_t offset = 0;
-  while (offset < text.size()) {
-    const std::size_t end = text.find('\n', offset);
-    const std::string_view line = text.substr(
-        offset,
-        end == std::string_view::npos ? std::string_view::npos : end - offset);
-    if (line.rfind(prefix, 0) == 0) {
-      return line;
-    }
-    if (end == std::string_view::npos) {
-      break;
-    }
-    offset = end + 1;
-  }
-  return std::nullopt;
-}
-
-std::optional<DeviceId> parse_hid_id_line(std::string_view text) {
-  const auto line = line_with_prefix(text, "HID_ID=");
-  if (!line) {
-    return std::nullopt;
-  }
-
-  const std::size_t first_colon = line->find(':');
-  if (first_colon == std::string_view::npos) {
-    return std::nullopt;
-  }
-  const std::size_t second_colon = line->find(':', first_colon + 1);
-  if (second_colon == std::string_view::npos) {
-    return std::nullopt;
-  }
-
-  const auto vendor = parse_hex_token(*line, first_colon + 1, 8);
-  const auto product = parse_hex_token(*line, second_colon + 1, 8);
-  if (!vendor || !product) {
-    return std::nullopt;
-  }
-
-  return DeviceId{.vendor = static_cast<std::uint16_t>(*vendor & 0xffffu),
-                  .product = static_cast<std::uint16_t>(*product & 0xffffu)};
-}
-
 std::optional<DeviceId> parse_modalias_line(std::string_view line) {
   const std::size_t vendor_marker = line.find('v');
   if (vendor_marker == std::string_view::npos) {
@@ -327,26 +287,6 @@ std::optional<DeviceId> parse_modalias_line(std::string_view line) {
 
   return DeviceId{.vendor = static_cast<std::uint16_t>(*vendor & 0xffffu),
                   .product = static_cast<std::uint16_t>(*product & 0xffffu)};
-}
-
-std::optional<DeviceId> parse_modalias(std::string_view text) {
-  if (const auto line = line_with_prefix(text, "MODALIAS=")) {
-    return parse_modalias_line(*line);
-  }
-  if (const auto line = line_with_prefix(text, "\tModalias: ")) {
-    return parse_modalias_line(*line);
-  }
-  if (const auto line = line_with_prefix(text, "Modalias: ")) {
-    return parse_modalias_line(*line);
-  }
-  return std::nullopt;
-}
-
-std::optional<DeviceId> parse_device_id(std::string_view text) {
-  if (const auto hid_id = parse_hid_id_line(text)) {
-    return hid_id;
-  }
-  return parse_modalias(text);
 }
 
 std::string hex16(std::uint16_t value) {
@@ -514,75 +454,6 @@ const char *usb_interface_kind_name(std::uint8_t kind) {
   }
 }
 
-std::string run_bluetoothctl_info(const std::string &address) {
-  (void)vds::parse_bluetooth_address(address);
-
-  const std::string command = "bluetoothctl info " + address + " 2>/dev/null";
-  FILE *pipe = ::popen(command.c_str(), "r");
-  if (!pipe) {
-    throw std::runtime_error("failed to run bluetoothctl");
-  }
-
-  std::string output;
-  std::array<char, 512> buffer{};
-  while (std::fgets(buffer.data(), static_cast<int>(buffer.size()), pipe)) {
-    output += buffer.data();
-  }
-
-  const int status = ::pclose(pipe);
-  if (status != 0 && output.empty()) {
-    throw std::runtime_error("bluetoothctl info failed for " + address);
-  }
-  return output;
-}
-
-std::optional<std::string> read_first_line(const std::filesystem::path &path) {
-  std::ifstream file(path);
-  if (!file) {
-    return std::nullopt;
-  }
-
-  std::string line;
-  if (!std::getline(file, line)) {
-    return std::nullopt;
-  }
-  if (!line.empty() && line.back() == '\r') {
-    line.pop_back();
-  }
-  return line;
-}
-
-bool bluetooth_hid_input_present(const std::string &address) {
-  const std::string normalized_address =
-      vds::normalize_bluetooth_address(address);
-  std::error_code error;
-  for (const auto &entry :
-       std::filesystem::directory_iterator("/sys/bus/hid/devices", error)) {
-    if (error) {
-      return false;
-    }
-
-    const std::string name = entry.path().filename().string();
-    if (name.rfind("0005:", 0) != 0) {
-      continue;
-    }
-
-    const auto uniq = read_first_line(entry.path() / "uniq");
-    if (!uniq) {
-      continue;
-    }
-
-    try {
-      if (vds::normalize_bluetooth_address(*uniq) == normalized_address) {
-        return true;
-      }
-    } catch (const std::exception &) {
-      continue;
-    }
-  }
-  return false;
-}
-
 std::uint32_t identity_from_device_id(const DeviceId &id) {
   if (id.vendor != VDS_SONY_VENDOR_ID) {
     throw std::runtime_error("unsupported controller vendor " +
@@ -606,8 +477,11 @@ const char *identity_name(std::uint32_t identity) {
 }
 
 std::uint32_t detect_bluetooth_identity(const std::string &address) {
-  const std::string info = run_bluetoothctl_info(address);
-  const auto id = parse_device_id(info);
+  const auto modalias = vds::bluez_device_modalias(address);
+  if (!modalias) {
+    throw std::runtime_error("failed to query BlueZ modalias for " + address);
+  }
+  const auto id = parse_modalias_line(*modalias);
   if (!id) {
     throw std::runtime_error("failed to detect Bluetooth device ID for " +
                              address);
@@ -650,7 +524,7 @@ int open_control_socket(const std::string &path) {
     throw std::runtime_error("failed to bind control socket " + path + ": " +
                              std::strerror(error));
   }
-  (void)::chmod(path.c_str(), 0600);
+  (void)::chmod(path.c_str(), 0660);
 
   if (::listen(fd.get(), 4) < 0) {
     const int error = errno;
@@ -1032,57 +906,69 @@ void handle_frame(const vds_frame_header &header,
                      hex_bytes(payload, kTraceDumpMaxBytes));
     }
     if (payload.size() >= 3 && payload[0] == kTestCommandReportId) {
-      std::array<std::uint8_t, VDS_USB_INPUT_REPORT_SIZE> test_result{};
-      test_result[0] = kTestCommandResultReportId;
-      test_result[1] = payload[1];
-      test_result[2] = payload[2];
-      test_result[3] = kTestCommandCompleteStatus;
-      cache_feature_report(port, test_result, output_trace, logger);
-      if (output_trace) {
-        logger.log("hid", vds::LogLevel::Debug,
-                   port.path + " cached WebHID test result device=" +
-                       hex_byte(payload[1]) +
-                       " action=" + hex_byte(payload[2]) + " status=complete");
+      std::size_t command_offset = 1;
+      if (payload.size() > command_offset &&
+          payload[command_offset] == kTestCommandReportId) {
+        ++command_offset;
       }
+      if (payload.size() > command_offset + 1) {
+        const std::uint8_t command_device = payload[command_offset];
+        const std::uint8_t command_action = payload[command_offset + 1];
+        const std::size_t command_data_offset = command_offset + 2;
 
-      if (payload[1] == kTestCommandAudioDevice &&
-          payload[2] == kTestCommandWaveoutPrepare) {
-        port.speaker_waveout_selected =
-            payload.size() > 5 && payload[5] == kTestCommandSpeakerParam;
+        std::array<std::uint8_t, VDS_USB_INPUT_REPORT_SIZE> test_result{};
+        test_result[0] = kTestCommandResultReportId;
+        test_result[1] = command_device;
+        test_result[2] = command_action;
+        test_result[3] = kTestCommandCompleteStatus;
+        cache_feature_report(port, test_result, output_trace, logger);
         if (output_trace) {
-          logger.log("audio", vds::LogLevel::Debug,
-                     port.path + " WebHID waveout target=" +
-                         std::string(port.speaker_waveout_selected
-                                         ? "speaker"
-                                         : "headphone"));
+          logger.log("hid", vds::LogLevel::Debug,
+                     port.path + " cached WebHID test result device=" +
+                         hex_byte(command_device) + " action=" +
+                         hex_byte(command_action) + " status=complete");
         }
-      } else if (payload[1] == kTestCommandAudioDevice &&
-                 payload[2] == kTestCommandWaveoutControl &&
-                 payload.size() >= 4) {
-        const bool enable = payload[3] != 0;
-        const bool speaker_waveout = enable && port.speaker_waveout_selected;
-        port.speaker_waveout_active = speaker_waveout;
-        port.speaker_waveout_phase = 0;
-        port.waveout_extractor = vds::PcmAudioExtractor{};
-        port.output_state.set_audio_out_stream_active(speaker_waveout);
-        if (!speaker_waveout) {
-          port.pending_audio_chunks.clear();
-          port.audio_signal_active = false;
-        }
-        if (bt_backend) {
-          forward_bt_state_if_changed(port, *bt_backend, trace_flags, logger,
-                                      speaker_waveout
-                                          ? "WebHID speaker waveout route on"
-                                          : "WebHID waveout route off");
-        }
-        if (output_trace) {
-          logger.log("audio", vds::LogLevel::Info,
-                     port.path + " WebHID waveout " +
-                         std::string(enable ? "on" : "off") + " target=" +
-                         std::string(port.speaker_waveout_selected
-                                         ? "speaker"
-                                         : "headphone") +
-                         " synthesized=" + (speaker_waveout ? "yes" : "no"));
+
+        if (command_device == kTestCommandAudioDevice &&
+            command_action == kTestCommandWaveoutPrepare) {
+          port.speaker_waveout_selected =
+              payload.size() > command_data_offset + 2 &&
+              payload[command_data_offset + 2] == kTestCommandSpeakerParam;
+          if (output_trace) {
+            logger.log("audio", vds::LogLevel::Debug,
+                       port.path + " WebHID waveout target=" +
+                           std::string(port.speaker_waveout_selected
+                                           ? "speaker"
+                                           : "headphone"));
+          }
+        } else if (command_device == kTestCommandAudioDevice &&
+                   command_action == kTestCommandWaveoutControl &&
+                   payload.size() > command_data_offset) {
+          const bool enable = payload[command_data_offset] != 0;
+          const bool speaker_waveout = enable && port.speaker_waveout_selected;
+          port.speaker_waveout_active = speaker_waveout;
+          port.speaker_waveout_phase = 0;
+          port.waveout_extractor = vds::PcmAudioExtractor{};
+          port.output_state.set_audio_out_stream_active(speaker_waveout);
+          if (!speaker_waveout) {
+            port.pending_audio_chunks.clear();
+            port.audio_signal_active = false;
+          }
+          if (bt_backend) {
+            forward_bt_state_if_changed(port, *bt_backend, trace_flags, logger,
+                                        speaker_waveout
+                                            ? "WebHID speaker waveout route on"
+                                            : "WebHID waveout route off");
+          }
+          if (output_trace) {
+            logger.log("audio", vds::LogLevel::Info,
+                       port.path + " WebHID waveout " +
+                           std::string(enable ? "on" : "off") + " target=" +
+                           std::string(port.speaker_waveout_selected
+                                           ? "speaker"
+                                           : "headphone") +
+                           " synthesized=" + (speaker_waveout ? "yes" : "no"));
+          }
         }
       }
     }
@@ -1531,22 +1417,26 @@ void sync_virtual_ports(std::vector<VirtualPort> &ports,
 
 void preempt_default_bluetooth_owner(const std::string &address,
                                      vds::Logger &logger) {
-  if (!bluetooth_hid_input_present(address)) {
+  if (!vds::bluetooth_hid_device_present(address)) {
     return;
   }
 
   logger.log("bluetooth", vds::LogLevel::Warn,
              "preempting default Bluetooth HID owner address=" + address);
-  const std::string command =
-      "bluetoothctl disconnect " + address + " >/dev/null 2>&1";
-  if (std::system(command.c_str()) != 0) {
+  try {
+    if (!vds::disconnect_bluez_device(address)) {
+      logger.log("bluetooth", vds::LogLevel::Warn,
+                 "BlueZ device not found for disconnect address=" + address);
+    }
+  } catch (const std::exception &error) {
     logger.log("bluetooth", vds::LogLevel::Warn,
-               "bluetoothctl disconnect failed address=" + address);
+               "BlueZ disconnect failed address=" + address +
+                   " error=" + error.what());
   }
 
   const auto deadline = Clock::now() + kBluetoothPreemptWait;
   while (Clock::now() < deadline) {
-    if (!bluetooth_hid_input_present(address)) {
+    if (!vds::bluetooth_hid_device_present(address)) {
       logger.log("bluetooth", vds::LogLevel::Info,
                  "default stack released address=" + address);
       return;
@@ -1700,17 +1590,10 @@ bool has_pending_bt_output(std::span<const VirtualPort> ports,
   return false;
 }
 
-int next_wakeup_timeout_ms(Clock::time_point next_port_scan,
-                           std::span<const VirtualPort> ports,
+int next_wakeup_timeout_ms(std::span<const VirtualPort> ports,
                            std::span<const ControllerBinding> bindings) {
   const auto now = Clock::now();
-  if (next_port_scan <= now) {
-    return 0;
-  }
-  const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(
-      next_port_scan - now);
-  int timeout_ms =
-      static_cast<int>(std::min<std::int64_t>(wait.count(), 60000));
+  int timeout_ms = 60000;
   if (has_pending_bt_output(ports, bindings)) {
     timeout_ms = std::min(timeout_ms, kPendingOutputPollMs);
   }
@@ -1867,7 +1750,7 @@ void flush_pending_outputs(std::vector<VirtualPort> &ports,
 
 void reconcile_bindings(std::vector<VirtualPort> &ports,
                         std::vector<ControllerBinding> &bindings,
-                        vds::Logger &logger) {
+                        const std::string &db_path, vds::Logger &logger) {
   const std::vector<std::string> devices = vds::discover_vds_devices();
   for (auto &binding : bindings) {
     if (!binding_uses_port(binding) ||
@@ -1885,7 +1768,7 @@ void reconcile_bindings(std::vector<VirtualPort> &ports,
   }
 
   sync_virtual_ports(ports, devices, logger);
-  const vds::BindingDb db = vds::load_binding_db(vds::kDefaultBindingDbPath);
+  const vds::BindingDb db = vds::load_binding_db(db_path);
   logger.log("config", vds::LogLevel::Info,
              "loaded bindings count=" + std::to_string(db.controllers.size()));
 
@@ -2099,6 +1982,7 @@ void add_epoll_fd(int epoll_fd, int fd, EventKind kind, std::size_t index) {
 }
 
 vds::UniqueFd rebuild_epoll(int control_fd, vds::BtL2capAcceptor &bt_acceptor,
+                            const vds::VdsDeviceMonitor &vds_monitor,
                             std::span<VirtualPort> ports,
                             std::span<ControllerBinding> bindings) {
   vds::UniqueFd epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
@@ -2108,6 +1992,7 @@ vds::UniqueFd rebuild_epoll(int control_fd, vds::BtL2capAcceptor &bt_acceptor,
   }
 
   add_epoll_fd(epoll_fd.get(), control_fd, EventKind::Control, 0);
+  add_epoll_fd(epoll_fd.get(), vds_monitor.fd(), EventKind::Udev, 0);
   add_epoll_fd(epoll_fd.get(), bt_acceptor.control_listener_fd(),
                EventKind::BtAcceptControl, 0);
   add_epoll_fd(epoll_fd.get(), bt_acceptor.interrupt_listener_fd(),
@@ -2153,10 +2038,12 @@ int main(int argc, char **argv) {
     const Options options = parse_args(argc, argv);
     vds::Logger logger(options.log_path);
     logger.log("daemon", vds::LogLevel::Info,
-               "started socket=" + options.socket + " log=" + options.log_path);
+               "started socket=" + options.socket + " log=" + options.log_path +
+                   " db=" + options.db_path);
 
     vds::UniqueFd control_fd(open_control_socket(options.socket));
     vds::BtL2capAcceptor bt_acceptor;
+    vds::VdsDeviceMonitor vds_monitor;
     logger.log("bluetooth", vds::LogLevel::Info,
                "listening for controller-initiated raw HID channels");
     SocketPathGuard control_socket_path(options.socket);
@@ -2166,29 +2053,12 @@ int main(int argc, char **argv) {
     std::uint32_t trace_flags = 0;
     bool reload_requested = true;
     bool epoll_dirty = true;
-    auto next_port_scan = Clock::now() + kPortScanInterval;
 
     while (g_stop_requested == 0) {
-      if (!reload_requested && Clock::now() >= next_port_scan) {
-        const std::vector<std::string> discovered = vds::discover_vds_devices();
-        std::vector<std::string> opened;
-        opened.reserve(ports.size());
-        for (const auto &port : ports) {
-          opened.push_back(port.path);
-        }
-        if (discovered != opened) {
-          logger.log("port", vds::LogLevel::Info,
-                     "virtual endpoint set changed; reloading");
-          reload_requested = true;
-        }
-        next_port_scan = Clock::now() + kPortScanInterval;
-      }
-
       if (reload_requested) {
         try {
-          reconcile_bindings(ports, bindings, logger);
+          reconcile_bindings(ports, bindings, options.db_path, logger);
           epoll_dirty = true;
-          next_port_scan = Clock::now() + kPortScanInterval;
         } catch (const std::exception &error) {
           logger.log("config", vds::LogLevel::Error,
                      std::string("reload failed: ") + error.what());
@@ -2197,14 +2067,13 @@ int main(int argc, char **argv) {
       }
 
       if (epoll_dirty || !epoll_fd) {
-        epoll_fd =
-            rebuild_epoll(control_fd.get(), bt_acceptor, ports, bindings);
+        epoll_fd = rebuild_epoll(control_fd.get(), bt_acceptor, vds_monitor,
+                                 ports, bindings);
         epoll_dirty = false;
       }
 
       std::array<epoll_event, 64> events{};
-      const int timeout_ms =
-          next_wakeup_timeout_ms(next_port_scan, ports, bindings);
+      const int timeout_ms = next_wakeup_timeout_ms(ports, bindings);
       const int ready =
           ::epoll_wait(epoll_fd.get(), events.data(),
                        static_cast<int>(events.size()), timeout_ms);
@@ -2245,6 +2114,19 @@ int main(int argc, char **argv) {
           }
           if ((revents & (EPOLLERR | EPOLLHUP)) != 0) {
             throw std::runtime_error("Bluetooth listener epoll error");
+          }
+          continue;
+        }
+
+        if (source.kind == EventKind::Udev) {
+          if ((revents & EPOLLIN) != 0 && vds_monitor.drain()) {
+            logger.log("port", vds::LogLevel::Info,
+                       "virtual endpoint udev event; reloading");
+            reload_requested = true;
+            epoll_dirty = true;
+          }
+          if ((revents & (EPOLLERR | EPOLLHUP)) != 0) {
+            throw std::runtime_error("udev monitor epoll error");
           }
           continue;
         }

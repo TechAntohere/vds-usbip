@@ -18,8 +18,9 @@
 #include <unistd.h>
 
 #include "unique_fd.hh"
-#include "vds_build_version.hh"
+#include "vds_build_info.hh"
 #include "vds_config.hh"
+#include "vds_udev.hh"
 
 namespace {
 
@@ -30,9 +31,9 @@ void usage() {
             << "): vDS management utility - Copyright (C) " << vds::kBuildYear
             << " Jihong Min\n"
             << "usage:\n"
-            << "  vdsctl attach <bt-address> [--identity ds5|dse] "
+            << "  vdsctl attach <address> [--identity ds5|dse] "
                "[--limit-dev /dev/vds0[,/dev/vds1...]]\n"
-            << "  vdsctl detach <bt-address>\n"
+            << "  vdsctl detach <address>\n"
             << "  vdsctl list\n"
             << "  vdsctl trace on|off [--scope all|input|output]\n";
 }
@@ -186,7 +187,7 @@ void print_db(const vds::BindingDb &db,
 
 void command_attach(int argc, char **argv) {
   if (argc < 3) {
-    throw std::runtime_error("attach requires a Bluetooth address");
+    throw std::runtime_error("attach requires an address");
   }
 
   vds::ControllerBindingConfig binding{

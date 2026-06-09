@@ -10,7 +10,7 @@
 
 namespace vds {
 
-constexpr const char *kDefaultBindingDbPath = "/var/lib/vds/bindings.db";
+constexpr const char *kDefaultBindingDbPath = "/var/lib/vds/vdsd.db";
 
 enum class BindingIdentity {
   Auto,
@@ -32,7 +32,6 @@ std::string normalize_bluetooth_address(std::string_view address);
 BindingIdentity parse_binding_identity(std::string_view identity);
 std::string binding_identity_name(BindingIdentity identity);
 std::vector<std::string> parse_limit_devices(std::string_view text);
-std::vector<std::string> discover_vds_devices();
 BindingDb load_binding_db(const std::string &path);
 BindingDb update_binding_db(const std::string &path,
                             const std::function<void(BindingDb &)> &update);

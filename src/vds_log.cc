@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <iomanip>
@@ -12,9 +14,15 @@
 #include <string>
 #include <string_view>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "vds_log.hh"
 
 namespace {
+
+constexpr mode_t kVdsLogFileMode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP;
 
 std::string local_timestamp() {
   const auto now = std::chrono::system_clock::now();
@@ -53,6 +61,25 @@ void write_log_message(std::ostream &out, std::string_view message) {
   }
 }
 
+void prepare_log_file(const std::string &path) {
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                        kVdsLogFileMode);
+  if (fd < 0) {
+    throw std::runtime_error("failed to open log file: " + path + ": " +
+                             std::strerror(errno));
+  }
+  if (::fchmod(fd, kVdsLogFileMode) < 0) {
+    const int error = errno;
+    (void)::close(fd);
+    throw std::runtime_error("failed to chmod log file: " + path + ": " +
+                             std::strerror(error));
+  }
+  if (::close(fd) < 0) {
+    throw std::runtime_error("failed to close log file: " + path + ": " +
+                             std::strerror(errno));
+  }
+}
+
 } // namespace
 
 namespace vds {
@@ -63,6 +90,7 @@ Logger::Logger(const std::string &path) {
   if (!directory.empty()) {
     std::filesystem::create_directories(directory);
   }
+  prepare_log_file(path);
   file_.open(path, std::ios::app);
   if (!file_) {
     throw std::runtime_error("failed to open log file: " + path);

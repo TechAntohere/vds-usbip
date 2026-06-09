@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -11,6 +12,9 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/l2cap.h>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -38,35 +42,6 @@ constexpr std::size_t kBtInputReportIdOffset = 1;
 constexpr std::size_t kBtInputUsbPayloadOffset = 3;
 constexpr std::size_t kBtInputMinimumSize =
     kBtInputUsbPayloadOffset + VDS_USB_INPUT_PAYLOAD_SIZE;
-
-struct SockaddrL2 {
-  sa_family_t family;
-  std::uint16_t psm;
-  std::uint8_t address[6];
-  std::uint16_t cid;
-  std::uint8_t address_type;
-};
-
-std::uint16_t host_to_le16(std::uint16_t value) {
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-  return static_cast<std::uint16_t>((value >> 8) | (value << 8));
-#else
-  return value;
-#endif
-}
-
-int hex_nibble(char value) {
-  if (value >= '0' && value <= '9') {
-    return value - '0';
-  }
-  if (value >= 'a' && value <= 'f') {
-    return 10 + value - 'a';
-  }
-  if (value >= 'A' && value <= 'F') {
-    return 10 + value - 'A';
-  }
-  return -1;
-}
 
 void close_if_open(int &fd) {
   if (fd >= 0) {
@@ -178,19 +153,25 @@ int open_l2cap_socket() {
   return fd;
 }
 
-void fill_l2cap_sockaddr(SockaddrL2 &sockaddr, std::uint16_t psm,
+void fill_l2cap_sockaddr(sockaddr_l2 &sockaddr, std::uint16_t psm,
                          std::span<const std::uint8_t, 6> address) {
-  sockaddr.family = AF_BLUETOOTH;
-  sockaddr.psm = host_to_le16(psm);
-  std::copy(address.begin(), address.end(), sockaddr.address);
+  sockaddr.l2_family = AF_BLUETOOTH;
+  sockaddr.l2_psm = htobs(psm);
+  bdaddr_t bdaddr{};
+  std::copy(address.begin(), address.end(), bdaddr.b);
+  ::bacpy(&sockaddr.l2_bdaddr, &bdaddr);
 }
 
-std::string bluetooth_address_string(std::span<const std::uint8_t, 6> address) {
+std::string bluetooth_address_string(const bdaddr_t &address) {
   char buffer[18]{};
-  std::snprintf(buffer, sizeof(buffer), "%02x:%02x:%02x:%02x:%02x:%02x",
-                address[5], address[4], address[3], address[2], address[1],
-                address[0]);
-  return buffer;
+  if (::ba2str(&address, buffer) < 0) {
+    throw std::runtime_error("failed to format Bluetooth address");
+  }
+  std::string text = buffer;
+  std::transform(text.begin(), text.end(), text.begin(), [](char ch) {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  });
+  return text;
 }
 
 UniqueFd listen_l2cap_psm(std::uint16_t psm) {
@@ -205,7 +186,7 @@ UniqueFd listen_l2cap_psm(std::uint16_t psm) {
   }
 
   const std::array<std::uint8_t, 6> any_address{};
-  SockaddrL2 sockaddr{};
+  sockaddr_l2 sockaddr{};
   fill_l2cap_sockaddr(sockaddr, psm, any_address);
   if (::bind(fd.get(), reinterpret_cast<const struct sockaddr *>(&sockaddr),
              sizeof(sockaddr)) < 0) {
@@ -223,7 +204,7 @@ UniqueFd listen_l2cap_psm(std::uint16_t psm) {
 
 std::optional<BtAcceptedChannel> accept_l2cap_psm(int listener_fd,
                                                   std::uint16_t psm) {
-  SockaddrL2 peer{};
+  sockaddr_l2 peer{};
   socklen_t peer_size = sizeof(peer);
   UniqueFd fd(::accept(listener_fd, reinterpret_cast<struct sockaddr *>(&peer),
                        &peer_size));
@@ -244,10 +225,8 @@ std::optional<BtAcceptedChannel> accept_l2cap_psm(int listener_fd,
                              " close-on-exec: " + std::strerror(errno));
   }
   set_nonblocking(fd.get());
-  std::array<std::uint8_t, 6> address{};
-  std::copy(peer.address, peer.address + address.size(), address.begin());
   return BtAcceptedChannel{
-      .address = bluetooth_address_string(address),
+      .address = bluetooth_address_string(peer.l2_bdaddr),
       .fd = std::move(fd),
   };
 }
@@ -256,25 +235,13 @@ std::optional<BtAcceptedChannel> accept_l2cap_psm(int listener_fd,
 
 std::array<std::uint8_t, 6>
 parse_bluetooth_address(const std::string &address) {
-  if (address.size() != 17) {
+  bdaddr_t parsed_address{};
+  if (::str2ba(address.c_str(), &parsed_address) < 0) {
     throw std::invalid_argument("Bluetooth address must be XX:XX:XX:XX:XX:XX");
   }
 
   std::array<std::uint8_t, 6> parsed{};
-  for (std::size_t part = 0; part < parsed.size(); ++part) {
-    const std::size_t offset = part * 3;
-    if (part != 5 && address[offset + 2] != ':') {
-      throw std::invalid_argument(
-          "Bluetooth address must be XX:XX:XX:XX:XX:XX");
-    }
-
-    const int high = hex_nibble(address[offset]);
-    const int low = hex_nibble(address[offset + 1]);
-    if (high < 0 || low < 0) {
-      throw std::invalid_argument("Bluetooth address contains non-hex digits");
-    }
-    parsed[5 - part] = static_cast<std::uint8_t>((high << 4) | low);
-  }
+  std::copy(parsed_address.b, parsed_address.b + parsed.size(), parsed.begin());
   return parsed;
 }
 
