@@ -119,7 +119,6 @@ struct TraceState {
   std::uint64_t dropped_audio_haptics_count = 0;
   std::uint64_t queue_dropped_audio_haptics_count = 0;
   std::uint64_t blocked_audio_haptics_count = 0;
-  std::uint64_t skipped_silent_audio_count = 0;
   std::uint64_t deferred_bt_state_count = 0;
   std::uint64_t coalesced_bt_state_count = 0;
   std::uint64_t blocked_bt_state_count = 0;
@@ -139,6 +138,8 @@ struct TraceState {
   std::array<std::uint8_t, kUsbInputButtonsSize> last_input_buttons{};
   bool have_last_input_buttons = false;
   bool audio_haptics_nonzero_seen = false;
+  bool haptics_burst_active = false;
+  std::uint64_t haptics_burst_chunks = 0;
 };
 
 struct VirtualPort {
@@ -153,7 +154,6 @@ struct VirtualPort {
   std::optional<vds::DsState> pending_bt_state;
   std::optional<vds::BtStateReport> pending_bt_state_report;
   Clock::time_point next_haptics_send_time{};
-  bool audio_signal_active = false;
   bool speaker_waveout_selected = true;
   bool speaker_waveout_active = false;
   std::uint32_t speaker_waveout_phase = 0;
@@ -574,7 +574,7 @@ bool write_vds_frame(VirtualPort &port, std::span<const std::uint8_t> bytes,
             port.trace_state.dropped_usb_frame_count % 1000 == 0) {
           logger.log(
               "port", vds::LogLevel::Warn,
-              port.path + " USB frame queue full count=" +
+              port.path + " vDS write queue full count=" +
                   std::to_string(port.trace_state.dropped_usb_frame_count));
         }
       }
@@ -722,7 +722,6 @@ void reset_virtual_port(VirtualPort &port) {
   port.pending_bt_state.reset();
   port.pending_bt_state_report.reset();
   port.next_haptics_send_time = {};
-  port.audio_signal_active = false;
   port.speaker_waveout_selected = true;
   port.speaker_waveout_active = false;
   port.speaker_waveout_phase = 0;
@@ -735,7 +734,6 @@ void reset_virtual_port(VirtualPort &port) {
 void disconnect_virtual_port(VirtualPort &port, vds::Logger &logger) {
   port.pending_audio_chunks.clear();
   port.next_haptics_send_time = {};
-  port.audio_signal_active = false;
   port.speaker_waveout_active = false;
   port.speaker_waveout_phase = 0;
   try {
@@ -952,7 +950,6 @@ void handle_frame(const vds_frame_header &header,
           port.output_state.set_audio_out_stream_active(speaker_waveout);
           if (!speaker_waveout) {
             port.pending_audio_chunks.clear();
-            port.audio_signal_active = false;
           }
           if (bt_backend) {
             forward_bt_state_if_changed(port, *bt_backend, trace_flags, logger,
@@ -992,16 +989,28 @@ void handle_frame(const vds_frame_header &header,
   }
 
   std::size_t queued_chunks = 0;
-  std::size_t skipped_silence_chunks = 0;
   std::size_t dropped_chunks = 0;
   const auto audio_start = Clock::now();
   const auto extract_start = Clock::now();
   const auto chunks = port.extractor.push_usb_audio(payload);
   const auto extract_duration = Clock::now() - extract_start;
   for (const auto &chunk : chunks) {
-    if (!chunk.has_signal && !port.audio_signal_active) {
-      ++skipped_silence_chunks;
-      continue;
+    if (output_trace) {
+      if (chunk.has_haptics_signal) {
+        if (!port.trace_state.haptics_burst_active) {
+          logger.log("audio", vds::LogLevel::Debug,
+                     port.path + " haptics burst start");
+          port.trace_state.haptics_burst_active = true;
+          port.trace_state.haptics_burst_chunks = 0;
+        }
+        ++port.trace_state.haptics_burst_chunks;
+      } else if (port.trace_state.haptics_burst_active) {
+        logger.log("audio", vds::LogLevel::Debug,
+                   port.path + " haptics burst end chunks=" +
+                       std::to_string(port.trace_state.haptics_burst_chunks));
+        port.trace_state.haptics_burst_active = false;
+        port.trace_state.haptics_burst_chunks = 0;
+      }
     }
 
     /*
@@ -1041,18 +1050,6 @@ void handle_frame(const vds_frame_header &header,
             " extract_encode_us=" +
             std::to_string(duration_us(extract_duration)) + " total_us=" +
             std::to_string(duration_us(Clock::now() - audio_start)));
-  }
-  if (skipped_silence_chunks > 0) {
-    port.trace_state.skipped_silent_audio_count += skipped_silence_chunks;
-    if (output_trace &&
-        (port.trace_state.skipped_silent_audio_count ==
-             skipped_silence_chunks ||
-         port.trace_state.skipped_silent_audio_count % 1000 == 0)) {
-      logger.log(
-          "audio", vds::LogLevel::Debug,
-          port.path + " skipped silent BT 0x36 haptics packets count=" +
-              std::to_string(port.trace_state.skipped_silent_audio_count));
-    }
   }
   if (output_trace) {
     trace_output_latency(
@@ -1393,7 +1390,6 @@ void sync_virtual_ports(std::vector<VirtualPort> &ports,
         .pending_bt_state = std::nullopt,
         .pending_bt_state_report = std::nullopt,
         .next_haptics_send_time = {},
-        .audio_signal_active = false,
         .speaker_waveout_selected = true,
         .speaker_waveout_active = false,
         .speaker_waveout_phase = 0,
@@ -1652,7 +1648,6 @@ bool flush_pending_audio_chunk(VirtualPort &port,
 
   const auto send_duration = Clock::now() - send_start;
   port.pending_audio_chunks.pop_front();
-  port.audio_signal_active = chunk.has_signal;
   port.last_sent_bt_state = port.output_state.state();
   if (port.pending_bt_state &&
       *port.pending_bt_state == *port.last_sent_bt_state) {

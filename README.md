@@ -40,11 +40,14 @@ Application
   -(Bluetooth HID Control/Interrupt)-> DualSense (Edge) controller
 ```
 
-Currently, the virtual USB HID polling intervals match each controller's USB HID
-specification: DualSense HID IN/OUT run at 250 Hz, while DualSense Edge HID IN
-runs at 1000 Hz and HID OUT runs at 250 Hz. These values affect host-side HID
-report scheduling, input/output latency, USB/HCD wakeups, and CPU/context-switch
-load.
+Currently, the virtual USB HID endpoint descriptors match each controller's USB
+HID specification: DualSense HID IN/OUT use 4 ms intervals, while DualSense Edge
+HID IN uses 1 ms and HID OUT uses 4 ms. vDS uses the HID IN interval to pace
+virtual USB input URB completion, so it affects host-side input report
+scheduling, input delivery latency, and USB/HCD wakeups while input reports are
+active. HID OUT still matches the real controller descriptors, but output
+reports are forwarded when the host submits them rather than by a separate
+periodic OUT scheduler.
 
 ## Dependencies
 
@@ -178,6 +181,13 @@ sudo vdsd
 ```
 
 Bind two paired/trusted Bluetooth DualSense or DualSense Edge controllers:
+
+> [!TIP]
+>
+> Some games support DualSense but not DualSense Edge. With vDS, you can expose
+> a DualSense Edge as a regular DualSense by passing `--identity ds5`. The
+> `--identity` option selects the virtual controller profile seen by the system,
+> not the physical controller model.
 
 ```sh
 sudo vdsctl attach aa:bb:cc:dd:ee:01 --identity ds5 --limit-dev /dev/vds0

@@ -593,9 +593,18 @@ static int vds_queue_input_packet_locked(struct vds_hcd_dev *dev,
 {
 	struct vds_input_packet *packet;
 
-	/* Keep at most 32 HID IN reports without a pending URB. */
-	if (dev->input_packet_count >= 32)
-		return -ENOSPC;
+	if (!list_empty(&dev->input_packets)) {
+		/*
+		 * HID IN reports are controller state snapshots. If the host
+		 * is temporarily not polling, keep the newest state instead of
+		 * replaying stale inputs later.
+		 */
+		packet = list_last_entry(&dev->input_packets,
+					 struct vds_input_packet, list);
+		packet->length = length;
+		memcpy(packet->payload, payload, length);
+		return 0;
+	}
 
 	packet = kmalloc_obj(*packet, GFP_ATOMIC);
 	if (!packet)

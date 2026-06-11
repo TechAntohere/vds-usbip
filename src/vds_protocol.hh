@@ -39,6 +39,7 @@ struct AudioChunk {
   HapticsChunk haptics;
   SpeakerChunk speaker;
   bool has_signal = false;
+  bool has_haptics_signal = false;
 };
 
 void fill_output_report_checksum(std::span<std::uint8_t> report);
@@ -96,8 +97,11 @@ private:
   std::size_t pending_frame_pos_ = 0;
   std::size_t speaker_frame_pos_ = 0;
   std::size_t haptics_chunk_pos_ = 0;
-  std::uint32_t decimation_phase_ = 0;
+  std::int32_t haptics_bucket_left_ = 0;
+  std::int32_t haptics_bucket_right_ = 0;
+  std::uint32_t haptics_bucket_frames_ = 0;
   bool chunk_has_signal_ = false;
+  bool chunk_has_haptics_signal_ = false;
 };
 
 std::vector<std::uint8_t> frame_bytes(std::uint16_t type,

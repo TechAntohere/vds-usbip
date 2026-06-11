@@ -37,7 +37,7 @@ constexpr std::size_t kBtStateOffset = 3;
 constexpr std::size_t kSpeakerBlockOffset = 142;
 constexpr std::size_t kSpeakerDataOffset = 144;
 constexpr int kSpeakerOpusBitrate = kSpeakerOpusSize * 8 * 100;
-constexpr std::uint8_t kBtHapticsAudioBufferLength = 128;
+constexpr std::uint8_t kBtHapticsAudioBufferLength = 64;
 constexpr std::size_t kOutputFlag0Offset = 0;
 constexpr std::size_t kOutputFlag1Offset = 1;
 constexpr std::size_t kOutputHeadphoneVolumeOffset = 4;
@@ -393,11 +393,6 @@ BtReport HapticsPacketBuilder::build_packet(
   packet[2] = 0x11 | (1 << 7);
   packet[3] = 7;
   packet[4] = 0xfe;
-  /*
-   * The controller accepts a larger haptics buffer length than the nominal
-   * 64-byte sample block. Use the largest observed working value to absorb
-   * Linux userspace scheduling jitter and reduce Bluetooth audio underruns.
-   */
   packet[5] = kBtHapticsAudioBufferLength;
   packet[6] = kBtHapticsAudioBufferLength;
   packet[7] = kBtHapticsAudioBufferLength;
@@ -432,12 +427,22 @@ PcmAudioExtractor::push_usb_audio(std::span<const std::uint8_t> pcm_bytes) {
 
     speaker_input_[speaker_frame_pos_ * kSpeakerChannels + 0] = samples[0];
     speaker_input_[speaker_frame_pos_ * kSpeakerChannels + 1] = samples[1];
+    chunk_has_haptics_signal_ |= samples[2] != 0 || samples[3] != 0;
     ++speaker_frame_pos_;
 
-    if (++decimation_phase_ == kHapticsDecimation) {
-      decimation_phase_ = 0;
-      haptics_chunk_[haptics_chunk_pos_++] = s16_to_s8_haptic(samples[2]);
-      haptics_chunk_[haptics_chunk_pos_++] = s16_to_s8_haptic(samples[3]);
+    haptics_bucket_left_ += samples[2];
+    haptics_bucket_right_ += samples[3];
+    if (++haptics_bucket_frames_ == kHapticsDecimation) {
+      const auto left = static_cast<std::int16_t>(
+          haptics_bucket_left_ / static_cast<std::int32_t>(kHapticsDecimation));
+      const auto right = static_cast<std::int16_t>(
+          haptics_bucket_right_ /
+          static_cast<std::int32_t>(kHapticsDecimation));
+      haptics_chunk_[haptics_chunk_pos_++] = s16_to_s8_haptic(left);
+      haptics_chunk_[haptics_chunk_pos_++] = s16_to_s8_haptic(right);
+      haptics_bucket_left_ = 0;
+      haptics_bucket_right_ = 0;
+      haptics_bucket_frames_ = 0;
     }
 
     if (speaker_frame_pos_ != kSpeakerInputFrames) {
@@ -449,10 +454,12 @@ PcmAudioExtractor::push_usb_audio(std::span<const std::uint8_t> pcm_bytes) {
     chunk.haptics = haptics_chunk_;
     chunk.speaker = speaker_encoder_->encode(speaker_input_);
     chunk.has_signal = chunk_has_signal_;
+    chunk.has_haptics_signal = chunk_has_haptics_signal_;
     chunks.push_back(chunk);
     haptics_chunk_.fill(0);
     haptics_chunk_pos_ = 0;
     chunk_has_signal_ = false;
+    chunk_has_haptics_signal_ = false;
   };
 
   while (!pcm_bytes.empty()) {
