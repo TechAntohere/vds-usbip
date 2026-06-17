@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com>
 
-#include <algorithm>
-#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -13,35 +11,17 @@
 
 #include <libudev.h>
 
-#include <fcntl.h>
-
+#include "vds_common.hh"
 #include "vds_config.hh"
+#include "vds_io.hh"
 #include "vds_udev.hh"
 
 namespace {
 
-bool is_decimal_number(std::string_view text) {
-  return !text.empty() && std::all_of(text.begin(), text.end(), [](char ch) {
-    return std::isdigit(static_cast<unsigned char>(ch)) != 0;
-  });
-}
-
 bool is_vds_device_path(std::string_view path) {
   constexpr std::string_view prefix = "/dev/vds";
   return path.rfind(prefix, 0) == 0 &&
-         is_decimal_number(path.substr(prefix.size()));
-}
-
-void set_nonblocking(int fd) {
-  const int flags = ::fcntl(fd, F_GETFL, 0);
-  if (flags < 0) {
-    throw std::runtime_error("failed to read udev monitor flags: " +
-                             std::string(std::strerror(errno)));
-  }
-  if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-    throw std::runtime_error("failed to set udev monitor nonblocking: " +
-                             std::string(std::strerror(errno)));
-  }
+         vds::is_decimal_number(path.substr(prefix.size()));
 }
 
 std::string require_vds_devnode(udev_device *device) {
@@ -185,7 +165,7 @@ VdsDeviceMonitor::VdsDeviceMonitor() {
     udev_ = nullptr;
     throw std::runtime_error("failed to enable udev monitor");
   }
-  set_nonblocking(fd());
+  set_nonblocking(fd(), "udev monitor");
 }
 
 VdsDeviceMonitor::~VdsDeviceMonitor() {

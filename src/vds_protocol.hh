@@ -6,11 +6,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
-#include "vds/ds5.h"
+#include "vds/ds5_protocol.h"
 
 namespace vds {
 
@@ -44,6 +45,15 @@ struct AudioChunk {
 
 void fill_output_report_checksum(std::span<std::uint8_t> report);
 void fill_feature_report_checksum(std::span<std::uint8_t> report);
+std::vector<std::uint8_t>
+hidp_output_packet(std::span<const std::uint8_t> report);
+std::vector<std::uint8_t> feature_get_packet(std::uint8_t report_id);
+std::vector<std::uint8_t>
+feature_set_packet(std::span<const std::uint8_t> report);
+std::optional<UsbInputReport>
+bt_input_to_usb_input(std::span<const std::uint8_t> packet);
+std::optional<std::vector<std::uint8_t>>
+bt_feature_to_usb_feature_reply(std::span<const std::uint8_t> packet);
 
 class HapticsPacketBuilder {
 public:
@@ -74,7 +84,8 @@ private:
 
 class PcmAudioExtractor {
 public:
-  PcmAudioExtractor();
+  explicit PcmAudioExtractor(
+      std::size_t speaker_input_frames = kSpeakerInputFrames);
   ~PcmAudioExtractor();
 
   PcmAudioExtractor(PcmAudioExtractor &&) noexcept;
@@ -93,13 +104,10 @@ private:
   std::array<std::uint8_t, VDS_AUDIO_CHANNELS * sizeof(std::int16_t)>
       pending_frame_{};
   SpeakerInput speaker_input_{};
-  HapticsChunk haptics_chunk_{};
+  SpeakerInput haptics_input_{};
+  std::size_t speaker_input_frames_ = kSpeakerInputFrames;
   std::size_t pending_frame_pos_ = 0;
   std::size_t speaker_frame_pos_ = 0;
-  std::size_t haptics_chunk_pos_ = 0;
-  std::int32_t haptics_bucket_left_ = 0;
-  std::int32_t haptics_bucket_right_ = 0;
-  std::uint32_t haptics_bucket_frames_ = 0;
   bool chunk_has_signal_ = false;
   bool chunk_has_haptics_signal_ = false;
 };

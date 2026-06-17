@@ -1,10 +1,14 @@
+# SPDX-License-Identifier: MIT
 *
 !/.gitignore
 
 !/CMakeLists.txt
 !/LICENSE
 !/README.md
+!/README-LINUX.md
+!/README-WINDOWS.md
 !/*.conf
+!/*.ps1
 !/*.rules
 
 !/include/
@@ -32,3 +36,21 @@
 !/src/**/*.hh
 !/src/**/*.hpp
 !/src/**/*.hxx
+
+!/windrv/
+!/windrv/**/
+!/windrv/**/*.c
+!/windrv/**/*.cc
+!/windrv/**/*.cpp
+!/windrv/**/*.cxx
+!/windrv/**/*.h
+!/windrv/**/*.hh
+!/windrv/**/*.hpp
+!/windrv/**/*.hxx
+!/windrv/**/*.cmd
+!/windrv/**/*.inf
+!/windrv/**/*.ps1
+!/windrv/**/*.reg
+!/windrv/**/*.vcxproj
+/windrv/**/build/
+/windrv/**/package/

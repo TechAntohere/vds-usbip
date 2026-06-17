@@ -1,19 +1,31 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com> */
 /*
- * DualSense protocol structures derived from DS5Dongle.
+ * DualSense Bluetooth and behavior protocol data derived from DS5Dongle.
  *
  * DS5Dongle source attribution:
  * Copyright (c) 2026 awalol, released under the MIT license.
  */
-#ifndef _VDS_DS5_H
-#define _VDS_DS5_H
+#ifndef _VDS_DS5_PROTOCOL_H
+#define _VDS_DS5_PROTOCOL_H
 
+#ifdef _WIN32
+#ifdef _KERNEL_MODE
+typedef unsigned char vds_u8;
+typedef unsigned long vds_u32;
+#else
+#include <stdint.h>
+typedef uint8_t vds_u8;
+typedef uint32_t vds_u32;
+#endif
+#else
 #include <linux/types.h>
 typedef __u8 vds_u8;
 typedef __u32 vds_u32;
+#endif
 
 #define VDS_SONY_VENDOR_ID 0x054c
+
 #define VDS_DS5_PRODUCT_ID 0x0ce6
 #define VDS_DSE_PRODUCT_ID 0x0df2
 
@@ -34,10 +46,6 @@ typedef __u32 vds_u32;
 #define VDS_AUDIO_CHANNELS 4
 #define VDS_AUDIO_SAMPLE_RATE 48000
 #define VDS_HAPTICS_SAMPLE_RATE 3000
-
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 #pragma pack(push, 1)
 struct vds_set_state_data {
@@ -108,10 +116,8 @@ struct vds_set_state_data {
 #pragma pack(pop)
 
 #ifdef __cplusplus
-}
-
 static_assert(sizeof(struct vds_set_state_data) == VDS_SET_STATE_SIZE,
 	      "DualSense SetStateData layout must stay protocol-sized");
 #endif
 
-#endif /* _VDS_DS5_H */
+#endif /* _VDS_DS5_PROTOCOL_H */

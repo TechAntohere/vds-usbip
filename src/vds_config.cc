@@ -3,12 +3,9 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cerrno>
 #include <cstdio>
-#include <cstring>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -16,17 +13,22 @@
 #include <utility>
 #include <vector>
 
-#include <fcntl.h>
-#include <sys/file.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
-#include "unique_fd.hh"
+#include "vds_common.hh"
 #include "vds_config.hh"
+#include "vds_fs.hh"
 
 namespace {
 
-constexpr mode_t kVdsFileMode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP;
+struct JsonValue {
+  std::string string_value;
+  std::vector<unsigned> array_value;
+  bool is_array = false;
+};
+
+struct JsonField {
+  std::string key;
+  JsonValue value;
+};
 
 bool is_hex_digit(char ch) {
   return std::isxdigit(static_cast<unsigned char>(ch)) != 0;
@@ -34,18 +36,6 @@ bool is_hex_digit(char ch) {
 
 char lowercase_hex(char ch) {
   return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-}
-
-bool is_decimal_number(std::string_view text) {
-  return !text.empty() && std::all_of(text.begin(), text.end(), [](char ch) {
-    return std::isdigit(static_cast<unsigned char>(ch)) != 0;
-  });
-}
-
-bool is_vds_device_path(std::string_view path) {
-  constexpr std::string_view prefix = "/dev/vds";
-  return path.rfind(prefix, 0) == 0 &&
-         is_decimal_number(path.substr(prefix.size()));
 }
 
 std::vector<std::string> split_commas(std::string_view text) {
@@ -57,7 +47,7 @@ std::vector<std::string> split_commas(std::string_view text) {
         offset, comma == std::string_view::npos ? std::string_view::npos
                                                 : comma - offset);
     if (part.empty()) {
-      throw std::runtime_error("empty device in limit-dev list");
+      throw std::runtime_error("empty port in ports list");
     }
     parts.emplace_back(part);
     if (comma == std::string_view::npos) {
@@ -66,73 +56,6 @@ std::vector<std::string> split_commas(std::string_view text) {
     offset = comma + 1;
   }
   return parts;
-}
-
-void ensure_db_directory(const std::filesystem::path &path) {
-  const std::filesystem::path directory = path.parent_path();
-  if (!directory.empty()) {
-    std::filesystem::create_directories(directory);
-  }
-}
-
-std::filesystem::path db_directory(const std::filesystem::path &db_path) {
-  const std::filesystem::path directory = db_path.parent_path();
-  if (directory.empty()) {
-    return ".";
-  }
-  return directory;
-}
-
-void chmod_db_file_if_exists(const std::filesystem::path &db_path) {
-  if (::chmod(db_path.c_str(), kVdsFileMode) < 0 && errno != ENOENT) {
-    throw std::runtime_error("failed to chmod " + db_path.string() + ": " +
-                             std::strerror(errno));
-  }
-}
-
-vds::UniqueFd lock_db_directory(const std::filesystem::path &db_path) {
-  const std::filesystem::path directory = db_directory(db_path);
-  vds::UniqueFd fd(
-      ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-  if (!fd) {
-    throw std::runtime_error("failed to open DB directory " +
-                             directory.string() + ": " + std::strerror(errno));
-  }
-  if (::flock(fd.get(), LOCK_EX) < 0) {
-    throw std::runtime_error("failed to lock DB directory " +
-                             directory.string() + ": " + std::strerror(errno));
-  }
-  chmod_db_file_if_exists(db_path);
-  return fd;
-}
-
-std::string read_file_if_exists(const std::filesystem::path &path) {
-  std::error_code error;
-  if (!std::filesystem::exists(path, error)) {
-    if (!error) {
-      return {};
-    }
-    throw std::runtime_error("failed to stat " + path.string() + ": " +
-                             error.message());
-  }
-
-  std::ifstream file(path);
-  if (!file) {
-    throw std::runtime_error("failed to open " + path.string());
-  }
-  return std::string(std::istreambuf_iterator<char>(file),
-                     std::istreambuf_iterator<char>());
-}
-
-std::string serialize_limit_devices(const std::vector<std::string> &devices) {
-  std::string text;
-  for (std::size_t i = 0; i < devices.size(); ++i) {
-    if (i > 0) {
-      text += ',';
-    }
-    text += devices[i];
-  }
-  return text;
 }
 
 void skip_json_space(std::string_view text, std::size_t &offset) {
@@ -146,7 +69,7 @@ void require_json_char(std::string_view text, std::size_t &offset,
                        char expected, std::size_t line_number) {
   skip_json_space(text, offset);
   if (offset >= text.size() || text[offset] != expected) {
-    throw std::runtime_error("invalid JSON binding record at line " +
+    throw std::runtime_error("invalid JSON config record at line " +
                              std::to_string(line_number));
   }
   ++offset;
@@ -240,9 +163,88 @@ std::string parse_json_string(std::string_view text, std::size_t &offset,
                            std::to_string(line_number));
 }
 
-std::vector<std::pair<std::string, std::string>>
-parse_json_object(std::string_view line, std::size_t line_number) {
-  std::vector<std::pair<std::string, std::string>> fields;
+unsigned parse_json_unsigned(std::string_view text, std::size_t &offset,
+                             std::size_t line_number) {
+  skip_json_space(text, offset);
+  const std::size_t start = offset;
+  while (offset < text.size() &&
+         std::isdigit(static_cast<unsigned char>(text[offset])) != 0) {
+    ++offset;
+  }
+  if (start == offset) {
+    throw std::runtime_error("expected JSON unsigned integer at line " +
+                             std::to_string(line_number));
+  }
+
+  unsigned long long value = 0;
+  for (const char ch : text.substr(start, offset - start)) {
+    value = value * 10 + static_cast<unsigned>(ch - '0');
+    if (value > std::numeric_limits<unsigned>::max()) {
+      throw std::runtime_error("JSON unsigned integer overflow at line " +
+                               std::to_string(line_number));
+    }
+  }
+  return static_cast<unsigned>(value);
+}
+
+std::vector<unsigned> parse_json_unsigned_array(std::string_view text,
+                                                std::size_t &offset,
+                                                std::size_t line_number) {
+  std::vector<unsigned> values;
+  require_json_char(text, offset, '[', line_number);
+  skip_json_space(text, offset);
+  if (offset < text.size() && text[offset] == ']') {
+    ++offset;
+    return values;
+  }
+
+  while (true) {
+    values.push_back(parse_json_unsigned(text, offset, line_number));
+    skip_json_space(text, offset);
+    if (offset >= text.size()) {
+      throw std::runtime_error("unterminated JSON array at line " +
+                               std::to_string(line_number));
+    }
+    if (text[offset] == ']') {
+      ++offset;
+      return values;
+    }
+    if (text[offset] != ',') {
+      throw std::runtime_error("expected JSON array separator at line " +
+                               std::to_string(line_number));
+    }
+    ++offset;
+  }
+}
+
+JsonValue parse_json_value(std::string_view line, std::size_t &offset,
+                           std::size_t line_number) {
+  skip_json_space(line, offset);
+  if (offset >= line.size()) {
+    throw std::runtime_error("missing JSON value at line " +
+                             std::to_string(line_number));
+  }
+  if (line[offset] == '"') {
+    return JsonValue{
+        .string_value = parse_json_string(line, offset, line_number),
+        .array_value = {},
+        .is_array = false,
+    };
+  }
+  if (line[offset] == '[') {
+    return JsonValue{
+        .string_value = {},
+        .array_value = parse_json_unsigned_array(line, offset, line_number),
+        .is_array = true,
+    };
+  }
+  throw std::runtime_error("unsupported JSON value at line " +
+                           std::to_string(line_number));
+}
+
+std::vector<JsonField> parse_json_object(std::string_view line,
+                                         std::size_t line_number) {
+  std::vector<JsonField> fields;
   std::size_t offset = 0;
 
   require_json_char(line, offset, '{', line_number);
@@ -260,8 +262,10 @@ parse_json_object(std::string_view line, std::size_t line_number) {
   while (true) {
     std::string key = parse_json_string(line, offset, line_number);
     require_json_char(line, offset, ':', line_number);
-    std::string value = parse_json_string(line, offset, line_number);
-    fields.emplace_back(std::move(key), std::move(value));
+    fields.push_back(JsonField{
+        .key = std::move(key),
+        .value = parse_json_value(line, offset, line_number),
+    });
 
     skip_json_space(line, offset);
     if (offset >= line.size()) {
@@ -325,69 +329,119 @@ std::string escape_json_string(std::string_view text) {
   return escaped;
 }
 
-std::string serialize_binding_db(const vds::BindingDb &db) {
+std::string serialize_ports(std::span<const unsigned> ports) {
+  std::string text = "[";
+  for (std::size_t i = 0; i < ports.size(); ++i) {
+    if (i > 0) {
+      text += ',';
+    }
+    text += std::to_string(ports[i]);
+  }
+  text += ']';
+  return text;
+}
+
+std::string serialize_config_db(const vds::ConfigDb &db) {
   std::string text;
   for (const auto &controller : db.controllers) {
-    text += "{\"address\": \"";
+    text += "{\"address\":\"";
     text += escape_json_string(controller.address);
-    text += "\", \"identity\": \"";
-    text += escape_json_string(vds::binding_identity_name(controller.identity));
-    text += "\", \"limit\": \"";
+    text += "\",\"profile\":\"";
     text +=
-        escape_json_string(serialize_limit_devices(controller.limit_devices));
-    text += "\"}\n";
+        escape_json_string(vds::controller_profile_name(controller.profile));
+    text += "\",\"ports\":";
+    text += serialize_ports(controller.ports);
+    text += "}\n";
   }
   return text;
 }
 
-vds::ControllerBindingConfig parse_controller_line(const std::string &line,
-                                                   std::size_t line_number) {
-  vds::ControllerBindingConfig binding{
+void require_string_value(const JsonValue &value, std::string_view key,
+                          std::size_t line_number) {
+  if (value.is_array) {
+    throw std::runtime_error("field " + std::string(key) +
+                             " must be a string at line " +
+                             std::to_string(line_number));
+  }
+}
+
+void require_array_value(const JsonValue &value, std::string_view key,
+                         std::size_t line_number) {
+  if (!value.is_array) {
+    throw std::runtime_error("field " + std::string(key) +
+                             " must be an array at line " +
+                             std::to_string(line_number));
+  }
+}
+
+void validate_ports(std::vector<unsigned> &ports) {
+  std::sort(ports.begin(), ports.end());
+  const auto duplicate = std::adjacent_find(ports.begin(), ports.end());
+  if (duplicate != ports.end()) {
+    throw std::runtime_error("duplicate port: " + std::to_string(*duplicate));
+  }
+  for (const unsigned port : ports) {
+    if (port >= vds::kMaxPortCount) {
+      throw std::runtime_error("port must be in range 0.." +
+                               std::to_string(vds::kMaxPortCount - 1) + ": " +
+                               std::to_string(port));
+    }
+  }
+}
+
+vds::ControllerConfig parse_controller_line(const std::string &line,
+                                            std::size_t line_number) {
+  vds::ControllerConfig config{
       .address = {},
-      .identity = vds::BindingIdentity::Auto,
-      .limit_devices = {},
+      .profile = vds::ControllerProfile::Unspecified,
+      .ports = {},
   };
   bool have_address = false;
-  bool have_identity = false;
-  bool have_limit = false;
+  bool have_profile = false;
+  bool have_ports = false;
 
-  for (const auto &[key, value] : parse_json_object(line, line_number)) {
-    if (key == "address") {
+  for (const auto &field : parse_json_object(line, line_number)) {
+    if (field.key == "address") {
       if (have_address) {
         throw std::runtime_error("duplicate address field at line " +
                                  std::to_string(line_number));
       }
-      binding.address = vds::normalize_bluetooth_address(value);
+      require_string_value(field.value, field.key, line_number);
+      config.address =
+          vds::normalize_bluetooth_address(field.value.string_value);
       have_address = true;
-    } else if (key == "identity") {
-      if (have_identity) {
-        throw std::runtime_error("duplicate identity field at line " +
+    } else if (field.key == "profile") {
+      if (have_profile) {
+        throw std::runtime_error("duplicate profile field at line " +
                                  std::to_string(line_number));
       }
-      binding.identity = vds::parse_binding_identity(value);
-      have_identity = true;
-    } else if (key == "limit") {
-      if (have_limit) {
-        throw std::runtime_error("duplicate limit field at line " +
+      require_string_value(field.value, field.key, line_number);
+      config.profile = vds::parse_controller_profile(field.value.string_value);
+      have_profile = true;
+    } else if (field.key == "ports") {
+      if (have_ports) {
+        throw std::runtime_error("duplicate ports field at line " +
                                  std::to_string(line_number));
       }
-      binding.limit_devices = vds::parse_limit_devices(value);
-      have_limit = true;
+      require_array_value(field.value, field.key, line_number);
+      config.ports = field.value.array_value;
+      validate_ports(config.ports);
+      have_ports = true;
     } else {
-      throw std::runtime_error("unknown JSON binding field at line " +
-                               std::to_string(line_number) + ": " + key);
+      throw std::runtime_error("unknown JSON config field at line " +
+                               std::to_string(line_number) + ": " + field.key);
     }
   }
 
-  if (!have_address || !have_identity || !have_limit) {
+  if (!have_address || !have_profile || !have_ports) {
     throw std::runtime_error("missing controller field at line " +
                              std::to_string(line_number));
   }
-  return binding;
+  return config;
 }
 
-vds::BindingDb parse_binding_db(std::string_view text) {
-  vds::BindingDb db;
+vds::ConfigDb parse_config_db(std::string_view text) {
+  vds::ConfigDb db;
   std::istringstream stream{std::string(text)};
   std::string line;
   std::size_t line_number = 0;
@@ -400,76 +454,19 @@ vds::BindingDb parse_binding_db(std::string_view text) {
     if (line.empty()) {
       continue;
     }
-    vds::ControllerBindingConfig binding =
-        parse_controller_line(line, line_number);
+    vds::ControllerConfig config = parse_controller_line(line, line_number);
     const auto duplicate =
         std::find_if(db.controllers.begin(), db.controllers.end(),
-                     [&](const vds::ControllerBindingConfig &existing) {
-                       return existing.address == binding.address;
+                     [&](const vds::ControllerConfig &existing) {
+                       return existing.address == config.address;
                      });
     if (duplicate != db.controllers.end()) {
       throw std::runtime_error("duplicate controller address at line " +
                                std::to_string(line_number));
     }
-    db.controllers.push_back(std::move(binding));
+    db.controllers.push_back(std::move(config));
   }
   return db;
-}
-
-void write_file_atomic(const std::filesystem::path &path,
-                       const std::string &text) {
-  const std::filesystem::path tmp_path = path.string() + ".tmp";
-  {
-    vds::UniqueFd fd(::open(tmp_path.c_str(),
-                            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
-                            kVdsFileMode));
-    if (!fd) {
-      throw std::runtime_error("failed to open " + tmp_path.string() + ": " +
-                               std::strerror(errno));
-    }
-    if (::fchmod(fd.get(), kVdsFileMode) < 0) {
-      throw std::runtime_error("failed to chmod " + tmp_path.string() + ": " +
-                               std::strerror(errno));
-    }
-    const char *data = text.data();
-    std::size_t size = text.size();
-    while (size > 0) {
-      const ssize_t written = ::write(fd.get(), data, size);
-      if (written < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        throw std::runtime_error("failed to write " + tmp_path.string() + ": " +
-                                 std::strerror(errno));
-      }
-      if (written == 0) {
-        throw std::runtime_error("write returned zero for " +
-                                 tmp_path.string());
-      }
-      data += written;
-      size -= static_cast<std::size_t>(written);
-    }
-    if (::fsync(fd.get()) < 0) {
-      throw std::runtime_error("failed to fsync " + tmp_path.string() + ": " +
-                               std::strerror(errno));
-    }
-  }
-  if (::rename(tmp_path.c_str(), path.c_str()) < 0) {
-    throw std::runtime_error("failed to rename " + tmp_path.string() + " to " +
-                             path.string() + ": " + std::strerror(errno));
-  }
-  const std::filesystem::path directory = db_directory(path);
-  const vds::UniqueFd directory_fd(
-      ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-  if (!directory_fd) {
-    throw std::runtime_error(std::string("failed to open DB directory for "
-                                         "fsync: ") +
-                             std::strerror(errno));
-  }
-  if (::fsync(directory_fd.get()) < 0) {
-    throw std::runtime_error(std::string("failed to fsync DB directory: ") +
-                             std::strerror(errno));
-  }
 }
 
 } // namespace
@@ -503,95 +500,220 @@ std::string normalize_bluetooth_address(std::string_view address) {
   return normalized;
 }
 
-BindingIdentity parse_binding_identity(std::string_view identity) {
-  if (identity == "auto") {
-    return BindingIdentity::Auto;
+ControllerProfile parse_controller_profile(std::string_view profile) {
+  if (profile.empty()) {
+    return ControllerProfile::Unspecified;
   }
-  if (identity == "ds5" || identity == "dualsense") {
-    return BindingIdentity::Ds5;
+  if (profile == "ds5") {
+    return ControllerProfile::Ds5;
   }
-  if (identity == "dse" || identity == "dualsense-edge") {
-    return BindingIdentity::Dse;
+  if (profile == "dse") {
+    return ControllerProfile::Dse;
   }
-  throw std::runtime_error("unknown identity: " + std::string(identity));
+  throw std::runtime_error("unknown profile: " + std::string(profile));
 }
 
-std::string binding_identity_name(BindingIdentity identity) {
-  switch (identity) {
-  case BindingIdentity::Auto:
-    return "auto";
-  case BindingIdentity::Ds5:
+std::string controller_profile_name(ControllerProfile profile) {
+  switch (profile) {
+  case ControllerProfile::Unspecified:
+    return "";
+  case ControllerProfile::Ds5:
     return "ds5";
-  case BindingIdentity::Dse:
+  case ControllerProfile::Dse:
     return "dse";
   }
-  throw std::runtime_error("unknown binding identity");
+  throw std::runtime_error("unknown controller profile");
 }
 
-std::vector<std::string> parse_limit_devices(std::string_view text) {
+std::vector<unsigned> parse_ports(std::string_view text) {
   if (text.empty()) {
     return {};
   }
 
-  std::vector<std::string> devices = split_commas(text);
-  std::sort(devices.begin(), devices.end());
-  const auto duplicate = std::adjacent_find(devices.begin(), devices.end());
-  if (duplicate != devices.end()) {
-    throw std::runtime_error("duplicate limit device: " + *duplicate);
+  std::vector<unsigned> ports;
+  for (const auto &part : split_commas(text)) {
+    if (!vds::is_decimal_number(part)) {
+      throw std::runtime_error("port must be a number: " + part);
+    }
+    unsigned long long value = 0;
+    for (const char ch : part) {
+      value = value * 10 + static_cast<unsigned>(ch - '0');
+      if (value > std::numeric_limits<unsigned>::max()) {
+        throw std::runtime_error("port number overflow: " + part);
+      }
+    }
+    ports.push_back(static_cast<unsigned>(value));
   }
-  for (const auto &device : devices) {
-    if (!is_vds_device_path(device)) {
-      throw std::runtime_error("limit device must be /dev/vdsN: " + device);
+  validate_ports(ports);
+  return ports;
+}
+
+std::string format_ports(std::span<const unsigned> ports) {
+  std::string text;
+  for (std::size_t i = 0; i < ports.size(); ++i) {
+    if (i > 0) {
+      text += ',';
+    }
+    text += std::to_string(ports[i]);
+  }
+  return text;
+}
+
+std::string port_path_for_index(unsigned port) {
+  if (port >= kMaxPortCount) {
+    throw std::runtime_error("port must be in range 0.." +
+                             std::to_string(kMaxPortCount - 1) + ": " +
+                             std::to_string(port));
+  }
+#ifdef _WIN32
+  return R"(\\.\vds)" + std::to_string(port);
+#else
+  return "/dev/vds" + std::to_string(port);
+#endif
+}
+
+std::optional<unsigned> port_index_from_path(std::string_view path) {
+#ifdef _WIN32
+  constexpr std::string_view dos_prefix = R"(\\.\vds)";
+  constexpr std::string_view nt_prefix = R"(\\?\vds)";
+  constexpr std::string_view short_prefix = "vds";
+  std::string_view port_text;
+  if (path.rfind(dos_prefix, 0) == 0) {
+    port_text = path.substr(dos_prefix.size());
+  } else if (path.rfind(nt_prefix, 0) == 0) {
+    port_text = path.substr(nt_prefix.size());
+  } else if (path.rfind(short_prefix, 0) == 0) {
+    port_text = path.substr(short_prefix.size());
+  } else {
+    return std::nullopt;
+  }
+#else
+  constexpr std::string_view prefix = "/dev/vds";
+  if (path.rfind(prefix, 0) != 0) {
+    return std::nullopt;
+  }
+  const std::string_view port_text = path.substr(prefix.size());
+#endif
+
+  if (!vds::is_decimal_number(port_text)) {
+    return std::nullopt;
+  }
+  unsigned value = 0;
+  for (const char ch : port_text) {
+    value = value * 10 + static_cast<unsigned>(ch - '0');
+    if (value >= kMaxPortCount) {
+      return std::nullopt;
     }
   }
-  return devices;
+  return value;
 }
 
-BindingDb load_binding_db(const std::string &path) {
-  const std::filesystem::path db_path(path);
-  ensure_db_directory(db_path);
-  const UniqueFd lock = lock_db_directory(db_path);
-  (void)lock;
-  return parse_binding_db(read_file_if_exists(db_path));
+bool controller_config_allows_port(const ControllerConfig &config,
+                                   unsigned port) {
+  return config.ports.empty() ||
+         std::find(config.ports.begin(), config.ports.end(), port) !=
+             config.ports.end();
 }
 
-BindingDb update_binding_db(const std::string &path,
-                            const std::function<void(BindingDb &)> &update) {
+bool controller_config_allows_path(const ControllerConfig &config,
+                                   std::string_view path) {
+  const auto port = port_index_from_path(path);
+  return port && controller_config_allows_port(config, *port);
+}
+
+std::vector<unsigned>
+controller_config_port_targets(const ControllerConfig &config) {
+  if (!config.ports.empty()) {
+    return config.ports;
+  }
+
+  std::vector<unsigned> ports;
+  ports.reserve(kMaxPortCount);
+  for (unsigned port = 0; port < kMaxPortCount; ++port) {
+    ports.push_back(port);
+  }
+  return ports;
+}
+
+bool controller_config_has_candidate_port(
+    const ControllerConfig &config, std::span<const unsigned> candidate_ports) {
+  return select_controller_config_port(config, candidate_ports).has_value();
+}
+
+std::optional<unsigned>
+select_controller_config_port(const ControllerConfig &config,
+                              std::span<const unsigned> candidate_ports,
+                              std::span<const unsigned> occupied_ports) {
+  for (const unsigned port : controller_config_port_targets(config)) {
+    if (std::find(candidate_ports.begin(), candidate_ports.end(), port) ==
+        candidate_ports.end()) {
+      continue;
+    }
+    if (std::find(occupied_ports.begin(), occupied_ports.end(), port) !=
+        occupied_ports.end()) {
+      continue;
+    }
+    return port;
+  }
+  return std::nullopt;
+}
+
+const ControllerConfig *
+find_controller_config_by_address(const ConfigDb &db,
+                                  std::string_view address) {
+  const std::string normalized = normalize_bluetooth_address(address);
+  for (const auto &config : db.controllers) {
+    if (config.address == normalized) {
+      return &config;
+    }
+  }
+  return nullptr;
+}
+
+ConfigDb load_config_db(const std::string &path) {
   const std::filesystem::path db_path(path);
-  ensure_db_directory(db_path);
-  const UniqueFd lock = lock_db_directory(db_path);
-  (void)lock;
-  BindingDb db = parse_binding_db(read_file_if_exists(db_path));
+  ensure_parent_directory(db_path);
+  const auto lock = lock_file(db_path);
+  return parse_config_db(read_file_if_exists(db_path));
+}
+
+ConfigDb update_config_db(const std::string &path,
+                          const std::function<void(ConfigDb &)> &update) {
+  const std::filesystem::path db_path(path);
+  ensure_parent_directory(db_path);
+  const auto lock = lock_file(db_path);
+  ConfigDb db = parse_config_db(read_file_if_exists(db_path));
   update(db);
-  write_file_atomic(db_path, serialize_binding_db(db));
+  write_file_atomic(db_path, serialize_config_db(db));
   return db;
 }
 
-void upsert_binding(BindingDb &db, ControllerBindingConfig binding) {
-  binding.address = normalize_bluetooth_address(binding.address);
+void upsert_controller_config(ConfigDb &db, ControllerConfig config) {
+  config.address = normalize_bluetooth_address(config.address);
+  validate_ports(config.ports);
   for (auto &controller : db.controllers) {
-    if (controller.address == binding.address) {
-      controller = std::move(binding);
+    if (controller.address == config.address) {
+      controller = std::move(config);
       return;
     }
   }
-  db.controllers.push_back(std::move(binding));
+  db.controllers.push_back(std::move(config));
 }
 
-bool remove_binding(BindingDb &db, std::string_view address) {
+bool remove_controller_config(ConfigDb &db, std::string_view address) {
   const std::string normalized = normalize_bluetooth_address(address);
   const auto old_size = db.controllers.size();
-  db.controllers.erase(
-      std::remove_if(db.controllers.begin(), db.controllers.end(),
-                     [&](const ControllerBindingConfig &binding) {
-                       return binding.address == normalized;
-                     }),
-      db.controllers.end());
+  db.controllers.erase(std::remove_if(db.controllers.begin(),
+                                      db.controllers.end(),
+                                      [&](const ControllerConfig &config) {
+                                        return config.address == normalized;
+                                      }),
+                       db.controllers.end());
   return db.controllers.size() != old_size;
 }
 
-void validate_binding_assignments(const BindingDb &db,
-                                  std::span<const std::string> devices) {
+void validate_config_assignments(const ConfigDb &db,
+                                 std::span<const std::string> devices) {
   if (db.controllers.empty()) {
     return;
   }
@@ -599,23 +721,26 @@ void validate_binding_assignments(const BindingDb &db,
     throw std::runtime_error("no available virtual ports");
   }
 
-  std::vector<std::string> sorted_devices(devices.begin(), devices.end());
-  std::sort(sorted_devices.begin(), sorted_devices.end());
+  std::vector<unsigned> available_ports;
+  for (const auto &device : devices) {
+    const auto port = port_index_from_path(device);
+    if (port) {
+      available_ports.push_back(*port);
+    }
+  }
+  std::sort(available_ports.begin(), available_ports.end());
 
-  for (const auto &binding : db.controllers) {
-    if (binding.limit_devices.empty()) {
+  for (const auto &config : db.controllers) {
+    if (config.ports.empty()) {
       continue;
     }
-
-    const auto allowed_device =
-        std::find_if(binding.limit_devices.begin(), binding.limit_devices.end(),
-                     [&](const std::string &device) {
-                       return std::binary_search(sorted_devices.begin(),
-                                                 sorted_devices.end(), device);
-                     });
-    if (allowed_device == binding.limit_devices.end()) {
-      throw std::runtime_error("no allowed virtual port for " +
-                               binding.address);
+    const auto allowed_port = std::find_if(
+        config.ports.begin(), config.ports.end(), [&](unsigned port) {
+          return std::binary_search(available_ports.begin(),
+                                    available_ports.end(), port);
+        });
+    if (allowed_port == config.ports.end()) {
+      throw std::runtime_error("no allowed virtual port for " + config.address);
     }
   }
 }

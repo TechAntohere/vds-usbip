@@ -7,11 +7,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <span>
@@ -35,21 +33,28 @@
 
 #include "uapi/vds.h"
 #include "unique_fd.hh"
-#include "vds/ds5.h"
+#include "vds/ds5_protocol.h"
 #include "vds_bluez.hh"
 #include "vds_bt.hh"
 #include "vds_build_info.hh"
+#include "vds_common.hh"
 #include "vds_config.hh"
+#include "vds_io.hh"
 #include "vds_log.hh"
+#include "vds_profile.hh"
 #include "vds_protocol.hh"
 #include "vds_udev.hh"
+#include "vdsd_common.hh"
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using vds::duration_us;
+using vds::hex_bytes;
+using vds::hex_u16;
+using vds::hex_u8;
 
 constexpr const char *kDefaultControlSocket = "/run/vdsd.sock";
-constexpr const char *kDefaultLogPath = "/var/log/vdsd.log";
 constexpr std::size_t kTraceDumpMaxBytes = 96;
 constexpr std::size_t kUsbInputButtonsOffset = 8;
 constexpr std::size_t kUsbInputButtonsSize = 4;
@@ -92,10 +97,6 @@ constexpr std::array<std::uint8_t, 3> kInitialFeatureReportIds = {0x09, 0x20,
 
 volatile sig_atomic_t g_stop_requested = 0;
 
-constexpr std::uint32_t kTraceInput = 1u << 0;
-constexpr std::uint32_t kTraceOutput = 1u << 1;
-constexpr std::uint32_t kTraceAll = kTraceInput | kTraceOutput;
-
 struct DeviceId {
   std::uint16_t vendor;
   std::uint16_t product;
@@ -103,8 +104,8 @@ struct DeviceId {
 
 struct Options {
   std::string socket = kDefaultControlSocket;
-  std::string log_path = kDefaultLogPath;
-  std::string db_path = vds::kDefaultBindingDbPath;
+  std::string log_path = vds::kDefaultLogPath;
+  std::string db_path = vds::kDefaultDbPath;
 };
 
 struct LatencyTraceStats {
@@ -142,6 +143,15 @@ struct TraceState {
   std::uint64_t haptics_burst_chunks = 0;
 };
 
+using vds::active_trace_name;
+using vds::kTraceAll;
+using vds::kTraceInput;
+using vds::kTraceOutput;
+using vds::parse_trace_scope;
+using vds::trace_enabled;
+using vds::trace_scope_name;
+using vds::trim_command;
+
 struct VirtualPort {
   std::string path;
   vds::UniqueFd fd;
@@ -163,10 +173,10 @@ struct VirtualPort {
   TraceState trace_state;
 };
 
-struct ControllerBinding {
-  vds::ControllerBindingConfig config;
+struct ControllerRuntime {
+  vds::ControllerConfig config;
   std::string device;
-  std::optional<std::uint32_t> detected_identity;
+  std::optional<std::uint32_t> detected_profile;
   std::optional<vds::BtL2capBackend> backend;
   vds::UniqueFd pending_control_fd;
   vds::UniqueFd pending_interrupt_fd;
@@ -203,31 +213,34 @@ private:
 
 void signal_handler(int) { g_stop_requested = 1; }
 
-void usage() {
-  std::cerr << "vdsd (" << vds::kVersion << "): vDS daemon - Copyright (C) "
-            << vds::kBuildYear << " Jihong Min\n"
-            << "usage: vdsd [--db-path /var/lib/vds/vdsd.db] "
-               "[--log /var/log/vdsd.log] "
-               "[--socket /run/vdsd.sock]\n";
-}
-
-Options parse_args(int argc, char **argv) {
+Options parse_platform_args(int argc, char **argv) {
   Options options;
+  vds::VdsdCommonOptions common = vds::default_vdsd_common_options();
+  const std::string platform_options =
+      std::string("[--socket ") + kDefaultControlSocket + "]";
+  const auto next_value = [&](int &index, std::string_view option) {
+    if (index + 1 >= argc) {
+      throw std::runtime_error(std::string(option) + " requires a value");
+    }
+    return std::string(argv[++index]);
+  };
+
   for (int i = 1; i < argc; ++i) {
-    const std::string arg = argv[i];
-    if (arg == "--socket" && i + 1 < argc) {
-      options.socket = argv[++i];
-    } else if (arg == "--log" && i + 1 < argc) {
-      options.log_path = argv[++i];
-    } else if (arg == "--db-path" && i + 1 < argc) {
-      options.db_path = argv[++i];
-    } else if (arg == "--help" || arg == "-h") {
-      usage();
-      std::exit(0);
+    const std::string_view arg = argv[i];
+    if (vds::parse_vdsd_common_option(argc, argv, i, common)) {
+      if (common.help_requested) {
+        vds::print_vdsd_usage(std::cerr, vds::kVersion, vds::kBuildYear,
+                              platform_options);
+        std::exit(0);
+      }
+    } else if (arg == "--socket") {
+      options.socket = next_value(i, arg);
     } else {
-      throw std::runtime_error("unknown argument: " + arg);
+      throw std::runtime_error("unknown argument: " + std::string(arg));
     }
   }
+  options.db_path = common.db_path;
+  options.log_path = common.log_path;
   return options;
 }
 
@@ -289,88 +302,6 @@ std::optional<DeviceId> parse_modalias_line(std::string_view line) {
                   .product = static_cast<std::uint16_t>(*product & 0xffffu)};
 }
 
-std::string hex16(std::uint16_t value) {
-  std::array<char, 7> buffer{};
-  std::snprintf(buffer.data(), buffer.size(), "0x%04x", value);
-  return buffer.data();
-}
-
-std::string hex_bytes(std::span<const std::uint8_t> bytes,
-                      std::size_t max_bytes) {
-  std::ostringstream out;
-  const std::size_t count = std::min(bytes.size(), max_bytes);
-
-  for (std::size_t i = 0; i < count; ++i) {
-    if (i > 0) {
-      out << ' ';
-    }
-    out << std::hex << std::setw(2) << std::setfill('0')
-        << static_cast<unsigned>(bytes[i]);
-  }
-  if (bytes.size() > max_bytes) {
-    out << " ...";
-  }
-  return out.str();
-}
-
-std::string hex_byte(std::uint8_t value) {
-  std::ostringstream out;
-  out << "0x" << std::hex << std::setw(2) << std::setfill('0')
-      << static_cast<unsigned>(value);
-  return out.str();
-}
-
-std::uint32_t parse_trace_scope(std::string_view scope) {
-  if (scope == "all") {
-    return kTraceAll;
-  }
-  if (scope == "input") {
-    return kTraceInput;
-  }
-  if (scope == "output") {
-    return kTraceOutput;
-  }
-  throw std::runtime_error("trace scope must be all, input, or output");
-}
-
-std::string trace_scope_name(std::uint32_t scope) {
-  if (scope == kTraceAll) {
-    return "all";
-  }
-  if (scope == kTraceInput) {
-    return "input";
-  }
-  if (scope == kTraceOutput) {
-    return "output";
-  }
-  return "none";
-}
-
-std::string active_trace_name(std::uint32_t trace_flags) {
-  if (trace_flags == 0) {
-    return "none";
-  }
-  if (trace_flags == kTraceAll) {
-    return "all";
-  }
-  if (trace_flags == kTraceInput) {
-    return "input";
-  }
-  if (trace_flags == kTraceOutput) {
-    return "output";
-  }
-  return "input,output";
-}
-
-bool trace_enabled(std::uint32_t trace_flags, std::uint32_t target) {
-  return (trace_flags & target) != 0;
-}
-
-std::uint64_t duration_us(Clock::duration duration) {
-  return static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::microseconds>(duration).count());
-}
-
 void trace_output_latency(const std::string &device, std::string_view label,
                           LatencyTraceStats &stats, Clock::duration duration,
                           Clock::duration slow_threshold, vds::Logger &logger) {
@@ -400,7 +331,7 @@ void trace_hid_out_report(const std::string &device,
   std::ostringstream line;
   line << device << " hid out";
   if (!payload.empty()) {
-    line << " report=" << hex_byte(payload[0]);
+    line << " report=" << hex_u8(payload[0]);
   }
   if (payload.size() >= 5) {
     /*
@@ -408,13 +339,12 @@ void trace_hid_out_report(const std::string &device,
      * show whether a plain rumble request exists before the HD haptics audio
      * path is involved.
      */
-    line << " flags0=" << hex_byte(payload[1])
-         << " flags1=" << hex_byte(payload[2])
+    line << " flags0=" << hex_u8(payload[1]) << " flags1=" << hex_u8(payload[2])
          << " rumble_r=" << static_cast<unsigned>(payload[3])
          << " rumble_l=" << static_cast<unsigned>(payload[4]);
   }
   if (payload.size() >= 40) {
-    line << " light_flags=" << hex_byte(payload[39]);
+    line << " light_flags=" << hex_u8(payload[39]);
   }
   logger.log("hid", vds::LogLevel::Debug, line.str());
 
@@ -454,29 +384,29 @@ const char *usb_interface_kind_name(std::uint8_t kind) {
   }
 }
 
-std::uint32_t identity_from_device_id(const DeviceId &id) {
+std::uint32_t profile_from_device_id(const DeviceId &id) {
   if (id.vendor != VDS_SONY_VENDOR_ID) {
     throw std::runtime_error("unsupported controller vendor " +
-                             hex16(id.vendor));
+                             hex_u16(id.vendor));
   }
   if (id.product == VDS_DS5_PRODUCT_ID) {
-    return VDS_IDENTITY_DS5;
+    return VDS_PROFILE_DS5;
   }
   if (id.product == VDS_DSE_PRODUCT_ID) {
-    return VDS_IDENTITY_DSE;
+    return VDS_PROFILE_DSE;
   }
   throw std::runtime_error("unsupported Sony controller product " +
-                           hex16(id.product));
+                           hex_u16(id.product));
 }
 
-const char *identity_name(std::uint32_t identity) {
-  if (identity == VDS_IDENTITY_DSE) {
+const char *profile_name(std::uint32_t profile) {
+  if (profile == VDS_PROFILE_DSE) {
     return "dualsense-edge";
   }
   return "dualsense";
 }
 
-std::uint32_t detect_bluetooth_identity(const std::string &address) {
+std::uint32_t detect_bluetooth_profile(const std::string &address) {
   const auto modalias = vds::bluez_device_modalias(address);
   if (!modalias) {
     throw std::runtime_error("failed to query BlueZ modalias for " + address);
@@ -486,20 +416,18 @@ std::uint32_t detect_bluetooth_identity(const std::string &address) {
     throw std::runtime_error("failed to detect Bluetooth device ID for " +
                              address);
   }
-  return identity_from_device_id(*id);
+  return profile_from_device_id(*id);
 }
 
-std::uint32_t
-resolve_binding_identity(const vds::ControllerBindingConfig &binding) {
-  switch (binding.identity) {
-  case vds::BindingIdentity::Auto:
-    return detect_bluetooth_identity(binding.address);
-  case vds::BindingIdentity::Ds5:
-    return VDS_IDENTITY_DS5;
-  case vds::BindingIdentity::Dse:
-    return VDS_IDENTITY_DSE;
+std::uint32_t resolve_config_profile(const vds::ControllerConfig &controller) {
+  switch (controller.profile) {
+  case vds::ControllerProfile::Unspecified:
+    return detect_bluetooth_profile(controller.address);
+  case vds::ControllerProfile::Ds5:
+  case vds::ControllerProfile::Dse:
+    return vds::usb_profile_from_controller_profile(controller.profile);
   }
-  throw std::runtime_error("unknown binding identity");
+  throw std::runtime_error("unknown controller profile");
 }
 
 int open_control_socket(const std::string &path) {
@@ -532,26 +460,6 @@ int open_control_socket(const std::string &path) {
                              ": " + std::strerror(error));
   }
   return fd.release();
-}
-
-void write_full(int fd, std::string_view text) {
-  const char *data = text.data();
-  std::size_t size = text.size();
-  while (size > 0) {
-    const ssize_t written = ::write(fd, data, size);
-    if (written < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      throw std::runtime_error("write failed: " +
-                               std::string(std::strerror(errno)));
-    }
-    if (written == 0) {
-      throw std::runtime_error("write returned zero bytes");
-    }
-    data += written;
-    size -= static_cast<std::size_t>(written);
-  }
 }
 
 bool write_vds_frame(VirtualPort &port, std::span<const std::uint8_t> bytes,
@@ -701,13 +609,13 @@ void ioctl_noarg(int fd, unsigned long request, const char *name) {
   }
 }
 
-void ioctl_set_identity(int fd, std::uint32_t identity) {
-  vds_identity_config config{
-      .identity = identity,
+void ioctl_set_profile(int fd, std::uint32_t profile) {
+  vds_profile_config config{
+      .profile = profile,
       .polling_rate_mode = 0,
   };
-  if (::ioctl(fd, VDS_IOC_SET_IDENTITY, &config) < 0) {
-    throw std::runtime_error("VDS_IOC_SET_IDENTITY failed: " +
+  if (::ioctl(fd, VDS_IOC_SET_PROFILE, &config) < 0) {
+    throw std::runtime_error("VDS_IOC_SET_PROFILE failed: " +
                              std::string(std::strerror(errno)));
   }
 }
@@ -860,7 +768,7 @@ void handle_frame(const vds_frame_header &header,
     const bool cache_hit = port.feature_cached[report_id];
     if (output_trace) {
       logger.log("hid", vds::LogLevel::Debug,
-                 port.path + " feature get report=" + hex_byte(report_id) +
+                 port.path + " feature get report=" + hex_u8(report_id) +
                      " request_len=" + std::to_string(requested_length) +
                      " cache=" + (cache_hit ? "hit" : "miss") + " forwarded=" +
                      ((bt_backend && !cache_hit) ? "yes" : "no"));
@@ -896,7 +804,7 @@ void handle_frame(const vds_frame_header &header,
     const std::uint8_t report_id = payload[0];
     if (output_trace) {
       logger.log("hid", vds::LogLevel::Debug,
-                 port.path + " feature set report=" + hex_byte(report_id) +
+                 port.path + " feature set report=" + hex_u8(report_id) +
                      " len=" + std::to_string(payload.size()) +
                      " forwarded=" + (bt_backend ? "yes" : "no"));
       logger.log("hid", vds::LogLevel::Debug,
@@ -923,8 +831,8 @@ void handle_frame(const vds_frame_header &header,
         if (output_trace) {
           logger.log("hid", vds::LogLevel::Debug,
                      port.path + " cached WebHID test result device=" +
-                         hex_byte(command_device) + " action=" +
-                         hex_byte(command_action) + " status=complete");
+                         hex_u8(command_device) + " action=" +
+                         hex_u8(command_action) + " status=complete");
         }
 
         if (command_device == kTestCommandAudioDevice &&
@@ -1203,7 +1111,7 @@ bool handle_bt_control(VirtualPort &port, vds::BtL2capBackend &bt_backend,
   const bool output_trace = trace_enabled(trace_flags, kTraceOutput);
   if (output_trace) {
     logger.log("hid", vds::LogLevel::Debug,
-               port.path + " bt feature cached report=" + hex_byte(report_id) +
+               port.path + " bt feature cached report=" + hex_u8(report_id) +
                    " len=" + std::to_string(report->size()) +
                    " usb_waiting=" + (usb_waiting ? "yes" : "no"));
   }
@@ -1237,7 +1145,7 @@ void initialize_bt_controller(vds::BtL2capBackend &bt_backend,
       if (ready <= 0) {
         throw std::runtime_error("timed out waiting for initial Bluetooth "
                                  "feature report " +
-                                 hex_byte(report_id));
+                                 hex_u8(report_id));
       }
       if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
         throw std::runtime_error("Bluetooth control channel closed during "
@@ -1263,15 +1171,6 @@ void initialize_bt_controller(vds::BtL2capBackend &bt_backend,
              port.path + " primed initial Bluetooth feature cache");
 }
 
-bool binding_allows_device(const vds::ControllerBindingConfig &binding,
-                           const std::string &device) {
-  if (binding.limit_devices.empty()) {
-    return true;
-  }
-  return std::find(binding.limit_devices.begin(), binding.limit_devices.end(),
-                   device) != binding.limit_devices.end();
-}
-
 std::optional<std::size_t> find_port_index(std::span<const VirtualPort> ports,
                                            const std::string &path) {
   for (std::size_t i = 0; i < ports.size(); ++i) {
@@ -1282,19 +1181,30 @@ std::optional<std::size_t> find_port_index(std::span<const VirtualPort> ports,
   return std::nullopt;
 }
 
-bool binding_uses_port(const ControllerBinding &binding) {
-  return binding.backend || binding.pending_control_fd ||
-         binding.pending_interrupt_fd || binding.virtual_connected;
+std::vector<unsigned> present_port_indices(std::span<const VirtualPort> ports) {
+  std::vector<unsigned> indices;
+  indices.reserve(ports.size());
+  for (const auto &port : ports) {
+    if (const auto index = vds::port_index_from_path(port.path)) {
+      indices.push_back(*index);
+    }
+  }
+  return indices;
 }
 
-bool port_used_by_other_binding(std::span<const ControllerBinding> bindings,
-                                const ControllerBinding &self,
-                                const std::string &device) {
-  for (const auto &binding : bindings) {
-    if (&binding == &self) {
+bool controller_uses_port(const ControllerRuntime &controller) {
+  return controller.backend || controller.pending_control_fd ||
+         controller.pending_interrupt_fd || controller.virtual_connected;
+}
+
+bool port_used_by_other_controller(
+    std::span<const ControllerRuntime> controllers,
+    const ControllerRuntime &self, const std::string &device) {
+  for (const auto &controller : controllers) {
+    if (&controller == &self) {
       continue;
     }
-    if (binding.device == device && binding_uses_port(binding)) {
+    if (controller.device == device && controller_uses_port(controller)) {
       return true;
     }
   }
@@ -1303,56 +1213,78 @@ bool port_used_by_other_binding(std::span<const ControllerBinding> bindings,
 
 std::optional<std::size_t>
 available_port_index(std::span<const VirtualPort> ports,
-                     std::span<const ControllerBinding> bindings,
-                     const ControllerBinding &binding) {
+                     std::span<const ControllerRuntime> controllers,
+                     const ControllerRuntime &controller) {
+  const std::vector<unsigned> candidate_ports = present_port_indices(ports);
+  std::vector<unsigned> occupied_ports;
+  occupied_ports.reserve(controllers.size());
+  for (const auto &other : controllers) {
+    if (&other == &controller || !controller_uses_port(other)) {
+      continue;
+    }
+    if (const auto port = vds::port_index_from_path(other.device)) {
+      occupied_ports.push_back(*port);
+    }
+  }
+
+  const auto selected_port = vds::select_controller_config_port(
+      controller.config, candidate_ports, occupied_ports);
+  if (!selected_port) {
+    return std::nullopt;
+  }
+
   for (std::size_t i = 0; i < ports.size(); ++i) {
-    if (!binding_allows_device(binding.config, ports[i].path)) {
-      continue;
+    if (vds::port_index_from_path(ports[i].path) == selected_port) {
+      return i;
     }
-    if (port_used_by_other_binding(bindings, binding, ports[i].path)) {
-      continue;
-    }
-    return i;
   }
   return std::nullopt;
 }
 
-ControllerBinding *binding_for_port(std::vector<ControllerBinding> &bindings,
-                                    const std::string &device) {
-  for (auto &binding : bindings) {
-    if (binding.device == device && binding_uses_port(binding)) {
-      return &binding;
+bool controller_has_present_allowed_port(std::span<const VirtualPort> ports,
+                                         const vds::ControllerConfig &config) {
+  return vds::controller_config_has_candidate_port(config,
+                                                   present_port_indices(ports));
+}
+
+ControllerRuntime *
+controller_for_port(std::vector<ControllerRuntime> &controllers,
+                    const std::string &device) {
+  for (auto &controller : controllers) {
+    if (controller.device == device && controller_uses_port(controller)) {
+      return &controller;
     }
   }
   return nullptr;
 }
 
-ControllerBinding *binding_for_address(std::vector<ControllerBinding> &bindings,
-                                       const std::string &address) {
-  for (auto &binding : bindings) {
-    if (binding.config.address == address) {
-      return &binding;
+ControllerRuntime *
+controller_for_address(std::vector<ControllerRuntime> &controllers,
+                       const std::string &address) {
+  for (auto &controller : controllers) {
+    if (controller.config.address == address) {
+      return &controller;
     }
   }
   return nullptr;
 }
 
-void drop_bt_backend(ControllerBinding &binding, VirtualPort &port,
+void drop_bt_backend(ControllerRuntime &controller, VirtualPort &port,
                      const std::string &reason, vds::Logger &logger) {
-  if (!binding.backend && !binding.virtual_connected) {
+  if (!controller.backend && !controller.virtual_connected) {
     return;
   }
 
   port.pending_bt_state.reset();
   port.pending_bt_state_report.reset();
   logger.log("bluetooth", vds::LogLevel::Warn,
-             "backend disconnected address=" + binding.config.address +
-                 " device=" + binding.device + " reason=" + reason);
-  binding.backend.reset();
-  binding.pending_control_fd.reset();
-  binding.pending_interrupt_fd.reset();
-  binding.virtual_connected = false;
-  binding.device.clear();
+             "backend disconnected address=" + controller.config.address +
+                 " device=" + controller.device + " reason=" + reason);
+  controller.backend.reset();
+  controller.pending_control_fd.reset();
+  controller.pending_interrupt_fd.reset();
+  controller.virtual_connected = false;
+  controller.device.clear();
   disconnect_virtual_port(port, logger);
 }
 
@@ -1381,8 +1313,8 @@ void sync_virtual_ports(std::vector<VirtualPort> &ports,
     updated.push_back(VirtualPort{
         .path = device,
         .fd = std::move(fd),
-        .extractor = {},
-        .waveout_extractor = {},
+        .extractor = vds::PcmAudioExtractor{},
+        .waveout_extractor = vds::PcmAudioExtractor{},
         .haptics_builder = {},
         .output_state = {},
         .pending_audio_chunks = {},
@@ -1444,38 +1376,38 @@ void preempt_default_bluetooth_owner(const std::string &address,
              "default Bluetooth HID owner still present address=" + address);
 }
 
-void complete_pending_binding(ControllerBinding &binding, VirtualPort &port,
-                              vds::Logger &logger) {
-  const std::uint32_t identity = resolve_binding_identity(binding.config);
-  preempt_default_bluetooth_owner(binding.config.address, logger);
+void complete_pending_controller(ControllerRuntime &controller,
+                                 VirtualPort &port, vds::Logger &logger) {
+  const std::uint32_t profile = resolve_config_profile(controller.config);
+  preempt_default_bluetooth_owner(controller.config.address, logger);
 
-  vds::BtL2capBackend candidate(binding.config.address,
-                                std::move(binding.pending_control_fd),
-                                std::move(binding.pending_interrupt_fd));
+  vds::BtL2capBackend candidate(controller.config.address,
+                                std::move(controller.pending_control_fd),
+                                std::move(controller.pending_interrupt_fd));
 
   reset_virtual_port(port);
   ioctl_noarg(port.fd.get(), VDS_IOC_DISCONNECT, "VDS_IOC_DISCONNECT");
-  ioctl_set_identity(port.fd.get(), identity);
+  ioctl_set_profile(port.fd.get(), profile);
   initialize_bt_controller(candidate, port, logger);
   candidate.send_output_report(port.output_state.build_bt_init_report());
   port.last_sent_bt_state = port.output_state.state();
   logger.log("hid", vds::LogLevel::Info,
              port.path + " sent initial Bluetooth state report");
 
-  binding.backend = std::move(candidate);
-  binding.detected_identity = identity;
+  controller.backend = std::move(candidate);
+  controller.detected_profile = profile;
   ioctl_noarg(port.fd.get(), VDS_IOC_CONNECT, "VDS_IOC_CONNECT");
-  binding.virtual_connected = true;
-  binding.last_error.clear();
+  controller.virtual_connected = true;
+  controller.last_error.clear();
 
-  logger.log("bluetooth", vds::LogLevel::Info,
-             "raw L2CAP backend connected address=" + binding.config.address +
-                 " device=" + port.path +
-                 " identity=" + identity_name(identity));
+  logger.log(
+      "bluetooth", vds::LogLevel::Info,
+      "raw L2CAP backend connected address=" + controller.config.address +
+          " device=" + port.path + " profile=" + profile_name(profile));
 }
 
 void handle_bt_accept(std::vector<VirtualPort> &ports,
-                      std::vector<ControllerBinding> &bindings,
+                      std::vector<ControllerRuntime> &controllers,
                       vds::BtL2capAcceptor &acceptor, bool control_channel,
                       vds::Logger &logger, bool &epoll_dirty) {
   while (true) {
@@ -1485,15 +1417,15 @@ void handle_bt_accept(std::vector<VirtualPort> &ports,
       return;
     }
 
-    ControllerBinding *binding =
-        binding_for_address(bindings, accepted->address);
-    if (!binding) {
+    ControllerRuntime *controller =
+        controller_for_address(controllers, accepted->address);
+    if (!controller) {
       logger.log("bluetooth", vds::LogLevel::Warn,
                  "rejected raw HID channel from unregistered address=" +
                      accepted->address);
       continue;
     }
-    if (binding->backend) {
+    if (controller->backend) {
       logger.log("bluetooth", vds::LogLevel::Warn,
                  "rejected duplicate raw HID channel address=" +
                      accepted->address);
@@ -1501,69 +1433,70 @@ void handle_bt_accept(std::vector<VirtualPort> &ports,
     }
 
     std::optional<std::size_t> port_index;
-    if (!binding->device.empty()) {
-      port_index = find_port_index(ports, binding->device);
-      if (port_index &&
-          port_used_by_other_binding(bindings, *binding, binding->device)) {
+    if (!controller->device.empty()) {
+      port_index = find_port_index(ports, controller->device);
+      if (port_index && port_used_by_other_controller(controllers, *controller,
+                                                      controller->device)) {
         port_index.reset();
       }
     }
     if (!port_index) {
-      port_index = available_port_index(ports, bindings, *binding);
+      port_index = available_port_index(ports, controllers, *controller);
       if (!port_index) {
-        binding->last_error = "no available virtual port";
+        controller->last_error = "no available virtual port";
         logger.log("port", vds::LogLevel::Warn,
                    "rejected raw HID channel address=" + accepted->address +
                        " reason=no available virtual port");
         continue;
       }
-      binding->device = ports[*port_index].path;
+      controller->device = ports[*port_index].path;
       logger.log("config", vds::LogLevel::Info,
-                 "binding assigned address=" + binding->config.address +
-                     " device=" + binding->device + " identity=" +
-                     vds::binding_identity_name(binding->config.identity));
+                 "controller assigned address=" + controller->config.address +
+                     " device=" + controller->device + " profile=\"" +
+                     vds::controller_profile_name(controller->config.profile) +
+                     "\"");
     }
 
     if (control_channel) {
-      binding->pending_control_fd = std::move(accepted->fd);
+      controller->pending_control_fd = std::move(accepted->fd);
       logger.log("bluetooth", vds::LogLevel::Info,
                  "accepted raw HID control channel address=" +
                      accepted->address);
     } else {
-      binding->pending_interrupt_fd = std::move(accepted->fd);
+      controller->pending_interrupt_fd = std::move(accepted->fd);
       logger.log("bluetooth", vds::LogLevel::Info,
                  "accepted raw HID interrupt channel address=" +
                      accepted->address);
     }
 
-    if (!binding->pending_control_fd || !binding->pending_interrupt_fd) {
+    if (!controller->pending_control_fd || !controller->pending_interrupt_fd) {
       continue;
     }
 
-    port_index = find_port_index(ports, binding->device);
+    port_index = find_port_index(ports, controller->device);
     if (!port_index) {
-      binding->pending_control_fd.reset();
-      binding->pending_interrupt_fd.reset();
-      binding->device.clear();
-      binding->last_error = "assigned virtual port disappeared";
+      controller->pending_control_fd.reset();
+      controller->pending_interrupt_fd.reset();
+      controller->device.clear();
+      controller->last_error = "assigned virtual port disappeared";
       logger.log("port", vds::LogLevel::Error,
-                 "binding inactive address=" + binding->config.address +
+                 "controller inactive address=" + controller->config.address +
                      " reason=assigned port disappeared");
       continue;
     }
 
     try {
-      complete_pending_binding(*binding, ports[*port_index], logger);
+      complete_pending_controller(*controller, ports[*port_index], logger);
       epoll_dirty = true;
     } catch (const std::exception &error) {
-      binding->backend.reset();
-      binding->pending_control_fd.reset();
-      binding->pending_interrupt_fd.reset();
-      binding->virtual_connected = false;
-      binding->device.clear();
-      binding->last_error = error.what();
+      controller->backend.reset();
+      controller->pending_control_fd.reset();
+      controller->pending_interrupt_fd.reset();
+      controller->virtual_connected = false;
+      controller->device.clear();
+      controller->last_error = error.what();
       logger.log("bluetooth", vds::LogLevel::Error,
-                 "connect failed address=" + binding->config.address +
+                 "connect failed address=" + controller->config.address +
                      " device=" + ports[*port_index].path +
                      " error=" + error.what());
     }
@@ -1571,12 +1504,12 @@ void handle_bt_accept(std::vector<VirtualPort> &ports,
 }
 
 bool has_pending_bt_output(std::span<const VirtualPort> ports,
-                           std::span<const ControllerBinding> bindings) {
-  for (const auto &binding : bindings) {
-    if (!binding.backend) {
+                           std::span<const ControllerRuntime> controllers) {
+  for (const auto &controller : controllers) {
+    if (!controller.backend) {
       continue;
     }
-    const auto port_index = find_port_index(ports, binding.device);
+    const auto port_index = find_port_index(ports, controller.device);
     if (port_index && (ports[*port_index].pending_bt_state_report ||
                        !ports[*port_index].pending_audio_chunks.empty() ||
                        ports[*port_index].speaker_waveout_active)) {
@@ -1587,17 +1520,17 @@ bool has_pending_bt_output(std::span<const VirtualPort> ports,
 }
 
 int next_wakeup_timeout_ms(std::span<const VirtualPort> ports,
-                           std::span<const ControllerBinding> bindings) {
+                           std::span<const ControllerRuntime> controllers) {
   const auto now = Clock::now();
   int timeout_ms = 60000;
-  if (has_pending_bt_output(ports, bindings)) {
+  if (has_pending_bt_output(ports, controllers)) {
     timeout_ms = std::min(timeout_ms, kPendingOutputPollMs);
   }
-  for (const auto &binding : bindings) {
-    if (!binding.backend) {
+  for (const auto &controller : controllers) {
+    if (!controller.backend) {
       continue;
     }
-    const auto port_index = find_port_index(ports, binding.device);
+    const auto port_index = find_port_index(ports, controller.device);
     if (!port_index || ports[*port_index].pending_audio_chunks.empty()) {
       continue;
     }
@@ -1706,78 +1639,86 @@ void enqueue_speaker_waveout_chunk(VirtualPort &port, std::uint32_t trace_flags,
 }
 
 void flush_pending_outputs(std::vector<VirtualPort> &ports,
-                           std::vector<ControllerBinding> &bindings,
+                           std::vector<ControllerRuntime> &controllers,
                            std::uint32_t trace_flags, vds::Logger &logger,
                            bool &epoll_dirty) {
-  for (auto &binding : bindings) {
-    if (!binding.backend) {
+  for (auto &controller : controllers) {
+    if (!controller.backend) {
       continue;
     }
-    const auto port_index = find_port_index(ports, binding.device);
+    const auto port_index = find_port_index(ports, controller.device);
     if (!port_index) {
-      binding.backend.reset();
-      binding.pending_control_fd.reset();
-      binding.pending_interrupt_fd.reset();
-      binding.virtual_connected = false;
-      binding.device.clear();
+      controller.backend.reset();
+      controller.pending_control_fd.reset();
+      controller.pending_interrupt_fd.reset();
+      controller.virtual_connected = false;
+      controller.device.clear();
       epoll_dirty = true;
       continue;
     }
 
     try {
       auto &port = ports[*port_index];
-      if (!flush_pending_bt_state_report(port, *binding.backend, trace_flags,
+      if (!flush_pending_bt_state_report(port, *controller.backend, trace_flags,
                                          logger)) {
         continue;
       }
       enqueue_speaker_waveout_chunk(port, trace_flags, logger);
-      (void)flush_pending_audio_chunk(port, *binding.backend, trace_flags,
+      (void)flush_pending_audio_chunk(port, *controller.backend, trace_flags,
                                       logger);
     } catch (const std::exception &error) {
       if (!is_bluetooth_error(error)) {
         throw;
       }
-      drop_bt_backend(binding, ports[*port_index], error.what(), logger);
+      drop_bt_backend(controller, ports[*port_index], error.what(), logger);
       epoll_dirty = true;
     }
   }
 }
 
-void reconcile_bindings(std::vector<VirtualPort> &ports,
-                        std::vector<ControllerBinding> &bindings,
-                        const std::string &db_path, vds::Logger &logger) {
+void reconcile_controller_configs(std::vector<VirtualPort> &ports,
+                                  std::vector<ControllerRuntime> &controllers,
+                                  const std::string &db_path,
+                                  vds::Logger &logger) {
   const std::vector<std::string> devices = vds::discover_vds_devices();
-  for (auto &binding : bindings) {
-    if (!binding_uses_port(binding) ||
-        std::binary_search(devices.begin(), devices.end(), binding.device)) {
+  for (auto &controller : controllers) {
+    if (!controller_uses_port(controller) ||
+        std::binary_search(devices.begin(), devices.end(), controller.device)) {
       continue;
     }
-    if (const auto port_index = find_port_index(ports, binding.device)) {
+    if (const auto port_index = find_port_index(ports, controller.device)) {
       disconnect_virtual_port(ports[*port_index], logger);
     }
-    binding.backend.reset();
-    binding.pending_control_fd.reset();
-    binding.pending_interrupt_fd.reset();
-    binding.virtual_connected = false;
-    binding.device.clear();
+    controller.backend.reset();
+    controller.pending_control_fd.reset();
+    controller.pending_interrupt_fd.reset();
+    controller.virtual_connected = false;
+    controller.device.clear();
   }
 
   sync_virtual_ports(ports, devices, logger);
-  const vds::BindingDb db = vds::load_binding_db(db_path);
+  const vds::ConfigDb db = vds::load_config_db(db_path);
   logger.log("config", vds::LogLevel::Info,
-             "loaded bindings count=" + std::to_string(db.controllers.size()));
+             "loaded controller config count=" +
+                 std::to_string(db.controllers.size()));
 
-  std::vector<bool> preserved(bindings.size(), false);
+  std::vector<bool> preserved(controllers.size(), false);
   std::vector<std::string> active_devices;
-  std::vector<ControllerBinding> next_bindings;
-  next_bindings.reserve(db.controllers.size());
+  std::vector<ControllerRuntime> next_controllers;
+  next_controllers.reserve(db.controllers.size());
 
   for (const auto &config : db.controllers) {
+    if (!controller_has_present_allowed_port(ports, config)) {
+      logger.log("config", vds::LogLevel::Warn,
+                 "controller binding unavailable address=" + config.address +
+                     " reason=no allowed virtual port present ports=[" +
+                     vds::format_ports(config.ports) + "]");
+    }
     preempt_default_bluetooth_owner(config.address, logger);
-    ControllerBinding next{
+    ControllerRuntime next{
         .config = config,
         .device = {},
-        .detected_identity = std::nullopt,
+        .detected_profile = std::nullopt,
         .backend = std::nullopt,
         .pending_control_fd = {},
         .pending_interrupt_fd = {},
@@ -1785,23 +1726,25 @@ void reconcile_bindings(std::vector<VirtualPort> &ports,
         .last_error = {},
     };
 
-    for (std::size_t old_index = 0; old_index < bindings.size(); ++old_index) {
-      auto &old = bindings[old_index];
+    for (std::size_t old_index = 0; old_index < controllers.size();
+         ++old_index) {
+      auto &old = controllers[old_index];
       if (preserved[old_index] || old.config.address != config.address ||
-          old.config.identity != config.identity) {
+          old.config.profile != config.profile) {
         continue;
       }
-      const bool old_uses_port = binding_uses_port(old);
+      const bool old_uses_port = controller_uses_port(old);
       const bool old_device_present =
           !old.device.empty() && find_port_index(ports, old.device);
       const bool old_device_allowed =
-          old_device_present && binding_allows_device(config, old.device);
+          old_device_present &&
+          vds::controller_config_allows_path(config, old.device);
       const bool old_device_available =
           old_device_allowed &&
           std::find(active_devices.begin(), active_devices.end(), old.device) ==
               active_devices.end();
 
-      next.detected_identity = old.detected_identity;
+      next.detected_profile = old.detected_profile;
       next.last_error = std::move(old.last_error);
       if (old_uses_port && old_device_available) {
         next.device = std::move(old.device);
@@ -1831,41 +1774,35 @@ void reconcile_bindings(std::vector<VirtualPort> &ports,
     }
 
     logger.log("config", vds::LogLevel::Info,
-               "binding registered address=" + config.address +
-                   " identity=" + vds::binding_identity_name(config.identity));
-    next_bindings.push_back(std::move(next));
+               "controller registered address=" + config.address +
+                   " profile=\"" +
+                   vds::controller_profile_name(config.profile) + "\"");
+    next_controllers.push_back(std::move(next));
   }
 
-  for (std::size_t i = 0; i < bindings.size(); ++i) {
+  for (std::size_t i = 0; i < controllers.size(); ++i) {
     if (preserved[i]) {
       continue;
     }
-    if (bindings[i].virtual_connected) {
-      if (const auto port_index = find_port_index(ports, bindings[i].device)) {
+    if (controllers[i].virtual_connected) {
+      if (const auto port_index =
+              find_port_index(ports, controllers[i].device)) {
         disconnect_virtual_port(ports[*port_index], logger);
       }
     }
-    if (bindings[i].backend) {
-      logger.log("bluetooth", vds::LogLevel::Info,
-                 "raw backend removed address=" + bindings[i].config.address +
-                     " device=" + bindings[i].device);
+    if (controllers[i].backend) {
+      logger.log(
+          "bluetooth", vds::LogLevel::Info,
+          "raw backend removed address=" + controllers[i].config.address +
+              " device=" + controllers[i].device);
     }
   }
 
-  bindings = std::move(next_bindings);
+  controllers = std::move(next_controllers);
 }
 
-std::string trim_command(std::string command) {
-  while (!command.empty() &&
-         (command.back() == '\n' || command.back() == '\r' ||
-          command.back() == ' ' || command.back() == '\t')) {
-    command.pop_back();
-  }
-  return command;
-}
-
-void handle_control_client(int control_fd,
-                           std::span<const ControllerBinding> bindings,
+void handle_control_client(int control_fd, std::span<const VirtualPort> ports,
+                           std::span<const ControllerRuntime> controllers,
                            std::uint32_t &trace_flags, bool &reload_requested,
                            vds::Logger &logger) {
   vds::UniqueFd client_fd(
@@ -1894,58 +1831,56 @@ void handle_control_client(int control_fd,
   std::string reply;
   const std::string command =
       trim_command(std::string(buffer.data(), static_cast<std::size_t>(got)));
-  try {
-    if (command == "RELOAD") {
-      reload_requested = true;
-      logger.log("config", vds::LogLevel::Info, "reload requested");
-      reply = "OK reloaded\n";
-    } else if (command == "LIST") {
-      reply = "OK\n";
-      for (const auto &binding : bindings) {
-        reply += binding.config.address;
-        reply += binding.virtual_connected ? " connected\n" : " disconnected\n";
-      }
-    } else if (command.rfind("TRACE ", 0) == 0) {
-      std::istringstream fields(command);
-      std::string verb;
-      std::string action;
-      std::string scope = "all";
-      std::string extra;
-      if (!(fields >> verb >> action) || verb != "TRACE") {
-        throw std::runtime_error("malformed trace command");
-      }
-      if (fields >> scope) {
-        if (fields >> extra) {
-          throw std::runtime_error("malformed trace command");
-        }
-      }
-
-      const std::uint32_t scope_mask = parse_trace_scope(scope);
-      if (action == "ON") {
-        trace_flags |= scope_mask;
-      } else if (action == "OFF") {
-        trace_flags &= ~scope_mask;
-      } else {
-        throw std::runtime_error("trace requires ON or OFF");
-      }
-
-      logger.log("control", vds::LogLevel::Info,
-                 "trace " + trace_scope_name(scope_mask) + " " +
-                     (action == "ON" ? "enabled" : "disabled") +
-                     " active=" + active_trace_name(trace_flags));
-      reply = "OK trace=" + std::string(action == "ON" ? "on" : "off") +
-              " scope=" + trace_scope_name(scope_mask) +
-              " active=" + active_trace_name(trace_flags) + "\n";
-    } else {
-      logger.log("control", vds::LogLevel::Warn, "unknown command: " + command);
-      reply = "ERR unknown command\n";
-    }
-  } catch (const std::exception &error) {
-    reply = std::string("ERR ") + error.what() + "\n";
+  std::vector<vds::VdsdControlControllerStatus> controller_statuses;
+  controller_statuses.reserve(controllers.size());
+  for (const auto &controller : controllers) {
+    controller_statuses.push_back(vds::VdsdControlControllerStatus{
+        .address = controller.config.address,
+        .connected = controller.virtual_connected,
+        .path = controller.virtual_connected ? controller.device : "",
+    });
   }
 
+  std::vector<vds::VdsdControlPortCandidate> port_candidates;
+  port_candidates.reserve(ports.size());
+  for (const auto &port : ports) {
+    const auto port_index = vds::port_index_from_path(port.path);
+    if (!port_index) {
+      continue;
+    }
+
+    port_candidates.push_back(vds::VdsdControlPortCandidate{
+        .port = *port_index,
+        .path = port.path,
+    });
+  }
+
+  std::vector<vds::VdsdControlPortBinding> port_bindings;
+  port_bindings.reserve(controllers.size());
+  for (const auto &controller : controllers) {
+    if (!controller_uses_port(controller)) {
+      continue;
+    }
+    const auto port = vds::port_index_from_path(controller.device);
+    if (!port) {
+      continue;
+    }
+    port_bindings.push_back(vds::VdsdControlPortBinding{
+        .port = *port,
+        .address = controller.config.address,
+        .device_address = {},
+    });
+  }
+
+  const std::vector<vds::VdsdControlPortStatus> port_statuses =
+      vds::build_vdsd_control_port_statuses(port_candidates, port_bindings);
+
+  reply = vds::handle_vdsd_control_command(command, controller_statuses,
+                                           port_statuses, trace_flags,
+                                           reload_requested, logger);
+
   try {
-    write_full(client_fd.get(), reply);
+    vds::write_full(client_fd.get(), reply);
   } catch (const std::exception &error) {
     if (trace_flags != 0) {
       logger.log("control", vds::LogLevel::Error,
@@ -1979,7 +1914,7 @@ void add_epoll_fd(int epoll_fd, int fd, EventKind kind, std::size_t index) {
 vds::UniqueFd rebuild_epoll(int control_fd, vds::BtL2capAcceptor &bt_acceptor,
                             const vds::VdsDeviceMonitor &vds_monitor,
                             std::span<VirtualPort> ports,
-                            std::span<ControllerBinding> bindings) {
+                            std::span<ControllerRuntime> controllers) {
   vds::UniqueFd epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
   if (!epoll_fd) {
     throw std::runtime_error("epoll_create1 failed: " +
@@ -1995,31 +1930,31 @@ vds::UniqueFd rebuild_epoll(int control_fd, vds::BtL2capAcceptor &bt_acceptor,
   for (std::size_t i = 0; i < ports.size(); ++i) {
     add_epoll_fd(epoll_fd.get(), ports[i].fd.get(), EventKind::Port, i);
   }
-  for (std::size_t i = 0; i < bindings.size(); ++i) {
-    if (!bindings[i].backend) {
+  for (std::size_t i = 0; i < controllers.size(); ++i) {
+    if (!controllers[i].backend) {
       continue;
     }
-    add_epoll_fd(epoll_fd.get(), bindings[i].backend->control_fd(),
+    add_epoll_fd(epoll_fd.get(), controllers[i].backend->control_fd(),
                  EventKind::BtControl, i);
-    add_epoll_fd(epoll_fd.get(), bindings[i].backend->interrupt_fd(),
+    add_epoll_fd(epoll_fd.get(), controllers[i].backend->interrupt_fd(),
                  EventKind::BtInterrupt, i);
   }
   return epoll_fd;
 }
 
 void disconnect_all(std::vector<VirtualPort> &ports,
-                    std::vector<ControllerBinding> &bindings,
+                    std::vector<ControllerRuntime> &controllers,
                     vds::Logger &logger) {
-  for (auto &binding : bindings) {
-    if (!binding.virtual_connected) {
+  for (auto &controller : controllers) {
+    if (!controller.virtual_connected) {
       continue;
     }
-    if (const auto port_index = find_port_index(ports, binding.device)) {
+    if (const auto port_index = find_port_index(ports, controller.device)) {
       disconnect_virtual_port(ports[*port_index], logger);
     }
-    binding.virtual_connected = false;
+    controller.virtual_connected = false;
   }
-  bindings.clear();
+  controllers.clear();
 }
 
 } // namespace
@@ -2030,7 +1965,7 @@ int main(int argc, char **argv) {
     ::signal(SIGINT, signal_handler);
     ::signal(SIGTERM, signal_handler);
 
-    const Options options = parse_args(argc, argv);
+    const Options options = parse_platform_args(argc, argv);
     vds::Logger logger(options.log_path);
     logger.log("daemon", vds::LogLevel::Info,
                "started socket=" + options.socket + " log=" + options.log_path +
@@ -2043,7 +1978,7 @@ int main(int argc, char **argv) {
                "listening for controller-initiated raw HID channels");
     SocketPathGuard control_socket_path(options.socket);
     std::vector<VirtualPort> ports;
-    std::vector<ControllerBinding> bindings;
+    std::vector<ControllerRuntime> controllers;
     vds::UniqueFd epoll_fd;
     std::uint32_t trace_flags = 0;
     bool reload_requested = true;
@@ -2052,7 +1987,8 @@ int main(int argc, char **argv) {
     while (g_stop_requested == 0) {
       if (reload_requested) {
         try {
-          reconcile_bindings(ports, bindings, options.db_path, logger);
+          reconcile_controller_configs(ports, controllers, options.db_path,
+                                       logger);
           epoll_dirty = true;
         } catch (const std::exception &error) {
           logger.log("config", vds::LogLevel::Error,
@@ -2063,12 +1999,12 @@ int main(int argc, char **argv) {
 
       if (epoll_dirty || !epoll_fd) {
         epoll_fd = rebuild_epoll(control_fd.get(), bt_acceptor, vds_monitor,
-                                 ports, bindings);
+                                 ports, controllers);
         epoll_dirty = false;
       }
 
       std::array<epoll_event, 64> events{};
-      const int timeout_ms = next_wakeup_timeout_ms(ports, bindings);
+      const int timeout_ms = next_wakeup_timeout_ms(ports, controllers);
       const int ready =
           ::epoll_wait(epoll_fd.get(), events.data(),
                        static_cast<int>(events.size()), timeout_ms);
@@ -2080,7 +2016,7 @@ int main(int argc, char **argv) {
                                  std::string(std::strerror(errno)));
       }
       if (ready == 0) {
-        flush_pending_outputs(ports, bindings, trace_flags, logger,
+        flush_pending_outputs(ports, controllers, trace_flags, logger,
                               epoll_dirty);
         continue;
       }
@@ -2091,8 +2027,8 @@ int main(int argc, char **argv) {
 
         if (source.kind == EventKind::Control) {
           if ((revents & EPOLLIN) != 0) {
-            handle_control_client(control_fd.get(), bindings, trace_flags,
-                                  reload_requested, logger);
+            handle_control_client(control_fd.get(), ports, controllers,
+                                  trace_flags, reload_requested, logger);
           }
           if ((revents & (EPOLLERR | EPOLLHUP)) != 0) {
             throw std::runtime_error("control socket epoll error");
@@ -2103,7 +2039,7 @@ int main(int argc, char **argv) {
         if (source.kind == EventKind::BtAcceptControl ||
             source.kind == EventKind::BtAcceptInterrupt) {
           if ((revents & EPOLLIN) != 0) {
-            handle_bt_accept(ports, bindings, bt_acceptor,
+            handle_bt_accept(ports, controllers, bt_acceptor,
                              source.kind == EventKind::BtAcceptControl, logger,
                              epoll_dirty);
           }
@@ -2131,9 +2067,11 @@ int main(int argc, char **argv) {
             continue;
           }
           auto &port = ports[source.index];
-          ControllerBinding *binding = binding_for_port(bindings, port.path);
-          vds::BtL2capBackend *backend =
-              binding && binding->backend ? &*binding->backend : nullptr;
+          ControllerRuntime *controller =
+              controller_for_port(controllers, port.path);
+          vds::BtL2capBackend *backend = controller && controller->backend
+                                             ? &*controller->backend
+                                             : nullptr;
           if ((revents & EPOLLIN) != 0) {
             for (int frame = 0; frame < kMaxPortFramesPerWake; ++frame) {
               try {
@@ -2141,10 +2079,10 @@ int main(int argc, char **argv) {
                   break;
                 }
               } catch (const std::exception &error) {
-                if (!is_bluetooth_error(error) || !binding) {
+                if (!is_bluetooth_error(error) || !controller) {
                   throw;
                 }
-                drop_bt_backend(*binding, port, error.what(), logger);
+                drop_bt_backend(*controller, port, error.what(), logger);
                 epoll_dirty = true;
                 break;
               }
@@ -2159,15 +2097,15 @@ int main(int argc, char **argv) {
           continue;
         }
 
-        if (source.index >= bindings.size() ||
-            !bindings[source.index].backend) {
+        if (source.index >= controllers.size() ||
+            !controllers[source.index].backend) {
           continue;
         }
-        auto &binding = bindings[source.index];
-        const auto port_index = find_port_index(ports, binding.device);
+        auto &controller = controllers[source.index];
+        const auto port_index = find_port_index(ports, controller.device);
         if (!port_index) {
-          binding.backend.reset();
-          binding.virtual_connected = false;
+          controller.backend.reset();
+          controller.virtual_connected = false;
           epoll_dirty = true;
           continue;
         }
@@ -2177,7 +2115,7 @@ int main(int argc, char **argv) {
           if ((revents & EPOLLIN) != 0) {
             for (int packet = 0; packet < kMaxBtPacketsPerWake; ++packet) {
               try {
-                if (!handle_bt_control(port, *binding.backend, trace_flags,
+                if (!handle_bt_control(port, *controller.backend, trace_flags,
                                        logger)) {
                   break;
                 }
@@ -2185,14 +2123,14 @@ int main(int argc, char **argv) {
                 if (!is_bluetooth_error(error)) {
                   throw;
                 }
-                drop_bt_backend(binding, port, error.what(), logger);
+                drop_bt_backend(controller, port, error.what(), logger);
                 epoll_dirty = true;
                 break;
               }
             }
           }
           if ((revents & (EPOLLERR | EPOLLHUP)) != 0) {
-            drop_bt_backend(binding, port,
+            drop_bt_backend(controller, port,
                             "Bluetooth L2CAP control epoll error", logger);
             epoll_dirty = true;
           }
@@ -2203,7 +2141,7 @@ int main(int argc, char **argv) {
           if ((revents & EPOLLIN) != 0) {
             for (int packet = 0; packet < kMaxBtPacketsPerWake; ++packet) {
               try {
-                if (!handle_bt_input(port, *binding.backend, trace_flags,
+                if (!handle_bt_input(port, *controller.backend, trace_flags,
                                      logger)) {
                   break;
                 }
@@ -2211,25 +2149,26 @@ int main(int argc, char **argv) {
                 if (!is_bluetooth_error(error)) {
                   throw;
                 }
-                drop_bt_backend(binding, port, error.what(), logger);
+                drop_bt_backend(controller, port, error.what(), logger);
                 epoll_dirty = true;
                 break;
               }
             }
           }
           if ((revents & (EPOLLERR | EPOLLHUP)) != 0) {
-            drop_bt_backend(binding, port,
+            drop_bt_backend(controller, port,
                             "Bluetooth L2CAP interrupt epoll error", logger);
             epoll_dirty = true;
           }
         }
       }
 
-      flush_pending_outputs(ports, bindings, trace_flags, logger, epoll_dirty);
+      flush_pending_outputs(ports, controllers, trace_flags, logger,
+                            epoll_dirty);
     }
 
     logger.log("daemon", vds::LogLevel::Info, "stopping");
-    disconnect_all(ports, bindings, logger);
+    disconnect_all(ports, controllers, logger);
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "vdsd: " << error.what() << "\n";

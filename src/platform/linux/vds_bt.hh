@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com>
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -13,8 +12,6 @@
 #include "vds_protocol.hh"
 
 namespace vds {
-
-std::array<std::uint8_t, 6> parse_bluetooth_address(const std::string &address);
 
 struct BtAcceptedChannel {
   std::string address;

@@ -3,10 +3,17 @@
 #pragma once
 
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <string_view>
 
 namespace vds {
+
+#ifdef _WIN32
+inline constexpr const char *kDefaultLogPath = R"(C:\ProgramData\vds\vdsd.log)";
+#else
+inline constexpr const char *kDefaultLogPath = "/var/log/vdsd.log";
+#endif
 
 enum class LogLevel {
   Debug,
@@ -22,6 +29,7 @@ public:
   void log(std::string_view scope, LogLevel level, std::string_view message);
 
 private:
+  std::mutex mutex_;
   std::ofstream file_;
 };
 

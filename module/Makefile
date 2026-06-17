@@ -1,4 +1,8 @@
 # SPDX-License-Identifier: MIT
+#
+# vDS virtual USB host controller for DualSense controllers
+#
+
 KERNELRELEASE ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KERNELRELEASE)/build
 DKMS_NAME := vds_hcd

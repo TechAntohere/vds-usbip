@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -44,6 +45,15 @@ constexpr std::size_t kOutputHeadphoneVolumeOffset = 4;
 constexpr std::size_t kOutputSpeakerVolumeOffset = 5;
 constexpr std::size_t kOutputAudioControlOffset = 7;
 constexpr std::size_t kOutputAudioControl2Offset = 37;
+constexpr std::uint8_t kBtHidpInputPrefix = 0xa1;
+constexpr std::uint8_t kBtHidpOutputPrefix = VDS_BT_OUTPUT_PREFIX;
+constexpr std::uint8_t kBtHidpFeaturePrefix = 0xa3;
+constexpr std::uint8_t kBtHidpGetFeaturePrefix = 0x43;
+constexpr std::uint8_t kBtHidpSetFeaturePrefix = 0x53;
+constexpr std::size_t kBtInputReportIdOffset = 1;
+constexpr std::size_t kBtInputUsbPayloadOffset = 3;
+constexpr std::size_t kBtInputMinimumSize =
+    kBtInputUsbPayloadOffset + VDS_USB_INPUT_PAYLOAD_SIZE;
 constexpr std::uint8_t kOutputFlag0HeadphoneVolumeEnable = 0x10;
 constexpr std::uint8_t kOutputFlag0SpeakerVolumeEnable = 0x20;
 constexpr std::uint8_t kOutputFlag0AudioControlEnable = 0x80;
@@ -58,6 +68,7 @@ constexpr DsState kInitialDsState{
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x0a, 0x07, 0x00, 0x00, 0x02, 0x01, 0x00, 0xff, 0xd7, 0x00};
+static_assert(kHapticsSampleSize % kSpeakerChannels == 0);
 
 constexpr std::uint32_t crc32_table_entry(std::uint32_t index) {
   for (unsigned bit = 0; bit < 8; ++bit) {
@@ -99,20 +110,18 @@ std::int16_t lerp_i16(std::int16_t left, std::int16_t right,
 }
 
 std::array<opus_int16, kSpeakerOpusFrames * kSpeakerChannels>
-resample_speaker_input(
-    std::span<const std::int16_t, kSpeakerInputFrames * kSpeakerChannels>
-        input) {
+resample_speaker_input(std::span<const std::int16_t> input,
+                       std::size_t input_frames) {
   std::array<opus_int16, kSpeakerOpusFrames * kSpeakerChannels> output{};
 
-  // USB audio is accumulated in 512-frame speaker windows, then resampled into
+  // USB audio is accumulated in platform-sized speaker windows, then resampled
   // one 10 ms, 480-frame Opus speaker block for the 0x36 packet.
   for (std::size_t frame = 0; frame < kSpeakerOpusFrames; ++frame) {
-    const std::size_t source_numerator = frame * kSpeakerInputFrames;
+    const std::size_t source_numerator = frame * input_frames;
     const std::size_t source_frame = source_numerator / kSpeakerOpusFrames;
     const auto fraction =
         static_cast<std::uint32_t>(source_numerator % kSpeakerOpusFrames);
-    const std::size_t next_frame =
-        std::min(source_frame + 1, kSpeakerInputFrames - 1);
+    const std::size_t next_frame = std::min(source_frame + 1, input_frames - 1);
 
     for (std::size_t channel = 0; channel < kSpeakerChannels; ++channel) {
       output[frame * kSpeakerChannels + channel] =
@@ -120,6 +129,33 @@ resample_speaker_input(
                    input[next_frame * kSpeakerChannels + channel], fraction,
                    kSpeakerOpusFrames);
     }
+  }
+
+  return output;
+}
+
+HapticsChunk resample_haptics_input(std::span<const std::int16_t> input,
+                                    std::size_t input_frames) {
+  HapticsChunk output{};
+  constexpr std::size_t output_frames = kHapticsSampleSize / kSpeakerChannels;
+
+  for (std::size_t frame = 0; frame < output_frames; ++frame) {
+    const std::size_t begin = frame * input_frames / output_frames;
+    const std::size_t end = (frame + 1) * input_frames / output_frames;
+    const std::size_t count = std::max<std::size_t>(1, end - begin);
+    std::int32_t left_sum = 0;
+    std::int32_t right_sum = 0;
+    for (std::size_t sample = begin; sample < end; ++sample) {
+      left_sum += input[sample * kSpeakerChannels + 0];
+      right_sum += input[sample * kSpeakerChannels + 1];
+    }
+
+    const auto left =
+        static_cast<std::int16_t>(left_sum / static_cast<std::int32_t>(count));
+    const auto right =
+        static_cast<std::int16_t>(right_sum / static_cast<std::int32_t>(count));
+    output[frame * kSpeakerChannels + 0] = s16_to_s8_haptic(left);
+    output[frame * kSpeakerChannels + 1] = s16_to_s8_haptic(right);
   }
 
   return output;
@@ -197,11 +233,10 @@ struct PcmAudioExtractor::SpeakerEncoder {
   SpeakerEncoder(const SpeakerEncoder &) = delete;
   SpeakerEncoder &operator=(const SpeakerEncoder &) = delete;
 
-  SpeakerChunk
-  encode(std::span<const std::int16_t, kSpeakerInputFrames * kSpeakerChannels>
-             input) {
+  SpeakerChunk encode(std::span<const std::int16_t> input,
+                      std::size_t input_frames) {
     SpeakerChunk output{};
-    const auto opus_input = resample_speaker_input(input);
+    const auto opus_input = resample_speaker_input(input, input_frames);
     const int bytes =
         opus_encode(encoder, opus_input.data(), kSpeakerOpusFrames,
                     output.data(), static_cast<opus_int32>(output.size()));
@@ -219,8 +254,15 @@ struct PcmAudioExtractor::SpeakerEncoder {
   OpusEncoder *encoder = nullptr;
 };
 
-PcmAudioExtractor::PcmAudioExtractor()
-    : speaker_encoder_(std::make_unique<SpeakerEncoder>()) {}
+PcmAudioExtractor::PcmAudioExtractor(std::size_t speaker_input_frames)
+    : speaker_encoder_(std::make_unique<SpeakerEncoder>()),
+      speaker_input_frames_(speaker_input_frames) {
+  if (speaker_input_frames_ == 0 ||
+      speaker_input_frames_ > kSpeakerInputFrames ||
+      speaker_input_frames_ % kHapticsDecimation != 0) {
+    throw std::invalid_argument("unsupported speaker input frame window");
+  }
+}
 
 PcmAudioExtractor::~PcmAudioExtractor() = default;
 
@@ -253,6 +295,61 @@ void fill_feature_report_checksum(std::span<std::uint8_t> report) {
   report[offset + 1] = static_cast<std::uint8_t>((crc >> 8) & 0xff);
   report[offset + 2] = static_cast<std::uint8_t>((crc >> 16) & 0xff);
   report[offset + 3] = static_cast<std::uint8_t>((crc >> 24) & 0xff);
+}
+
+std::vector<std::uint8_t>
+hidp_output_packet(std::span<const std::uint8_t> report) {
+  std::vector<std::uint8_t> packet;
+  packet.reserve(report.size() + 1);
+  packet.push_back(kBtHidpOutputPrefix);
+  packet.insert(packet.end(), report.begin(), report.end());
+  return packet;
+}
+
+std::vector<std::uint8_t> feature_get_packet(std::uint8_t report_id) {
+  return {kBtHidpGetFeaturePrefix, report_id};
+}
+
+std::vector<std::uint8_t>
+feature_set_packet(std::span<const std::uint8_t> report) {
+  if (report.empty()) {
+    return {};
+  }
+
+  std::vector<std::uint8_t> checked_report(report.begin(), report.end());
+  if (checked_report.size() >= sizeof(std::uint32_t)) {
+    fill_feature_report_checksum(checked_report);
+  }
+
+  std::vector<std::uint8_t> packet;
+  packet.reserve(report.size() + 1);
+  packet.push_back(kBtHidpSetFeaturePrefix);
+  packet.insert(packet.end(), checked_report.begin(), checked_report.end());
+  return packet;
+}
+
+std::optional<UsbInputReport>
+bt_input_to_usb_input(std::span<const std::uint8_t> packet) {
+  if (packet.size() < kBtInputMinimumSize || packet[0] != kBtHidpInputPrefix ||
+      packet[kBtInputReportIdOffset] != VDS_BT_STATE_REPORT_ID) {
+    return std::nullopt;
+  }
+
+  UsbInputReport report{};
+  report[0] = VDS_USB_INPUT_REPORT_ID;
+  std::copy(packet.begin() +
+                static_cast<std::ptrdiff_t>(kBtInputUsbPayloadOffset),
+            packet.begin() + static_cast<std::ptrdiff_t>(kBtInputMinimumSize),
+            report.begin() + 1);
+  return report;
+}
+
+std::optional<std::vector<std::uint8_t>>
+bt_feature_to_usb_feature_reply(std::span<const std::uint8_t> packet) {
+  if (packet.size() < 2 || packet[0] != kBtHidpFeaturePrefix) {
+    return std::nullopt;
+  }
+  return std::vector<std::uint8_t>(packet.begin() + 1, packet.end());
 }
 
 DsOutputState::DsOutputState() : state_(kInitialDsState) {}
@@ -416,7 +513,8 @@ BtReport HapticsPacketBuilder::build_packet(
 std::vector<AudioChunk>
 PcmAudioExtractor::push_usb_audio(std::span<const std::uint8_t> pcm_bytes) {
   std::vector<AudioChunk> chunks;
-  chunks.reserve(pcm_bytes.size() / (kPcmFrameSize * kSpeakerInputFrames) + 1);
+  chunks.reserve(pcm_bytes.size() / (kPcmFrameSize * speaker_input_frames_) +
+                 1);
 
   const auto consume_frame = [this, &chunks](const std::uint8_t *base) {
     std::array<std::int16_t, kPcmChannels> samples{};
@@ -427,37 +525,28 @@ PcmAudioExtractor::push_usb_audio(std::span<const std::uint8_t> pcm_bytes) {
 
     speaker_input_[speaker_frame_pos_ * kSpeakerChannels + 0] = samples[0];
     speaker_input_[speaker_frame_pos_ * kSpeakerChannels + 1] = samples[1];
+    haptics_input_[speaker_frame_pos_ * kSpeakerChannels + 0] = samples[2];
+    haptics_input_[speaker_frame_pos_ * kSpeakerChannels + 1] = samples[3];
     chunk_has_haptics_signal_ |= samples[2] != 0 || samples[3] != 0;
     ++speaker_frame_pos_;
 
-    haptics_bucket_left_ += samples[2];
-    haptics_bucket_right_ += samples[3];
-    if (++haptics_bucket_frames_ == kHapticsDecimation) {
-      const auto left = static_cast<std::int16_t>(
-          haptics_bucket_left_ / static_cast<std::int32_t>(kHapticsDecimation));
-      const auto right = static_cast<std::int16_t>(
-          haptics_bucket_right_ /
-          static_cast<std::int32_t>(kHapticsDecimation));
-      haptics_chunk_[haptics_chunk_pos_++] = s16_to_s8_haptic(left);
-      haptics_chunk_[haptics_chunk_pos_++] = s16_to_s8_haptic(right);
-      haptics_bucket_left_ = 0;
-      haptics_bucket_right_ = 0;
-      haptics_bucket_frames_ = 0;
-    }
-
-    if (speaker_frame_pos_ != kSpeakerInputFrames) {
+    if (speaker_frame_pos_ != speaker_input_frames_) {
       return;
     }
 
     speaker_frame_pos_ = 0;
     AudioChunk chunk{};
-    chunk.haptics = haptics_chunk_;
-    chunk.speaker = speaker_encoder_->encode(speaker_input_);
+    chunk.haptics = resample_haptics_input(
+        std::span<const std::int16_t>(haptics_input_.data(),
+                                      speaker_input_frames_ * kSpeakerChannels),
+        speaker_input_frames_);
+    chunk.speaker = speaker_encoder_->encode(
+        std::span<const std::int16_t>(speaker_input_.data(),
+                                      speaker_input_frames_ * kSpeakerChannels),
+        speaker_input_frames_);
     chunk.has_signal = chunk_has_signal_;
     chunk.has_haptics_signal = chunk_has_haptics_signal_;
     chunks.push_back(chunk);
-    haptics_chunk_.fill(0);
-    haptics_chunk_pos_ = 0;
     chunk_has_signal_ = false;
     chunk_has_haptics_signal_ = false;
   };
@@ -522,6 +611,10 @@ std::string frame_type_name(std::uint16_t type) {
     return "USB_FEATURE_REPLY";
   case VDS_FRAME_USB_INTERFACE:
     return "USB_INTERFACE";
+  case VDS_FRAME_BT_CONTROL_PACKET:
+    return "BT_CONTROL_PACKET";
+  case VDS_FRAME_BT_INTERRUPT_PACKET:
+    return "BT_INTERRUPT_PACKET";
   default:
     return "UNKNOWN";
   }

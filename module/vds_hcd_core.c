@@ -20,11 +20,9 @@
 #include <linux/platform_device.h>
 #include <linux/poll.h>
 #include <linux/slab.h>
-#include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <linux/usb.h>
 #include <linux/usb/ch11.h>
-#include <linux/usb/ch9.h>
 #include <linux/usb/hcd.h>
 
 #include "uapi/vds.h"
@@ -35,16 +33,15 @@
 #endif
 
 #define VDS_HCD_DRIVER_NAME "vds_hcd"
-
-static unsigned int max_port = 1;
+static unsigned int max_port = VDS_MAX_PORT_COUNT;
 module_param(max_port, uint, 0444);
-MODULE_PARM_DESC(max_port, "Number of virtual DualSense ports to create (1-8)");
+MODULE_PARM_DESC(max_port, "Number of virtual DualSense ports to create (1-4)");
 
 /* Root-hub port change bits live in the high 16 bits of port_status. */
-#define PORT_C_MASK                                                            \
-	((USB_PORT_STAT_C_CONNECTION | USB_PORT_STAT_C_ENABLE |                \
-	  USB_PORT_STAT_C_SUSPEND | USB_PORT_STAT_C_OVERCURRENT |              \
-	  USB_PORT_STAT_C_RESET)                                               \
+#define PORT_C_MASK                                               \
+	((USB_PORT_STAT_C_CONNECTION | USB_PORT_STAT_C_ENABLE |   \
+	  USB_PORT_STAT_C_SUSPEND | USB_PORT_STAT_C_OVERCURRENT | \
+	  USB_PORT_STAT_C_RESET)                                  \
 	 << 16)
 
 struct vds_event {
@@ -735,11 +732,10 @@ static ssize_t vds_write(struct file *file, const char __user *buf,
 			return PTR_ERR(payload);
 	}
 
-	if (header.type == VDS_FRAME_USB_HID_IN) {
+	if (header.type == VDS_FRAME_USB_HID_IN)
 		ret = vds_write_input_frame(dev, payload, header.length);
-	} else if (header.type == VDS_FRAME_USB_FEATURE_REPLY) {
+	else if (header.type == VDS_FRAME_USB_FEATURE_REPLY)
 		ret = vds_write_feature_reply(dev, payload, header.length);
-	}
 
 	kfree(payload);
 	return ret ? ret : count;
@@ -759,8 +755,8 @@ static void vds_set_connection(struct vds_hcd_dev *dev, bool connected)
 	}
 	was_connected = dev->port_status & USB_PORT_STAT_CONNECTION;
 	if (connected) {
-		dev->port_status |=
-			USB_PORT_STAT_POWER | USB_PORT_STAT_CONNECTION;
+		dev->port_status |= USB_PORT_STAT_POWER |
+				    USB_PORT_STAT_CONNECTION;
 		if (!was_connected)
 			dev->port_status |= USB_PORT_STAT_C_CONNECTION << 16;
 		vds_status_set_locked(dev, VDS_STATUS_CONNECTED, true);
@@ -797,7 +793,7 @@ static void vds_set_connection(struct vds_hcd_dev *dev, bool connected)
 static long vds_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct vds_hcd_dev *dev = vds_from_file(file);
-	struct vds_identity_config identity;
+	struct vds_profile_config profile;
 	struct vds_status status;
 	unsigned long flags;
 	int ret;
@@ -810,25 +806,25 @@ static long vds_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		memset(&status, 0, sizeof(status));
 		spin_lock_irqsave(&dev->lock, flags);
 		status.status_flags = dev->status_flags;
-		status.identity = vds_usb_device_identity(&dev->usb);
+		status.profile = vds_usb_device_profile_id(&dev->usb);
 		status.frames_to_user = dev->frames_to_user;
 		status.frames_from_user = dev->frames_from_user;
 		spin_unlock_irqrestore(&dev->lock, flags);
 		if (copy_to_user((void __user *)arg, &status, sizeof(status)))
 			return -EFAULT;
 		return 0;
-	case VDS_IOC_SET_IDENTITY:
-		if (copy_from_user(&identity, (void __user *)arg,
-				   sizeof(identity)))
+	case VDS_IOC_SET_PROFILE:
+		if (copy_from_user(&profile, (void __user *)arg,
+				   sizeof(profile)))
 			return -EFAULT;
-		if (identity.polling_rate_mode)
+		if (profile.polling_rate_mode)
 			return -EOPNOTSUPP;
 		spin_lock_irqsave(&dev->lock, flags);
 		if (dev->status_flags & VDS_STATUS_CONNECTED) {
 			spin_unlock_irqrestore(&dev->lock, flags);
 			return -EBUSY;
 		}
-		ret = vds_usb_device_set_identity(&dev->usb, identity.identity);
+		ret = vds_usb_device_set_profile(&dev->usb, profile.profile);
 		if (ret) {
 			spin_unlock_irqrestore(&dev->lock, flags);
 			return ret;
@@ -926,8 +922,8 @@ static void vds_schedule_iso_giveback(struct vds_hcd_dev *dev,
 
 		duration_by_bytes =
 			DIV_ROUND_UP_ULL((u64)total * 1000ULL, bytes_per_ms);
-		duration_us = max_t(unsigned int, (unsigned int)duration_by_bytes,
-				    1000U);
+		duration_us = max_t(unsigned int,
+				    (unsigned int)duration_by_bytes, 1000U);
 	}
 
 	now = ktime_get();
@@ -1124,12 +1120,12 @@ static int vds_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 				context->status = status;
 				context->ready_time = 0;
 				wake_giveback = true;
-			} else {
-				wake_giveback =
-					vds_queue_urb_giveback_locked(dev,
-								      context,
-								      status);
-			}
+				} else {
+					wake_giveback =
+						vds_queue_urb_giveback_locked(dev,
+									      context,
+									      status);
+				}
 		}
 	}
 	spin_unlock_irqrestore(&dev->lock, flags);
@@ -1349,7 +1345,7 @@ static int vds_hcd_probe(struct platform_device *pdev)
 	memset(dev, 0, sizeof(*dev));
 	dev->hcd = hcd;
 	dev->port_index = pdev->id;
-	vds_usb_device_init(&dev->usb, VDS_IDENTITY_DS5);
+	vds_usb_device_init(&dev->usb, VDS_PROFILE_DS5);
 	spin_lock_init(&dev->lock);
 	init_waitqueue_head(&dev->read_wq);
 	init_waitqueue_head(&dev->giveback_wq);
@@ -1410,9 +1406,9 @@ static void vds_hcd_remove(struct platform_device *pdev)
 static struct platform_driver vds_hcd_platform_driver = {
 	.probe = vds_hcd_probe,
 	.remove = vds_hcd_remove,
-		.driver = {
-			.name = VDS_HCD_DRIVER_NAME,
-		},
+	.driver = {
+		.name = VDS_HCD_DRIVER_NAME,
+	},
 };
 
 static int __init vds_hcd_init(void)
@@ -1422,7 +1418,7 @@ static int __init vds_hcd_init(void)
 	int ret;
 
 	/* Bound per-module virtual controllers to a small, predictable set. */
-	if (!max_port || max_port > 8)
+	if (max_port < VDS_MIN_PORT_COUNT || max_port > VDS_MAX_PORT_COUNT)
 		return -EINVAL;
 
 	ret = platform_driver_register(&vds_hcd_platform_driver);

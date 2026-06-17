@@ -10,10 +10,9 @@
 
 #include <linux/errno.h>
 #include <linux/string.h>
-#include <linux/usb/ch9.h>
 
 #include "uapi/vds.h"
-#include "vds/ds5.h"
+#include "vds/ds5_protocol.h"
 #include "vds_usb.h"
 
 #define HID_REQ_GET_REPORT 0x01
@@ -48,14 +47,15 @@ static const struct usb_qualifier_descriptor vds_qualifier_desc = {
 	.bNumConfigurations = 1,
 };
 
-static bool vds_usb_valid_identity(u32 identity)
+static bool vds_usb_valid_profile(u32 profile)
 {
-	return identity == VDS_IDENTITY_DS5 || identity == VDS_IDENTITY_DSE;
+	return profile == VDS_PROFILE_DS5 || profile == VDS_PROFILE_DSE;
 }
 
-static const struct vds_controller_profile *vds_usb_profile_for_identity(u32 identity)
+static const struct vds_controller_profile *
+vds_usb_controller_profile_for_profile(u32 profile)
 {
-	if (identity == VDS_IDENTITY_DSE)
+	if (profile == VDS_PROFILE_DSE)
 		return &vds_dualsense_edge_profile;
 	return &vds_dualsense_profile;
 }
@@ -76,12 +76,12 @@ static void vds_usb_reset_state_locked(struct vds_usb_device *dev)
 	memset(dev->feature_cache_len, 0, sizeof(dev->feature_cache_len));
 }
 
-void vds_usb_device_init(struct vds_usb_device *dev, u32 identity)
+void vds_usb_device_init(struct vds_usb_device *dev, u32 profile)
 {
 	memset(dev, 0, sizeof(*dev));
 	spin_lock_init(&dev->lock);
-	dev->identity = vds_usb_valid_identity(identity) ? identity :
-							   VDS_IDENTITY_DS5;
+	dev->profile = vds_usb_valid_profile(profile) ? profile :
+							VDS_PROFILE_DS5;
 	vds_usb_reset_state_locked(dev);
 }
 
@@ -94,20 +94,20 @@ void vds_usb_device_reset_state(struct vds_usb_device *dev)
 	spin_unlock_irqrestore(&dev->lock, flags);
 }
 
-u32 vds_usb_device_identity(const struct vds_usb_device *dev)
+u32 vds_usb_device_profile_id(const struct vds_usb_device *dev)
 {
-	return READ_ONCE(dev->identity);
+	return READ_ONCE(dev->profile);
 }
 
-int vds_usb_device_set_identity(struct vds_usb_device *dev, u32 identity)
+int vds_usb_device_set_profile(struct vds_usb_device *dev, u32 profile)
 {
 	unsigned long flags;
 
-	if (!vds_usb_valid_identity(identity))
+	if (!vds_usb_valid_profile(profile))
 		return -EINVAL;
 
 	spin_lock_irqsave(&dev->lock, flags);
-	WRITE_ONCE(dev->identity, identity);
+	WRITE_ONCE(dev->profile, profile);
 	vds_usb_reset_state_locked(dev);
 	spin_unlock_irqrestore(&dev->lock, flags);
 	return 0;
@@ -116,7 +116,7 @@ int vds_usb_device_set_identity(struct vds_usb_device *dev, u32 identity)
 const struct vds_controller_profile *
 vds_usb_device_profile(const struct vds_usb_device *dev)
 {
-	return vds_usb_profile_for_identity(vds_usb_device_identity(dev));
+	return vds_usb_controller_profile_for_profile(vds_usb_device_profile_id(dev));
 }
 
 int vds_usb_device_update_feature_reply(struct vds_usb_device *dev,
@@ -319,7 +319,8 @@ static int vds_usb_audio_control(struct vds_usb_device *dev, struct urb *urb,
 			default:
 				return -EPIPE;
 			}
-			return vds_usb_copy_to_urb(urb, &volume, sizeof(volume));
+			return vds_usb_copy_to_urb(urb, &volume,
+						   sizeof(volume));
 		default:
 			return -EPIPE;
 		}
@@ -408,21 +409,21 @@ static int vds_usb_hid_control(struct vds_usb_device *dev, struct urb *urb,
 		if (urb->transfer_buffer_length) {
 			u8 feature_set[VDS_CONTROLLER_HID_PACKET_SIZE + 1];
 
-				if (urb->transfer_buffer_length >
-				    VDS_CONTROLLER_HID_PACKET_SIZE)
-					return -EPIPE;
+			if (urb->transfer_buffer_length >
+			    VDS_CONTROLLER_HID_PACKET_SIZE)
+				return -EPIPE;
 
-				feature_set[0] = report_id;
-				memcpy(feature_set + 1, urb->transfer_buffer,
-				       urb->transfer_buffer_length);
-				ret = vds_usb_enqueue_frame(ops, context,
-							    VDS_FRAME_USB_FEATURE_SET,
-							    feature_set,
-							    urb->transfer_buffer_length + 1,
-							    gfp);
-				if (ret)
-					return ret;
-			}
+			feature_set[0] = report_id;
+			memcpy(feature_set + 1, urb->transfer_buffer,
+			       urb->transfer_buffer_length);
+			ret = vds_usb_enqueue_frame(ops, context,
+						    VDS_FRAME_USB_FEATURE_SET,
+						    feature_set,
+						    urb->transfer_buffer_length + 1,
+						    gfp);
+			if (ret)
+				return ret;
+		}
 		urb->actual_length = urb->transfer_buffer_length;
 		return 0;
 	case HID_REQ_GET_IDLE:
@@ -481,7 +482,7 @@ vds_usb_standard_control(struct vds_usb_device *dev, struct urb *urb,
 			device_desc.bMaxPacketSize0 = profile->max_packet_size0;
 			device_desc.idVendor = cpu_to_le16(VDS_SONY_VENDOR_ID);
 			device_desc.idProduct = cpu_to_le16(profile->product_id);
-			device_desc.bcdDevice = cpu_to_le16(0x0100);
+			device_desc.bcdDevice = cpu_to_le16(profile->device_version);
 			device_desc.iManufacturer = 1;
 			device_desc.iProduct = 2;
 			device_desc.bNumConfigurations =
@@ -498,7 +499,8 @@ vds_usb_standard_control(struct vds_usb_device *dev, struct urb *urb,
 		case USB_DT_STRING:
 			switch (desc_index) {
 			case 0:
-				return vds_usb_copy_string_descriptor(urb, NULL);
+				return vds_usb_copy_string_descriptor(urb,
+								      NULL);
 			case 1:
 				return vds_usb_copy_string_descriptor(urb,
 								      profile->manufacturer);
@@ -568,11 +570,11 @@ vds_usb_standard_control(struct vds_usb_device *dev, struct urb *urb,
 			vds_usb_set_status(ops, context,
 					   VDS_STATUS_AUDIO_ENABLED,
 					   audio_enabled);
-			vds_usb_enqueue_interface_event(ops, context,
-							profile->audio_out_interface,
-							value & 0xff,
-							VDS_USB_INTERFACE_AUDIO_OUT,
-							gfp);
+				vds_usb_enqueue_interface_event(ops, context,
+								profile->audio_out_interface,
+								value & 0xff,
+								VDS_USB_INTERFACE_AUDIO_OUT,
+								gfp);
 			return 0;
 		}
 		if (profile->audio_in_interface !=
@@ -581,11 +583,11 @@ vds_usb_standard_control(struct vds_usb_device *dev, struct urb *urb,
 			spin_lock_irqsave(&dev->lock, flags);
 			dev->audio_in_altsetting = value & 0xff;
 			spin_unlock_irqrestore(&dev->lock, flags);
-			vds_usb_enqueue_interface_event(ops, context,
-							profile->audio_in_interface,
-							value & 0xff,
-							VDS_USB_INTERFACE_AUDIO_IN,
-							gfp);
+				vds_usb_enqueue_interface_event(ops, context,
+								profile->audio_in_interface,
+								value & 0xff,
+								VDS_USB_INTERFACE_AUDIO_IN,
+								gfp);
 			return 0;
 		}
 		return -EPIPE;

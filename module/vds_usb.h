@@ -12,7 +12,7 @@
 struct vds_usb_device {
 	/* Protects address/configuration/interface state and feature cache. */
 	spinlock_t lock;
-	u32 identity;
+	u32 profile;
 	u8 address;
 	u8 configuration;
 	u8 audio_out_altsetting;
@@ -32,10 +32,10 @@ struct vds_usb_device_ops {
 	void (*set_status)(void *context, u32 flags, bool enabled);
 };
 
-void vds_usb_device_init(struct vds_usb_device *dev, u32 identity);
+void vds_usb_device_init(struct vds_usb_device *dev, u32 profile);
 void vds_usb_device_reset_state(struct vds_usb_device *dev);
-u32 vds_usb_device_identity(const struct vds_usb_device *dev);
-int vds_usb_device_set_identity(struct vds_usb_device *dev, u32 identity);
+u32 vds_usb_device_profile_id(const struct vds_usb_device *dev);
+int vds_usb_device_set_profile(struct vds_usb_device *dev, u32 profile);
 const struct vds_controller_profile *
 vds_usb_device_profile(const struct vds_usb_device *dev);
 int vds_usb_device_update_feature_reply(struct vds_usb_device *dev,

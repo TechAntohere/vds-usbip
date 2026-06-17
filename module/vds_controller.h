@@ -24,8 +24,9 @@ enum vds_controller_audio_feature {
 };
 
 struct vds_controller_profile {
-	u32 identity;
+	u32 profile;
 	u16 product_id;
+	u16 device_version;
 	u8 device_class;
 	u8 device_subclass;
 	u8 device_protocol;
