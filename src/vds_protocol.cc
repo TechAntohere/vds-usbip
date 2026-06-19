@@ -45,6 +45,10 @@ constexpr std::size_t kOutputHeadphoneVolumeOffset = 4;
 constexpr std::size_t kOutputSpeakerVolumeOffset = 5;
 constexpr std::size_t kOutputAudioControlOffset = 7;
 constexpr std::size_t kOutputAudioControl2Offset = 37;
+constexpr std::size_t kOutputLightBrightnessOffset =
+    offsetof(vds_set_state_data, light_brightness);
+constexpr std::size_t kOutputLedColorOffset =
+    offsetof(vds_set_state_data, led_red);
 constexpr std::uint8_t kBtHidpInputPrefix = 0xa1;
 constexpr std::uint8_t kBtHidpOutputPrefix = VDS_BT_OUTPUT_PREFIX;
 constexpr std::uint8_t kBtHidpFeaturePrefix = 0xa3;
@@ -200,6 +204,24 @@ void set_state_bit(std::uint8_t &byte, int bit, bool value) {
                                    (value ? mask : std::uint8_t{0}));
 }
 
+std::uint8_t scale_light_component(std::uint8_t component,
+                                   std::uint8_t brightness) {
+  std::uint16_t scale = 255;
+  switch (brightness) {
+  case 1:
+    scale = 128;
+    break;
+  case 2:
+    scale = 64;
+    break;
+  default:
+    break;
+  }
+
+  return static_cast<std::uint8_t>(
+      (static_cast<std::uint16_t>(component) * scale + 127) / 255);
+}
+
 } // namespace
 
 struct PcmAudioExtractor::SpeakerEncoder {
@@ -352,7 +374,11 @@ bt_feature_to_usb_feature_reply(std::span<const std::uint8_t> packet) {
   return std::vector<std::uint8_t>(packet.begin() + 1, packet.end());
 }
 
-DsOutputState::DsOutputState() : state_(kInitialDsState) {}
+DsOutputState::DsOutputState()
+    : state_(kInitialDsState), light_color_{state_[kOutputLedColorOffset + 0],
+                                            state_[kOutputLedColorOffset + 1],
+                                            state_[kOutputLedColorOffset + 2]},
+      light_brightness_(state_[kOutputLightBrightnessOffset]) {}
 
 BtInitReport DsOutputState::build_bt_init_report() {
   BtInitReport report{};
@@ -367,12 +393,17 @@ BtInitReport DsOutputState::build_bt_init_report() {
 
 bool DsOutputState::apply_usb_output_report(
     std::span<const std::uint8_t> report) {
-  if (report.size() < 1 + kSetStateSize ||
-      report[0] != VDS_USB_OUTPUT_REPORT_ID) {
+  std::span<const std::uint8_t> update;
+
+  if (report.size() >= 1 + kSetStateSize &&
+      report[0] == VDS_USB_OUTPUT_REPORT_ID) {
+    update = report.subspan(1, kSetStateSize);
+  } else if (report.size() == kSetStateSize) {
+    update = report.first(kSetStateSize);
+  } else {
     return false;
   }
 
-  const std::span update = report.subspan(1, kSetStateSize);
   vds_set_state_data decoded{};
   std::memcpy(&decoded, update.data(), sizeof(decoded));
 
@@ -432,17 +463,29 @@ bool DsOutputState::apply_usb_output_report(
                      sizeof(decoded.light_fade_animation));
   }
   if (decoded.allow_light_brightness_change) {
-    copy_state_bytes(state_, update,
-                     offsetof(vds_set_state_data, light_brightness),
+    copy_state_bytes(state_, update, kOutputLightBrightnessOffset,
                      sizeof(decoded.light_brightness));
+    light_brightness_ = decoded.light_brightness;
+    emulate_light_brightness_ = true;
   }
   if (decoded.allow_player_indicators) {
     // player_light* is a bitfield byte immediately before led_red.
-    copy_state_bytes(state_, update, offsetof(vds_set_state_data, led_red) - 1,
-                     1);
+    copy_state_bytes(state_, update, kOutputLedColorOffset - 1, 1);
   }
   if (decoded.allow_led_color) {
-    copy_state_bytes(state_, update, offsetof(vds_set_state_data, led_red), 3);
+    light_color_ = {update[kOutputLedColorOffset + 0],
+                    update[kOutputLedColorOffset + 1],
+                    update[kOutputLedColorOffset + 2]};
+    copy_state_bytes(state_, update, kOutputLedColorOffset, 3);
+  }
+  if (emulate_light_brightness_ &&
+      (decoded.allow_light_brightness_change || decoded.allow_led_color)) {
+    state_[kOutputLedColorOffset + 0] =
+        scale_light_component(light_color_[0], light_brightness_);
+    state_[kOutputLedColorOffset + 1] =
+        scale_light_component(light_color_[1], light_brightness_);
+    state_[kOutputLedColorOffset + 2] =
+        scale_light_component(light_color_[2], light_brightness_);
   }
   return true;
 }

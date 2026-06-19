@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <sstream>
@@ -13,22 +12,12 @@
 #include <utility>
 #include <vector>
 
+#include "jsonl.hh"
 #include "vds_common.hh"
 #include "vds_config.hh"
 #include "vds_fs.hh"
 
 namespace {
-
-struct JsonValue {
-  std::string string_value;
-  std::vector<unsigned> array_value;
-  bool is_array = false;
-};
-
-struct JsonField {
-  std::string key;
-  JsonValue value;
-};
 
 bool is_hex_digit(char ch) {
   return std::isxdigit(static_cast<unsigned char>(ch)) != 0;
@@ -58,320 +47,19 @@ std::vector<std::string> split_commas(std::string_view text) {
   return parts;
 }
 
-void skip_json_space(std::string_view text, std::size_t &offset) {
-  while (offset < text.size() &&
-         std::isspace(static_cast<unsigned char>(text[offset])) != 0) {
-    ++offset;
-  }
-}
-
-void require_json_char(std::string_view text, std::size_t &offset,
-                       char expected, std::size_t line_number) {
-  skip_json_space(text, offset);
-  if (offset >= text.size() || text[offset] != expected) {
-    throw std::runtime_error("invalid JSON config record at line " +
-                             std::to_string(line_number));
-  }
-  ++offset;
-}
-
-char parse_json_escape(char escape, std::size_t line_number) {
-  switch (escape) {
-  case '"':
-  case '\\':
-  case '/':
-    return escape;
-  case 'b':
-    return '\b';
-  case 'f':
-    return '\f';
-  case 'n':
-    return '\n';
-  case 'r':
-    return '\r';
-  case 't':
-    return '\t';
-  default:
-    throw std::runtime_error("unsupported JSON escape at line " +
-                             std::to_string(line_number));
-  }
-}
-
-int parse_json_hex_digit(char ch, std::size_t line_number) {
-  if (ch >= '0' && ch <= '9') {
-    return ch - '0';
-  }
-  if (ch >= 'a' && ch <= 'f') {
-    return ch - 'a' + 10;
-  }
-  if (ch >= 'A' && ch <= 'F') {
-    return ch - 'A' + 10;
-  }
-  throw std::runtime_error("invalid JSON unicode escape at line " +
-                           std::to_string(line_number));
-}
-
-std::string parse_json_string(std::string_view text, std::size_t &offset,
-                              std::size_t line_number) {
-  skip_json_space(text, offset);
-  if (offset >= text.size() || text[offset] != '"') {
-    throw std::runtime_error("expected JSON string at line " +
-                             std::to_string(line_number));
-  }
-  ++offset;
-
-  std::string value;
-  while (offset < text.size()) {
-    const char ch = text[offset++];
-    if (ch == '"') {
-      return value;
-    }
-    if (ch == '\\') {
-      if (offset >= text.size()) {
-        throw std::runtime_error("unterminated JSON escape at line " +
-                                 std::to_string(line_number));
-      }
-      const char escape = text[offset++];
-      if (escape == 'u') {
-        if (offset + 4 > text.size()) {
-          throw std::runtime_error("unterminated JSON unicode escape at line " +
-                                   std::to_string(line_number));
-        }
-        unsigned int code_point = 0;
-        for (int i = 0; i < 4; ++i) {
-          code_point = (code_point << 4) |
-                       parse_json_hex_digit(text[offset++], line_number);
-        }
-        if (code_point > 0x7f) {
-          throw std::runtime_error("unsupported JSON unicode escape at line " +
-                                   std::to_string(line_number));
-        }
-        value.push_back(static_cast<char>(code_point));
-      } else {
-        value.push_back(parse_json_escape(escape, line_number));
-      }
-      continue;
-    }
-    if (static_cast<unsigned char>(ch) < 0x20) {
-      throw std::runtime_error("invalid control character at line " +
-                               std::to_string(line_number));
-    }
-    value.push_back(ch);
-  }
-
-  throw std::runtime_error("unterminated JSON string at line " +
-                           std::to_string(line_number));
-}
-
-unsigned parse_json_unsigned(std::string_view text, std::size_t &offset,
-                             std::size_t line_number) {
-  skip_json_space(text, offset);
-  const std::size_t start = offset;
-  while (offset < text.size() &&
-         std::isdigit(static_cast<unsigned char>(text[offset])) != 0) {
-    ++offset;
-  }
-  if (start == offset) {
-    throw std::runtime_error("expected JSON unsigned integer at line " +
-                             std::to_string(line_number));
-  }
-
-  unsigned long long value = 0;
-  for (const char ch : text.substr(start, offset - start)) {
-    value = value * 10 + static_cast<unsigned>(ch - '0');
-    if (value > std::numeric_limits<unsigned>::max()) {
-      throw std::runtime_error("JSON unsigned integer overflow at line " +
-                               std::to_string(line_number));
-    }
-  }
-  return static_cast<unsigned>(value);
-}
-
-std::vector<unsigned> parse_json_unsigned_array(std::string_view text,
-                                                std::size_t &offset,
-                                                std::size_t line_number) {
-  std::vector<unsigned> values;
-  require_json_char(text, offset, '[', line_number);
-  skip_json_space(text, offset);
-  if (offset < text.size() && text[offset] == ']') {
-    ++offset;
-    return values;
-  }
-
-  while (true) {
-    values.push_back(parse_json_unsigned(text, offset, line_number));
-    skip_json_space(text, offset);
-    if (offset >= text.size()) {
-      throw std::runtime_error("unterminated JSON array at line " +
-                               std::to_string(line_number));
-    }
-    if (text[offset] == ']') {
-      ++offset;
-      return values;
-    }
-    if (text[offset] != ',') {
-      throw std::runtime_error("expected JSON array separator at line " +
-                               std::to_string(line_number));
-    }
-    ++offset;
-  }
-}
-
-JsonValue parse_json_value(std::string_view line, std::size_t &offset,
-                           std::size_t line_number) {
-  skip_json_space(line, offset);
-  if (offset >= line.size()) {
-    throw std::runtime_error("missing JSON value at line " +
-                             std::to_string(line_number));
-  }
-  if (line[offset] == '"') {
-    return JsonValue{
-        .string_value = parse_json_string(line, offset, line_number),
-        .array_value = {},
-        .is_array = false,
-    };
-  }
-  if (line[offset] == '[') {
-    return JsonValue{
-        .string_value = {},
-        .array_value = parse_json_unsigned_array(line, offset, line_number),
-        .is_array = true,
-    };
-  }
-  throw std::runtime_error("unsupported JSON value at line " +
-                           std::to_string(line_number));
-}
-
-std::vector<JsonField> parse_json_object(std::string_view line,
-                                         std::size_t line_number) {
-  std::vector<JsonField> fields;
-  std::size_t offset = 0;
-
-  require_json_char(line, offset, '{', line_number);
-  skip_json_space(line, offset);
-  if (offset < line.size() && line[offset] == '}') {
-    ++offset;
-    skip_json_space(line, offset);
-    if (offset != line.size()) {
-      throw std::runtime_error("trailing data after JSON object at line " +
-                               std::to_string(line_number));
-    }
-    return fields;
-  }
-
-  while (true) {
-    std::string key = parse_json_string(line, offset, line_number);
-    require_json_char(line, offset, ':', line_number);
-    fields.push_back(JsonField{
-        .key = std::move(key),
-        .value = parse_json_value(line, offset, line_number),
-    });
-
-    skip_json_space(line, offset);
-    if (offset >= line.size()) {
-      throw std::runtime_error("unterminated JSON object at line " +
-                               std::to_string(line_number));
-    }
-    if (line[offset] == '}') {
-      ++offset;
-      skip_json_space(line, offset);
-      if (offset != line.size()) {
-        throw std::runtime_error("trailing data after JSON object at line " +
-                                 std::to_string(line_number));
-      }
-      return fields;
-    }
-    if (line[offset] != ',') {
-      throw std::runtime_error("expected JSON field separator at line " +
-                               std::to_string(line_number));
-    }
-    ++offset;
-  }
-}
-
-std::string escape_json_string(std::string_view text) {
-  std::string escaped;
-  for (const char ch : text) {
-    switch (ch) {
-    case '"':
-      escaped += "\\\"";
-      break;
-    case '\\':
-      escaped += "\\\\";
-      break;
-    case '\b':
-      escaped += "\\b";
-      break;
-    case '\f':
-      escaped += "\\f";
-      break;
-    case '\n':
-      escaped += "\\n";
-      break;
-    case '\r':
-      escaped += "\\r";
-      break;
-    case '\t':
-      escaped += "\\t";
-      break;
-    default:
-      if (static_cast<unsigned char>(ch) < 0x20) {
-        char code[7];
-        std::snprintf(code, sizeof(code), "\\u%04x",
-                      static_cast<unsigned char>(ch));
-        escaped += code;
-      } else {
-        escaped.push_back(ch);
-      }
-      break;
-    }
-  }
-  return escaped;
-}
-
-std::string serialize_ports(std::span<const unsigned> ports) {
-  std::string text = "[";
-  for (std::size_t i = 0; i < ports.size(); ++i) {
-    if (i > 0) {
-      text += ',';
-    }
-    text += std::to_string(ports[i]);
-  }
-  text += ']';
-  return text;
-}
-
 std::string serialize_config_db(const vds::ConfigDb &db) {
   std::string text;
   for (const auto &controller : db.controllers) {
-    text += "{\"address\":\"";
-    text += escape_json_string(controller.address);
-    text += "\",\"profile\":\"";
-    text +=
-        escape_json_string(vds::controller_profile_name(controller.profile));
-    text += "\",\"ports\":";
-    text += serialize_ports(controller.ports);
+    text += "{";
+    text += vds::jsonl_string_field("address", controller.address);
+    text += ",";
+    text += vds::jsonl_string_field(
+        "profile", vds::controller_profile_name(controller.profile));
+    text += ",";
+    text += vds::jsonl_unsigned_array_field("ports", controller.ports);
     text += "}\n";
   }
   return text;
-}
-
-void require_string_value(const JsonValue &value, std::string_view key,
-                          std::size_t line_number) {
-  if (value.is_array) {
-    throw std::runtime_error("field " + std::string(key) +
-                             " must be a string at line " +
-                             std::to_string(line_number));
-  }
-}
-
-void require_array_value(const JsonValue &value, std::string_view key,
-                         std::size_t line_number) {
-  if (!value.is_array) {
-    throw std::runtime_error("field " + std::string(key) +
-                             " must be an array at line " +
-                             std::to_string(line_number));
-  }
 }
 
 void validate_ports(std::vector<unsigned> &ports) {
@@ -391,52 +79,25 @@ void validate_ports(std::vector<unsigned> &ports) {
 
 vds::ControllerConfig parse_controller_line(const std::string &line,
                                             std::size_t line_number) {
-  vds::ControllerConfig config{
-      .address = {},
-      .profile = vds::ControllerProfile::Unspecified,
-      .ports = {},
+  const std::string context =
+      "config record at line " + std::to_string(line_number);
+  const std::vector<vds::JsonlField> fields =
+      vds::parse_jsonl_object(line, context);
+  static constexpr std::string_view expected[] = {
+      "address",
+      "profile",
+      "ports",
   };
-  bool have_address = false;
-  bool have_profile = false;
-  bool have_ports = false;
+  vds::reject_unknown_jsonl_fields(fields, expected, context);
 
-  for (const auto &field : parse_json_object(line, line_number)) {
-    if (field.key == "address") {
-      if (have_address) {
-        throw std::runtime_error("duplicate address field at line " +
-                                 std::to_string(line_number));
-      }
-      require_string_value(field.value, field.key, line_number);
-      config.address =
-          vds::normalize_bluetooth_address(field.value.string_value);
-      have_address = true;
-    } else if (field.key == "profile") {
-      if (have_profile) {
-        throw std::runtime_error("duplicate profile field at line " +
-                                 std::to_string(line_number));
-      }
-      require_string_value(field.value, field.key, line_number);
-      config.profile = vds::parse_controller_profile(field.value.string_value);
-      have_profile = true;
-    } else if (field.key == "ports") {
-      if (have_ports) {
-        throw std::runtime_error("duplicate ports field at line " +
-                                 std::to_string(line_number));
-      }
-      require_array_value(field.value, field.key, line_number);
-      config.ports = field.value.array_value;
-      validate_ports(config.ports);
-      have_ports = true;
-    } else {
-      throw std::runtime_error("unknown JSON config field at line " +
-                               std::to_string(line_number) + ": " + field.key);
-    }
-  }
-
-  if (!have_address || !have_profile || !have_ports) {
-    throw std::runtime_error("missing controller field at line " +
-                             std::to_string(line_number));
-  }
+  vds::ControllerConfig config{
+      .address = vds::normalize_bluetooth_address(
+          vds::require_jsonl_string(fields, "address", context)),
+      .profile = vds::parse_controller_profile(
+          vds::require_jsonl_string(fields, "profile", context)),
+      .ports = vds::require_jsonl_unsigned_array(fields, "ports", context),
+  };
+  validate_ports(config.ports);
   return config;
 }
 
@@ -718,7 +379,7 @@ void validate_config_assignments(const ConfigDb &db,
     return;
   }
   if (devices.empty()) {
-    throw std::runtime_error("no available virtual ports");
+    throw std::runtime_error("virtual port provider unavailable");
   }
 
   std::vector<unsigned> available_ports;

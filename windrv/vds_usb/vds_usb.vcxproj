@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
       <Configuration>Debug</Configuration>
@@ -15,7 +15,6 @@
     <Keyword>Win32Proj</Keyword>
     <RootNamespace>vds_usb</RootNamespace>
     <ProjectName>vds_usb</ProjectName>
-    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -38,32 +37,42 @@
     <IntDir>$(MSBuildProjectDirectory)\build\obj\$(Platform)\$(Configuration)\</IntDir>
     <TargetName>vds_usb</TargetName>
     <TargetExt>.sys</TargetExt>
+    <VdsWindowsKernelKitVersion Condition="'$(VdsWindowsKernelKitVersion)'==''">$(WindowsTargetPlatformVersion)</VdsWindowsKernelKitVersion>
+    <VdsWindowsKmdfIncludeDir Condition="'$(VdsWindowsKmdfIncludeDir)'==''"></VdsWindowsKmdfIncludeDir>
+    <VdsWindowsUdeIncludeDir Condition="'$(VdsWindowsUdeIncludeDir)'==''"></VdsWindowsUdeIncludeDir>
+    <VdsWindowsUdeLibDir Condition="'$(VdsWindowsUdeLibDir)'==''"></VdsWindowsUdeLibDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <OutDir>$(MSBuildProjectDirectory)\build\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(MSBuildProjectDirectory)\build\obj\$(Platform)\$(Configuration)\</IntDir>
     <TargetName>vds_usb</TargetName>
     <TargetExt>.sys</TargetExt>
+    <VdsWindowsKernelKitVersion Condition="'$(VdsWindowsKernelKitVersion)'==''">$(WindowsTargetPlatformVersion)</VdsWindowsKernelKitVersion>
+    <VdsWindowsKmdfIncludeDir Condition="'$(VdsWindowsKmdfIncludeDir)'==''"></VdsWindowsKmdfIncludeDir>
+    <VdsWindowsUdeIncludeDir Condition="'$(VdsWindowsUdeIncludeDir)'==''"></VdsWindowsUdeIncludeDir>
+    <VdsWindowsUdeLibDir Condition="'$(VdsWindowsUdeLibDir)'==''"></VdsWindowsUdeLibDir>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>..\..\include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km\ude\1.0;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km\ucx\1.1;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>..\..\include;$(WindowsSdkDir)Include\$(VdsWindowsKernelKitVersion)\km;$(WindowsSdkDir)Include\$(VdsWindowsKernelKitVersion)\shared;$(VdsWindowsKmdfIncludeDir);$(VdsWindowsUdeIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_AMD64_=1;AMD64=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
     </ClCompile>
     <Link>
-      <AdditionalLibraryDirectories>$(WindowsSdkDir)Lib\$(WindowsTargetPlatformVersion)\km\$(Platform)\ude\1.0;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(WindowsSdkDir)Lib\$(VdsWindowsKernelKitVersion)\km\$(Platform);$(VdsWindowsUdeLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>udecxstub.lib;usbd.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>..\..\include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km\ude\1.0;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km\ucx\1.1;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>..\..\include;$(WindowsSdkDir)Include\$(VdsWindowsKernelKitVersion)\km;$(WindowsSdkDir)Include\$(VdsWindowsKernelKitVersion)\shared;$(VdsWindowsKmdfIncludeDir);$(VdsWindowsUdeIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_AMD64_=1;AMD64=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
     </ClCompile>
     <Link>
-      <AdditionalLibraryDirectories>$(WindowsSdkDir)Lib\$(WindowsTargetPlatformVersion)\km\$(Platform)\ude\1.0;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(WindowsSdkDir)Lib\$(VdsWindowsKernelKitVersion)\km\$(Platform);$(VdsWindowsUdeLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>udecxstub.lib;usbd.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
@@ -71,4 +80,8 @@
     <ClCompile Include="vds_usb.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="PrintVdsKmdfVersion">
+    <Message Importance="High" Text="VDS_KMDF_VERSION=$(KMDF_VERSION_MAJOR).$(KMDF_VERSION_MINOR)" Condition="'$(KMDF_VERSION_MAJOR)'!='' and '$(KMDF_VERSION_MINOR)'!=''" />
+    <Message Importance="High" Text="VDS_KMDF_DEFINITIONS=%(ClCompile.PreprocessorDefinitions)" />
+  </Target>
 </Project>

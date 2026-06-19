@@ -20,7 +20,6 @@
 #include <utility>
 #include <vector>
 
-#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -29,7 +28,6 @@
 #include <bluetoothapis.h>
 #include <hidsdi.h>
 #include <setupapi.h>
-#endif
 
 #include "uapi/vds.h"
 #include "unique_handle.hh"
@@ -38,6 +36,7 @@
 #include "vds_common.hh"
 #include "vds_io.hh"
 #include "vds_profile.hh"
+#include "vds_protocol.hh"
 #include "vds_win32.hh"
 
 namespace vds::win {
@@ -59,7 +58,6 @@ constexpr std::size_t kMaxPendingHidOutputWrites = 64;
 constexpr std::size_t kMaxQueuedHidAudioOutputWrites = 4;
 constexpr DWORD kHidInputReadStallTimeoutMs = 2000;
 
-#ifdef _WIN32
 class UniqueDeviceInfoSet {
 public:
   UniqueDeviceInfoSet() = default;
@@ -147,12 +145,32 @@ query_bluetooth_device_info(std::string_view address) {
   return info;
 }
 
-bool is_bluetooth_device_connected(std::string_view address) {
-  const auto info = query_bluetooth_device_info(address);
-  return info && info->fConnected != FALSE;
+std::string utf8_from_wide(const WCHAR *text) {
+  if (text == nullptr || text[0] == L'\0') {
+    return {};
+  }
+
+  const int required =
+      WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+  if (required <= 1) {
+    return {};
+  }
+
+  std::string converted(static_cast<std::size_t>(required - 1), '\0');
+  const int written = WideCharToMultiByte(
+      CP_UTF8, 0, text, -1, converted.data(), required, nullptr, nullptr);
+  if (written <= 1) {
+    return {};
+  }
+  return converted;
 }
 
-#endif
+std::string default_bluetooth_device_name(std::uint32_t profile) {
+  if (profile == VDS_PROFILE_DSE) {
+    return "DualSense Edge Wireless Controller";
+  }
+  return "DualSense Wireless Controller";
+}
 
 std::size_t bluetooth_feature_report_length(std::uint8_t report_id) {
   switch (report_id) {
@@ -210,7 +228,6 @@ bool is_bluetooth_address(std::string_view address) {
          is_colon_bluetooth_address(address);
 }
 
-#ifdef _WIN32
 std::string colon_bluetooth_address(std::string_view compact_address) {
   std::string address;
   address.reserve(17);
@@ -339,6 +356,7 @@ public:
       : path_(std::move(path)), match_label_(std::move(match_label)),
         handle_(open_hid_device(path_, true)),
         output_handle_(open_hid_device(path_, true)),
+        feature_handle_(open_hid_device(path_, false)),
         queue_event_(CreateEventA(nullptr, TRUE, FALSE, nullptr)),
         stop_event_(CreateEventA(nullptr, TRUE, FALSE, nullptr)) {
     if (!queue_event_ || !stop_event_) {
@@ -361,6 +379,10 @@ public:
   std::optional<std::vector<std::uint8_t>>
   read_feature_report(std::uint8_t report_id) override {
     return get_feature_report(report_id);
+  }
+
+  void write_feature_report(std::span<const std::uint8_t> report) override {
+    set_feature_report(report);
   }
 
   void write_interrupt_packet(std::span<const std::uint8_t> packet) override {
@@ -606,13 +628,34 @@ private:
   std::vector<std::uint8_t> get_feature_report(std::uint8_t report_id) {
     std::vector<std::uint8_t> buffer(feature_report_length_);
     buffer[0] = report_id;
-    if (!HidD_GetFeature(handle_.get(), buffer.data(),
+    if (!HidD_GetFeature(feature_handle_.get(), buffer.data(),
                          static_cast<ULONG>(buffer.size()))) {
       throw std::runtime_error(
           "HidD_GetFeature report=" + std::to_string(report_id) +
           " failed: " + win32_error_message(GetLastError()));
     }
     return buffer;
+  }
+
+  void set_feature_report(std::span<const std::uint8_t> report) {
+    if (report.empty()) {
+      throw std::runtime_error("empty HID feature report");
+    }
+    if (report.size() > feature_report_length_) {
+      throw std::runtime_error(
+          "HID feature report too large: " + std::to_string(report.size()) +
+          " > " + std::to_string(feature_report_length_));
+    }
+
+    std::vector<std::uint8_t> buffer(feature_report_length_);
+    std::copy(report.begin(), report.end(), buffer.begin());
+    fill_feature_report_checksum(buffer);
+    if (!HidD_SetFeature(feature_handle_.get(), buffer.data(),
+                         static_cast<ULONG>(buffer.size()))) {
+      throw std::runtime_error(
+          "HidD_SetFeature report=" + std::to_string(buffer[0]) +
+          " failed: " + win32_error_message(GetLastError()));
+    }
   }
 
   QueuedOutputWrite make_output_write(std::span<const std::uint8_t> report) {
@@ -768,6 +811,7 @@ private:
   std::string match_label_;
   UniqueHandle handle_;
   UniqueHandle output_handle_;
+  UniqueHandle feature_handle_;
   UniqueHandle queue_event_;
   UniqueHandle stop_event_;
   USHORT input_report_length_ = 0;
@@ -912,13 +956,28 @@ std::string find_hid_bluetooth_device_path(const std::string &address) {
   }
   return *first_match;
 }
-#endif
+
+UniqueHandle open_filter_control_handle() {
+  UniqueHandle handle(CreateFileA(kVdsFilterControlPath, GENERIC_READ,
+                                  kDeviceShareMode, nullptr, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (handle) {
+    return handle;
+  }
+
+  const DWORD error = GetLastError();
+  if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+    return UniqueHandle();
+  }
+  throw std::runtime_error("failed to open " +
+                           std::string(kVdsFilterControlPath) + ": " +
+                           win32_error_message(error));
+}
 
 } // namespace
 
 std::unique_ptr<BluetoothTransport>
 make_filter_bluetooth_transport(const std::string &address) {
-#ifdef _WIN32
   auto device = find_filter_bluetooth_device(address);
   if (!device) {
     throw std::runtime_error("no matching Windows Bluetooth transport");
@@ -929,26 +988,17 @@ make_filter_bluetooth_transport(const std::string &address) {
         find_hid_bluetooth_device_path(device->address), device->address);
   }
   throw std::runtime_error("Windows Bluetooth transport has no usable backend");
-#else
-  (void)address;
-  throw std::runtime_error("vds_filter transport is only available on Windows");
-#endif
+}
+
+bool filter_provider_available() {
+  return static_cast<bool>(open_filter_control_handle());
 }
 
 std::vector<HidBluetoothDevice> list_filter_bluetooth_devices() {
-#ifdef _WIN32
   std::vector<HidBluetoothDevice> devices;
-  UniqueHandle handle(CreateFileA(kVdsFilterControlPath, GENERIC_READ,
-                                  kDeviceShareMode, nullptr, OPEN_EXISTING,
-                                  FILE_ATTRIBUTE_NORMAL, nullptr));
+  UniqueHandle handle = open_filter_control_handle();
   if (!handle) {
-    const DWORD error = GetLastError();
-    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
-      return devices;
-    }
-    throw std::runtime_error("failed to open " +
-                             std::string(kVdsFilterControlPath) + ": " +
-                             win32_error_message(error));
+    return devices;
   }
 
   vds_filter_device_list list{};
@@ -970,13 +1020,19 @@ std::vector<HidBluetoothDevice> list_filter_bluetooth_devices() {
   devices.reserve(count);
   for (std::uint32_t index = 0; index < count; ++index) {
     const std::string address = address_from_filter_info(list.devices[index]);
+    const auto info = query_bluetooth_device_info(address);
+    std::string name = info ? utf8_from_wide(info->szName) : std::string{};
+    if (name.empty()) {
+      name = default_bluetooth_device_name(list.devices[index].profile);
+    }
     devices.push_back(HidBluetoothDevice{
         .path = address,
         .address = address,
+        .name = std::move(name),
         .profile = list.devices[index].profile,
         .profile_valid = true,
         .filter_backed = true,
-        .bluetooth_connected = is_bluetooth_device_connected(address),
+        .bluetooth_connected = info && info->fConnected != FALSE,
         .report_target =
             (list.devices[index].flags & VDS_FILTER_DEVICE_REPORT_TARGET) != 0,
         .access_restricted = (list.devices[index].flags &
@@ -984,14 +1040,10 @@ std::vector<HidBluetoothDevice> list_filter_bluetooth_devices() {
     });
   }
   return devices;
-#else
-  return {};
-#endif
 }
 
 std::optional<HidBluetoothDevice>
 find_filter_bluetooth_device(const std::string &address) {
-#ifdef _WIN32
   if (!is_bluetooth_address(address)) {
     return std::nullopt;
   }
@@ -1017,14 +1069,9 @@ find_filter_bluetooth_device(const std::string &address) {
   }
 
   return std::nullopt;
-#else
-  (void)address;
-  return std::nullopt;
-#endif
 }
 
 std::string describe_bluetooth_lookup(const std::string &address) {
-#ifdef _WIN32
   const bool valid_address = is_bluetooth_address(address);
   const std::string address_filter =
       valid_address ? compact_bluetooth_address(address) : std::string{};
@@ -1066,10 +1113,6 @@ std::string describe_bluetooth_lookup(const std::string &address) {
   }
   append_registry_lookup_diagnostics(text, address_filter);
   return text;
-#else
-  (void)address;
-  return {};
-#endif
 }
 
 } // namespace vds::win

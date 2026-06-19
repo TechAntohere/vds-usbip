@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -57,6 +58,12 @@ using vds::hex_bytes;
 using vds::hex_u8;
 
 constexpr const char *kDefaultControlPipe = R"(\\.\pipe\vdsd)";
+constexpr const char *kVirtualPortProviderUnavailableReason =
+    "virtual port provider unavailable";
+constexpr const char *kWindowsVirtualPortProviderUnavailable =
+    R"(vds_usb driver is not loaded or no \\.\vds# ports are available)";
+constexpr const char *kWindowsFilterProviderUnavailable =
+    R"(vds_filter driver is not loaded or \\.\vds_filter is unavailable)";
 constexpr DWORD kDeviceShareMode =
     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 constexpr std::size_t kMaxPendingAudioChunks = 64;
@@ -85,6 +92,18 @@ constexpr auto kAudioSendGapWarn = std::chrono::milliseconds(15);
 constexpr auto kAudioSummaryInterval = std::chrono::seconds(1);
 constexpr UINT kWindowsTimerResolutionMs = 1;
 constexpr const char *kServiceName = "vdsd";
+constexpr std::uint8_t kTestCommandReportId = 0x80;
+constexpr std::uint8_t kTestCommandResultReportId = 0x81;
+constexpr std::uint8_t kTestCommandCompleteStatus = 0x02;
+constexpr std::uint8_t kTestCommandAudioDevice = 0x06;
+constexpr std::uint8_t kTestCommandWaveoutPrepare = 0x04;
+constexpr std::uint8_t kTestCommandWaveoutControl = 0x02;
+constexpr std::uint8_t kTestCommandSpeakerParam = 0x08;
+constexpr std::uint32_t kSpeakerWaveoutFrequencyHz = 1000;
+constexpr std::uint32_t kSpeakerWaveoutPeriodFrames =
+    VDS_AUDIO_SAMPLE_RATE / kSpeakerWaveoutFrequencyHz;
+constexpr double kSpeakerWaveoutTwoPi = 6.28318530717958647692;
+constexpr std::int16_t kSpeakerWaveoutAmplitude = 12000;
 std::atomic_bool g_stop_requested = false;
 HANDLE g_stop_event = nullptr;
 SERVICE_STATUS_HANDLE g_service_status_handle = nullptr;
@@ -95,7 +114,6 @@ using vds::active_trace_name;
 using vds::kTraceAll;
 using vds::kTraceInput;
 using vds::kTraceOutput;
-using vds::parse_trace_scope;
 using vds::trace_enabled;
 using vds::trace_scope_name;
 using vds::trim_command;
@@ -105,6 +123,7 @@ using vds::bt_input_to_usb_input;
 using vds::hidp_output_packet;
 using vds::win::BluetoothTransport;
 using vds::win::describe_bluetooth_lookup;
+using vds::win::filter_provider_available;
 using vds::win::find_filter_bluetooth_device;
 using vds::win::Frame;
 using vds::win::HidBluetoothDevice;
@@ -290,10 +309,13 @@ struct BridgeState {
   std::mutex mutex;
   vds::DsOutputState output_state;
   vds::PcmAudioExtractor extractor{kWindowsSpeakerInputFrames};
+  vds::PcmAudioExtractor waveout_extractor{kWindowsSpeakerInputFrames};
   vds::HapticsPacketBuilder haptics_builder;
   vds::AudioChunk silent_audio_chunk = make_silent_audio_chunk();
   std::deque<vds::AudioChunk> pending_audio_chunks;
   std::optional<vds::AudioChunk> last_audio_chunk;
+  std::array<std::vector<std::uint8_t>, 256> feature_cache;
+  std::array<bool, 256> feature_cached{};
   Clock::time_point next_haptics_send_time{};
   Clock::time_point last_audio_send_time{};
   Clock::time_point last_audio_usb_frame_time{};
@@ -344,6 +366,9 @@ struct BridgeState {
   bool audio_haptics_sent_seen = false;
   bool audio_out_stream_active = false;
   bool audio_pcm_stream_active = false;
+  bool speaker_waveout_selected = true;
+  bool speaker_waveout_active = false;
+  std::uint32_t speaker_waveout_phase = 0;
   bool audio_queue_empty_reported = false;
   bool audio_underflow_reported = false;
 };
@@ -457,6 +482,24 @@ find_connected_bluetooth_device(const std::string &address,
   return std::nullopt;
 }
 
+std::vector<vds::ControllerTarget> list_windows_controller_targets() {
+  std::vector<vds::ControllerTarget> targets;
+  for (const auto &device : list_filter_bluetooth_devices()) {
+    if (!device.report_target || !device.profile_valid) {
+      continue;
+    }
+    targets.push_back(vds::ControllerTarget{
+        .address = vds::normalize_bluetooth_address(device.address),
+        .name = device.name,
+        .profile = device.profile == VDS_PROFILE_DSE
+                       ? vds::ControllerProfile::Dse
+                       : vds::ControllerProfile::Ds5,
+        .online = device.bluetooth_connected,
+    });
+  }
+  return targets;
+}
+
 std::optional<vds_port_info> query_virtual_port_info(unsigned port) {
   const std::string path = vds::port_path_for_index(port);
   UniqueHandle handle(CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE,
@@ -487,6 +530,21 @@ bool virtual_port_is_enabled(unsigned port) {
   return (info->flags & VDS_PORT_INFO_ENABLED) != 0;
 }
 
+std::vector<unsigned> enabled_virtual_ports() {
+  std::vector<unsigned> ports;
+  ports.reserve(vds::kMaxPortCount);
+  for (unsigned port = 0; port < vds::kMaxPortCount; ++port) {
+    if (virtual_port_is_enabled(port)) {
+      ports.push_back(port);
+    }
+  }
+  return ports;
+}
+
+bool virtual_port_provider_available() {
+  return !enabled_virtual_ports().empty();
+}
+
 bool virtual_port_is_available(unsigned port) {
   const auto info = query_virtual_port_info(port);
   if (!info) {
@@ -507,14 +565,9 @@ std::vector<unsigned> available_virtual_ports() {
   return ports;
 }
 
-bool controller_has_enabled_virtual_port(const vds::ControllerConfig &config) {
-  std::vector<unsigned> enabled_ports;
-  enabled_ports.reserve(vds::kMaxPortCount);
-  for (unsigned port = 0; port < vds::kMaxPortCount; ++port) {
-    if (virtual_port_is_enabled(port)) {
-      enabled_ports.push_back(port);
-    }
-  }
+bool controller_has_enabled_virtual_port(
+    const vds::ControllerConfig &config,
+    std::span<const unsigned> enabled_ports) {
   return vds::controller_config_has_candidate_port(config, enabled_ports);
 }
 
@@ -607,7 +660,7 @@ std::uint32_t resolve_virtual_port_profile(const vds::ControllerConfig &config,
       find_connected_bluetooth_device(config.address, &discovery_error);
   if (!device) {
     if (discovery_error.empty()) {
-      discovery_error = "no matching Bluetooth filter device";
+      discovery_error = "no matching filter device";
     }
     throw std::runtime_error("failed to detect Bluetooth controller profile: " +
                              discovery_error);
@@ -698,6 +751,26 @@ std::string input_report_summary(const vds::UsbInputReport &report) {
          " b1=" + hex_u8(report[9]) + " b2=" + hex_u8(report[10]);
 }
 
+void cache_feature_report(BridgeState &state,
+                          std::span<const std::uint8_t> report) {
+  if (report.empty()) {
+    return;
+  }
+
+  std::lock_guard guard(state.mutex);
+  state.feature_cache[report[0]].assign(report.begin(), report.end());
+  state.feature_cached[report[0]] = true;
+}
+
+std::optional<std::vector<std::uint8_t>>
+cached_feature_report(BridgeState &state, std::uint8_t report_id) {
+  std::lock_guard guard(state.mutex);
+  if (!state.feature_cached[report_id]) {
+    return std::nullopt;
+  }
+  return state.feature_cache[report_id];
+}
+
 bool try_send_bt_output_report(BluetoothTransport &bluetooth,
                                std::span<const std::uint8_t> report,
                                vds::Logger &logger, std::mutex &bluetooth_mutex,
@@ -751,9 +824,9 @@ void send_bt_state_if_changed(BluetoothTransport &bluetooth, BridgeState &state,
   }
 }
 
-void handle_virtual_frame(BluetoothTransport &bluetooth, BridgeState &state,
-                          const Frame &frame, vds::Logger &logger,
-                          std::mutex &bluetooth_mutex) {
+void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
+                          BridgeState &state, const Frame &frame,
+                          vds::Logger &logger, std::mutex &bluetooth_mutex) {
   if (frame.header.type == VDS_FRAME_USB_INTERFACE) {
     if (frame.payload.size() != sizeof(vds_usb_interface_event)) {
       logger.log("usb", vds::LogLevel::Warn,
@@ -843,10 +916,40 @@ void handle_virtual_frame(BluetoothTransport &bluetooth, BridgeState &state,
   }
 
   if (frame.header.type == VDS_FRAME_USB_FEATURE_GET) {
-    if (!frame.payload.empty()) {
+    if (frame.payload.empty()) {
+      return;
+    }
+    const std::uint8_t report_id = frame.payload[0];
+    if (const auto cached = cached_feature_report(state, report_id)) {
+      vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_FEATURE_REPLY,
+                                   *cached, "virtual",
+                                   handle_io_cancellation());
       logger.log("usb", vds::LogLevel::Info,
-                 "feature get report_id=" + std::to_string(frame.payload[0]) +
-                     " bluetooth_forward=no");
+                 "feature get report_id=" + std::to_string(report_id) +
+                     " cache=hit bluetooth_forward=no");
+      return;
+    }
+
+    try {
+      std::optional<std::vector<std::uint8_t>> report;
+      {
+        std::lock_guard guard(bluetooth_mutex);
+        report = bluetooth.read_feature_report(report_id);
+      }
+      if (report) {
+        cache_feature_report(state, *report);
+        vds::win::write_handle_frame(virtual_device,
+                                     VDS_FRAME_USB_FEATURE_REPLY, *report,
+                                     "virtual", handle_io_cancellation());
+      }
+      logger.log(
+          "usb", vds::LogLevel::Info,
+          "feature get report_id=" + std::to_string(report_id) +
+              " cache=miss bluetooth_forward=" + (report ? "yes" : "no"));
+    } catch (const std::exception &error) {
+      logger.log("usb", vds::LogLevel::Warn,
+                 "feature get report_id=" + std::to_string(report_id) +
+                     " failed: " + error.what());
     }
     return;
   }
@@ -857,14 +960,107 @@ void handle_virtual_frame(BluetoothTransport &bluetooth, BridgeState &state,
     if (!frame.payload.empty()) {
       message += " report_id=" + std::to_string(frame.payload[0]);
     }
-    message += " bluetooth_forward=no";
     logger.log("usb", vds::LogLevel::Info, message);
     if (frame.payload.empty() || frame.payload[0] == 0) {
       logger.log("usb", vds::LogLevel::Warn,
                  "ignoring malformed feature set report");
       return;
     }
+    const std::uint8_t report_id = frame.payload[0];
+    bool synthetic_test_command = false;
 
+    if (frame.payload.size() >= 3 && report_id == kTestCommandReportId) {
+      std::size_t command_offset = 1;
+      if (frame.payload.size() > command_offset &&
+          frame.payload[command_offset] == kTestCommandReportId) {
+        ++command_offset;
+      }
+      if (frame.payload.size() > command_offset + 1) {
+        const std::uint8_t command_device = frame.payload[command_offset];
+        const std::uint8_t command_action = frame.payload[command_offset + 1];
+        const std::size_t command_data_offset = command_offset + 2;
+        synthetic_test_command = true;
+
+        std::array<std::uint8_t, VDS_USB_INPUT_REPORT_SIZE> test_result{};
+        test_result[0] = kTestCommandResultReportId;
+        test_result[1] = command_device;
+        test_result[2] = command_action;
+        test_result[3] = kTestCommandCompleteStatus;
+        cache_feature_report(state, test_result);
+        logger.log(
+            "usb", vds::LogLevel::Info,
+            "WebHID test command device=" + std::to_string(command_device) +
+                " action=" + std::to_string(command_action));
+
+        bool update_bt_state = false;
+        std::string waveout_message;
+        {
+          std::lock_guard guard(state.mutex);
+          if (command_device == kTestCommandAudioDevice &&
+              command_action == kTestCommandWaveoutPrepare) {
+            state.speaker_waveout_selected =
+                frame.payload.size() > command_data_offset + 2 &&
+                frame.payload[command_data_offset + 2] ==
+                    kTestCommandSpeakerParam;
+            waveout_message =
+                std::string("WebHID waveout target=") +
+                (state.speaker_waveout_selected ? "speaker" : "headphone");
+          } else if (command_device == kTestCommandAudioDevice &&
+                     command_action == kTestCommandWaveoutControl &&
+                     frame.payload.size() > command_data_offset) {
+            const bool enable = frame.payload[command_data_offset] != 0;
+            const bool speaker_waveout =
+                enable && state.speaker_waveout_selected;
+            state.speaker_waveout_active = speaker_waveout;
+            state.speaker_waveout_phase = 0;
+            state.waveout_extractor =
+                vds::PcmAudioExtractor{kWindowsSpeakerInputFrames};
+            state.output_state.set_audio_out_stream_active(speaker_waveout);
+            state.audio_out_stream_active = speaker_waveout;
+            state.audio_pcm_stream_active = speaker_waveout;
+            state.audio_jitter_buffering = speaker_waveout;
+            state.audio_queue_empty_since = {};
+            state.audio_queue_drained_time = {};
+            state.have_last_audio_send_time = false;
+            state.last_audio_chunk.reset();
+            if (!speaker_waveout) {
+              state.pending_audio_chunks.clear();
+            }
+            update_bt_state = true;
+            waveout_message =
+                std::string("WebHID waveout ") + (enable ? "on" : "off") +
+                " target=" +
+                (state.speaker_waveout_selected ? "speaker" : "headphone") +
+                " synthesized=" + (speaker_waveout ? "yes" : "no");
+          }
+        }
+        if (!waveout_message.empty()) {
+          logger.log("audio", vds::LogLevel::Info, waveout_message);
+        }
+        if (update_bt_state) {
+          send_bt_state_if_changed(bluetooth, state, logger, bluetooth_mutex);
+        }
+      }
+    }
+
+    if (synthetic_test_command) {
+      logger.log("usb", vds::LogLevel::Info,
+                 "feature set report_id=" + std::to_string(report_id) +
+                     " bluetooth_forward=no reason=synthetic_webhid_test");
+      return;
+    }
+
+    try {
+      std::lock_guard guard(bluetooth_mutex);
+      bluetooth.write_feature_report(frame.payload);
+      logger.log("usb", vds::LogLevel::Info,
+                 "feature set report_id=" + std::to_string(report_id) +
+                     " bluetooth_forward=yes");
+    } catch (const std::exception &error) {
+      logger.log("usb", vds::LogLevel::Warn,
+                 "feature set report_id=" + std::to_string(report_id) +
+                     " failed: " + error.what());
+    }
     return;
   }
 
@@ -1199,6 +1395,42 @@ void send_initial_bluetooth_reports(BluetoothTransport &bluetooth,
     std::lock_guard guard(state.mutex);
     state.last_sent_state = state.output_state.state();
     state.have_last_sent_state = true;
+  }
+}
+
+void enqueue_speaker_waveout_chunk(BridgeState &state) {
+  std::lock_guard guard(state.mutex);
+  if (!state.speaker_waveout_active || !state.pending_audio_chunks.empty()) {
+    return;
+  }
+
+  std::array<std::uint8_t, kWindowsSpeakerInputFrames * VDS_AUDIO_CHANNELS *
+                               sizeof(std::int16_t)>
+      pcm{};
+  for (std::size_t frame = 0; frame < kWindowsSpeakerInputFrames; ++frame) {
+    const double angle = kSpeakerWaveoutTwoPi *
+                         static_cast<double>(state.speaker_waveout_phase) /
+                         static_cast<double>(kSpeakerWaveoutPeriodFrames);
+    const auto sample = static_cast<std::int16_t>(
+        std::sin(angle) * static_cast<double>(kSpeakerWaveoutAmplitude));
+    state.speaker_waveout_phase =
+        (state.speaker_waveout_phase + 1) % kSpeakerWaveoutPeriodFrames;
+
+    for (std::size_t channel = 0; channel < vds::kSpeakerChannels; ++channel) {
+      const std::size_t offset =
+          (frame * VDS_AUDIO_CHANNELS + channel) * sizeof(std::int16_t);
+      const auto value = static_cast<std::uint16_t>(sample);
+      pcm[offset + 0] = static_cast<std::uint8_t>(value & 0xff);
+      pcm[offset + 1] = static_cast<std::uint8_t>((value >> 8) & 0xff);
+    }
+  }
+
+  const auto chunks = state.waveout_extractor.push_usb_audio(pcm);
+  for (const auto &chunk : chunks) {
+    if (state.pending_audio_chunks.size() >= kMaxPendingAudioChunks) {
+      break;
+    }
+    state.pending_audio_chunks.push_back(chunk);
   }
 }
 
@@ -1655,6 +1887,7 @@ void audio_flush_loop(BluetoothTransport &bluetooth, BridgeState &state,
       }
       state.audio_last_flush_time = now;
     }
+    enqueue_speaker_waveout_chunk(state);
     const auto sleep_duration =
         flush_pending_audio_chunk(bluetooth, state, logger, bluetooth_mutex);
     maybe_log_audio_summary(bluetooth, state, logger);
@@ -1668,7 +1901,7 @@ void virtual_to_bluetooth_loop(HANDLE virtual_device,
                                std::mutex &bluetooth_mutex,
                                std::atomic_bool &bridge_restart_requested) {
   while (!g_stop_requested.load() && !bridge_restart_requested.load()) {
-    handle_virtual_frame(bluetooth, state,
+    handle_virtual_frame(virtual_device, bluetooth, state,
                          vds::win::read_handle_frame(virtual_device, "virtual",
                                                      handle_io_cancellation()),
                          logger, bluetooth_mutex);
@@ -1890,7 +2123,7 @@ public:
 
     std::string reply;
     if (got == 0) {
-      reply = "ERR empty command\n";
+      reply = "{\"OK\":false,\"error\":\"empty command\"}\n";
     } else {
       reply = handler(trim_command(
           std::string(buffer.data(), static_cast<std::size_t>(got))));
@@ -1921,7 +2154,8 @@ bool worker_is_connected(const BridgeWorker &worker) {
 std::string handle_supervisor_control_command(
     const std::string &command,
     const std::vector<std::unique_ptr<BridgeWorker>> &workers,
-    std::uint32_t &trace_flags, bool &reload_requested, vds::Logger &logger) {
+    const std::string &db_path, std::uint32_t &trace_flags,
+    bool &reload_requested, vds::Logger &logger) {
   std::vector<vds::VdsdControlControllerStatus> controller_statuses;
   controller_statuses.reserve(workers.size());
   for (const auto &worker : workers) {
@@ -1959,9 +2193,10 @@ std::string handle_supervisor_control_command(
   const std::vector<vds::VdsdControlPortStatus> port_statuses =
       vds::build_vdsd_control_port_statuses(port_candidates, port_bindings);
 
-  return vds::handle_vdsd_control_command(command, controller_statuses,
-                                          port_statuses, trace_flags,
-                                          reload_requested, logger);
+  return vds::handle_vdsd_control_command(
+      command, db_path, controller_statuses, port_statuses,
+      [] { return list_windows_controller_targets(); }, trace_flags,
+      reload_requested, logger);
 }
 
 void run_configured_bridge_worker(vds::ControllerConfig config,
@@ -2001,11 +2236,13 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
   std::vector<vds::VdsdWorkerFailureBackoff> worker_failure_backoffs;
   std::vector<std::string> discovery_warned_states;
   std::vector<std::string> no_port_warned_addresses;
-  std::vector<std::string> disabled_port_warned_addresses;
+  std::vector<std::string> port_binding_warned_states;
   ControlPipeServer control_pipe(options.pipe, logger);
   std::atomic_uint32_t trace_flags = 0;
   bool reload_requested = false;
   bool config_load_logged = false;
+  bool filter_provider_warned = false;
+  bool virtual_port_provider_warned = false;
   logger.log("daemon", vds::LogLevel::Info,
              "Windows bridge supervisor started pipe=" + options.pipe);
 
@@ -2029,7 +2266,8 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
     (void)control_pipe.service_once([&](const std::string &command) {
       std::uint32_t current_trace_flags = trace_flags.load();
       const std::string reply = handle_supervisor_control_command(
-          command, workers, current_trace_flags, reload_requested, logger);
+          command, workers, options.db_path, current_trace_flags,
+          reload_requested, logger);
       trace_flags.store(current_trace_flags);
       return reply;
     });
@@ -2042,6 +2280,35 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
                        std::to_string(db.controllers.size()));
         config_load_logged = true;
       }
+      const std::vector<unsigned> enabled_ports = enabled_virtual_ports();
+      const bool virtual_port_provider_is_available = !enabled_ports.empty();
+      if (!virtual_port_provider_is_available) {
+        if (!virtual_port_provider_warned) {
+          logger.log("port", vds::LogLevel::Error,
+                     std::string(kVirtualPortProviderUnavailableReason) +
+                         " detail=" + kWindowsVirtualPortProviderUnavailable);
+          virtual_port_provider_warned = true;
+        }
+      } else if (virtual_port_provider_warned) {
+        logger.log("port", vds::LogLevel::Info,
+                   "virtual port provider recovered");
+        virtual_port_provider_warned = false;
+      }
+
+      const bool filter_provider_is_available = filter_provider_available();
+      if (!filter_provider_is_available) {
+        if (!filter_provider_warned) {
+          logger.log("bluetooth", vds::LogLevel::Error,
+                     "filter provider unavailable detail=" +
+                         std::string(kWindowsFilterProviderUnavailable));
+          filter_provider_warned = true;
+        }
+      } else if (filter_provider_warned) {
+        logger.log("bluetooth", vds::LogLevel::Info,
+                   "filter provider recovered");
+        filter_provider_warned = false;
+      }
+
       for (const auto &worker : workers) {
         const bool stale = vds::vdsd_worker_config_is_stale(
             db, worker->address, worker->profile, worker->port,
@@ -2076,19 +2343,43 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
         if (existing != workers.end()) {
           continue;
         }
-        if (!controller_has_enabled_virtual_port(config)) {
-          if (vds::remember_vdsd_warning(disabled_port_warned_addresses,
-                                         config.address)) {
+        if (!virtual_port_provider_is_available) {
+          if (vds::remember_vdsd_warning_state(
+                  port_binding_warned_states, config.address,
+                  kVirtualPortProviderUnavailableReason)) {
             logger.log(
                 "daemon", vds::LogLevel::Warn,
                 "controller binding unavailable address=" + config.address +
-                    " reason=no allowed virtual port enabled ports=[" +
-                    vds::format_ports(config.ports) + "]");
+                    " reason=" + kVirtualPortProviderUnavailableReason);
           }
           continue;
         }
-        vds::forget_vdsd_warning(disabled_port_warned_addresses,
-                                 config.address);
+        const std::string port_binding_error =
+            "no allowed virtual port enabled ports=[" +
+            vds::format_ports(config.ports) + "]";
+        if (!controller_has_enabled_virtual_port(config, enabled_ports)) {
+          if (vds::remember_vdsd_warning_state(port_binding_warned_states,
+                                               config.address,
+                                               port_binding_error)) {
+            logger.log("daemon", vds::LogLevel::Warn,
+                       "controller binding unavailable address=" +
+                           config.address + " reason=" + port_binding_error);
+          }
+          continue;
+        }
+        vds::forget_vdsd_warning_state(port_binding_warned_states,
+                                       config.address);
+        if (!filter_provider_is_available) {
+          if (vds::remember_vdsd_warning_state(discovery_warned_states,
+                                               config.address,
+                                               "filter provider unavailable")) {
+            logger.log(
+                "daemon", vds::LogLevel::Warn,
+                "controller filter unavailable address=" + config.address +
+                    " reason=filter provider unavailable");
+          }
+          continue;
+        }
         std::string discovery_error;
         const auto connected_device =
             find_connected_bluetooth_device(config.address, &discovery_error);
@@ -2096,7 +2387,7 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
           if (vds::remember_vdsd_warning_state(
                   discovery_warned_states, config.address, discovery_error)) {
             logger.log("daemon", vds::LogLevel::Warn,
-                       "controller Bluetooth filter unavailable address=" +
+                       "controller filter unavailable address=" +
                            config.address + " reason=" + discovery_error);
           }
           continue;
@@ -2105,7 +2396,19 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
         const vds::VdsdWorkerLaunchDecision launch =
             vds::select_vdsd_worker_launch_decision(
                 config, available_virtual_ports(), reserved_ports,
-                config.address, reserved_device_addresses);
+                config.address, virtual_port_provider_is_available,
+                reserved_device_addresses);
+        if (launch.status ==
+            vds::VdsdWorkerLaunchStatus::VirtualPortProviderUnavailable) {
+          if (vds::remember_vdsd_warning_state(
+                  port_binding_warned_states, config.address,
+                  kVirtualPortProviderUnavailableReason)) {
+            logger.log("daemon", vds::LogLevel::Warn,
+                       "rejected filter device address=" + config.address +
+                           " reason=" + kVirtualPortProviderUnavailableReason);
+          }
+          continue;
+        }
         if (launch.status ==
             vds::VdsdWorkerLaunchStatus::DeviceAddressReserved) {
           continue;
@@ -2113,10 +2416,9 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
         if (launch.status == vds::VdsdWorkerLaunchStatus::NoAvailablePort) {
           if (vds::remember_vdsd_warning(no_port_warned_addresses,
                                          config.address)) {
-            logger.log(
-                "daemon", vds::LogLevel::Warn,
-                "rejected Bluetooth filter device address=" + config.address +
-                    " reason=no available virtual port");
+            logger.log("daemon", vds::LogLevel::Warn,
+                       "rejected filter device address=" + config.address +
+                           " reason=no available virtual port");
           }
           continue;
         }
@@ -2198,6 +2500,12 @@ int run_windows_daemon(int argc, char **argv, bool service_mode) {
                                          : vds::LogLevel::Warn,
                std::string("Windows timer resolution 1 ms ") +
                    (timer_resolution.active() ? "enabled" : "request failed"));
+    if (!virtual_port_provider_available()) {
+      logger.log("port", vds::LogLevel::Error,
+                 std::string(kVirtualPortProviderUnavailableReason) +
+                     " detail=" + kWindowsVirtualPortProviderUnavailable);
+      throw std::runtime_error(kWindowsVirtualPortProviderUnavailable);
+    }
     if (service_mode) {
       update_service_status(SERVICE_RUNNING);
       logger.log("daemon", vds::LogLevel::Info, "Windows service started");

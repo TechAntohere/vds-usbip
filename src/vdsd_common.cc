@@ -3,13 +3,13 @@
 
 #include <algorithm>
 #include <ostream>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "jsonl.hh"
 #include "vds_config.hh"
 #include "vds_log.hh"
 #include "vdsd_common.hh"
@@ -85,16 +85,23 @@ std::string trim_command(std::string command) {
 }
 
 std::uint32_t parse_trace_scope(std::string_view scope) {
-  if (scope == "all") {
-    return kTraceAll;
+  std::uint32_t flags = 0;
+  while (true) {
+    const std::size_t separator = scope.find(',');
+    const std::string_view item = scope.substr(0, separator);
+    if (item == "input") {
+      flags |= kTraceInput;
+    } else if (item == "output") {
+      flags |= kTraceOutput;
+    } else {
+      throw std::runtime_error(
+          "trace scope must be input, output, or comma-separated input/output");
+    }
+    if (separator == std::string_view::npos) {
+      return flags;
+    }
+    scope.remove_prefix(separator + 1);
   }
-  if (scope == "input") {
-    return kTraceInput;
-  }
-  if (scope == "output") {
-    return kTraceOutput;
-  }
-  throw std::runtime_error("trace scope must be all, input, or output");
 }
 
 std::string trace_scope_name(std::uint32_t scope) {
@@ -108,6 +115,21 @@ std::string trace_scope_name(std::uint32_t scope) {
     return "output";
   }
   return "none";
+}
+
+std::string format_controller_config(const ControllerConfig &config) {
+  std::string text = config.address;
+  text += " profile=\"";
+  text += controller_profile_name(config.profile);
+  text += "\" ports=";
+  if (config.ports.empty()) {
+    text += "[]";
+  } else {
+    text += '[';
+    text += format_ports(config.ports);
+    text += ']';
+  }
+  return text;
 }
 
 std::string active_trace_name(std::uint32_t trace_flags) {
@@ -197,7 +219,17 @@ std::vector<VdsdControlPortStatus> build_vdsd_control_port_statuses(
 VdsdWorkerLaunchDecision select_vdsd_worker_launch_decision(
     const ControllerConfig &config, std::span<const unsigned> available_ports,
     std::span<const unsigned> reserved_ports, std::string_view device_address,
+    bool virtual_port_provider_available,
     std::span<const std::string> reserved_device_addresses) {
+  if (!virtual_port_provider_available) {
+    return VdsdWorkerLaunchDecision{
+        .status = VdsdWorkerLaunchStatus::VirtualPortProviderUnavailable,
+        .config = config,
+        .port = 0,
+        .device_address = std::string(device_address),
+    };
+  }
+
   if (std::find(reserved_device_addresses.begin(),
                 reserved_device_addresses.end(),
                 device_address) != reserved_device_addresses.end()) {
@@ -272,108 +304,366 @@ bool consume_vdsd_worker_retry(std::vector<VdsdWorkerFailureBackoff> &backoffs,
 }
 
 std::string format_control_list_reply(
+    const ConfigDb &db,
     std::span<const VdsdControlControllerStatus> controllers) {
-  std::string reply = "OK\n";
-  for (const auto &controller : controllers) {
-    reply += controller.address;
-    reply += controller.connected ? " connected " : " disconnected ";
-    reply += controller.connected && !controller.path.empty() ? controller.path
-                                                              : "-";
-    reply += '\n';
+  const auto runtime_status = [&](std::string_view address) {
+    for (const auto &controller : controllers) {
+      if (controller.address == address) {
+        return &controller;
+      }
+    }
+    return static_cast<const VdsdControlControllerStatus *>(nullptr);
+  };
+
+  std::string reply;
+  for (const auto &controller : db.controllers) {
+    const VdsdControlControllerStatus *status =
+        runtime_status(controller.address);
+    const bool connected = status && status->connected;
+    reply += "{";
+    reply += jsonl_string_field("address", controller.address);
+    reply += ',';
+    reply += jsonl_bool_field("connected", connected);
+    reply += ',';
+    reply +=
+        jsonl_string_field("path", connected && status ? status->path : "");
+    reply += ',';
+    reply += jsonl_string_field("profile",
+                                controller_profile_name(controller.profile));
+    reply += ',';
+    reply += jsonl_unsigned_array_field("ports", controller.ports);
+    reply += "}\n";
   }
   return reply;
+}
+
+const ControllerTarget *
+find_controller_target_by_address(std::span<const ControllerTarget> targets,
+                                  std::string_view address) {
+  const auto target =
+      std::find_if(targets.begin(), targets.end(), [&](const auto &candidate) {
+        return candidate.address == address;
+      });
+  return target == targets.end() ? nullptr : &*target;
+}
+
+std::string format_control_target_jsonl(const ControllerTarget &target,
+                                        bool registered) {
+  std::string line = "{";
+  line += jsonl_string_field("address", target.address);
+  line += ',';
+  line += jsonl_string_field("name", target.name);
+  line += ',';
+  line += jsonl_bool_field("online", target.online);
+  line += ',';
+  line += jsonl_bool_field("registered", registered);
+  line += "}\n";
+  return line;
 }
 
 std::string
-format_control_ports_reply(std::span<const VdsdControlPortStatus> ports) {
-  std::string reply = "OK\n";
-  for (const auto &port : ports) {
-    reply += std::to_string(port.port);
-    reply += ' ';
-    reply += port.path;
-    reply += port.occupied ? " occupied " : " idle ";
-    reply += port.occupied ? port.address : "-";
-    reply += ' ';
-    reply += port.device_address.empty() ? "-" : port.device_address;
-    reply += '\n';
+format_control_list_targets_reply(const ConfigDb &db,
+                                  std::span<const ControllerTarget> targets) {
+  std::vector<ControllerTarget> sorted_targets(targets.begin(), targets.end());
+  std::sort(sorted_targets.begin(), sorted_targets.end(),
+            [](const ControllerTarget &left, const ControllerTarget &right) {
+              return left.address < right.address;
+            });
+
+  std::string reply;
+  for (const auto &target : sorted_targets) {
+    reply += format_control_target_jsonl(
+        target,
+        find_controller_config_by_address(db, target.address) != nullptr);
   }
   return reply;
 }
 
-VdsdTraceControlResult apply_trace_control_command(std::string_view command,
-                                                   std::uint32_t &trace_flags) {
-  std::istringstream fields{std::string(command)};
-  std::string verb;
-  std::string action;
-  std::string scope_text = "all";
-  std::string extra;
-  if (!(fields >> verb >> action) || verb != "TRACE") {
-    throw std::runtime_error("malformed trace command");
+std::vector<std::string>
+port_status_paths(std::span<const VdsdControlPortStatus> ports) {
+  std::vector<std::string> paths;
+  paths.reserve(ports.size());
+  for (const auto &port : ports) {
+    paths.push_back(port.path);
   }
-  if (fields >> scope_text && (fields >> extra)) {
-    throw std::runtime_error("malformed trace command");
-  }
+  return paths;
+}
 
-  const std::uint32_t scope = parse_trace_scope(scope_text);
-  bool enabled = false;
-  if (action == "ON") {
-    trace_flags |= scope;
-    enabled = true;
-  } else if (action == "OFF") {
-    trace_flags &= ~scope;
-  } else {
-    throw std::runtime_error("trace requires ON or OFF");
-  }
+std::string format_control_error_reply(std::string_view error) {
+  std::string reply = "{";
+  reply += jsonl_bool_field("OK", false);
+  reply += ',';
+  reply += jsonl_string_field("error", error);
+  reply += "}\n";
+  return reply;
+}
 
-  std::string reply = "OK trace=";
-  reply += enabled ? "on" : "off";
-  reply += " scope=";
-  reply += trace_scope_name(scope);
-  reply += " active=";
-  reply += active_trace_name(trace_flags);
-  reply += '\n';
-  return VdsdTraceControlResult{
-      .enabled = enabled,
-      .scope = scope,
-      .reply = std::move(reply),
+std::string format_control_attach_reply(bool ok, std::string_view error,
+                                        const ControllerConfig &config) {
+  std::string reply = "{";
+  reply += jsonl_bool_field("OK", ok);
+  reply += ',';
+  reply += jsonl_string_field("error", error);
+  reply += ',';
+  reply += jsonl_string_field("address", config.address);
+  reply += ',';
+  reply += jsonl_unsigned_array_field("ports", config.ports);
+  reply += ',';
+  reply +=
+      jsonl_string_field("profile", controller_profile_name(config.profile));
+  reply += "}\n";
+  return reply;
+}
+
+std::string format_control_detach_reply(bool ok, std::string_view error,
+                                        std::string_view address) {
+  std::string reply = "{";
+  reply += jsonl_bool_field("OK", ok);
+  reply += ',';
+  reply += jsonl_string_field("error", error);
+  reply += ',';
+  reply += jsonl_string_field("address", address);
+  reply += "}\n";
+  return reply;
+}
+
+std::string format_control_trace_reply(bool ok, std::string_view error,
+                                       std::uint32_t trace_flags) {
+  std::string reply = "{";
+  reply += jsonl_bool_field("OK", ok);
+  reply += ',';
+  reply += jsonl_string_field("error", error);
+  reply += ',';
+  reply += jsonl_bool_field("trace", (trace_flags & kTraceAll) != 0);
+  reply += ",\"scope\":[";
+  bool wrote_scope = false;
+  if (trace_enabled(trace_flags, kTraceInput)) {
+    reply += jsonl_string_value("input");
+    wrote_scope = true;
+  }
+  if (trace_enabled(trace_flags, kTraceOutput)) {
+    if (wrote_scope) {
+      reply += ',';
+    }
+    reply += jsonl_string_value("output");
+  }
+  reply += ']';
+  reply += "}\n";
+  return reply;
+}
+
+std::string handle_attach_control_request(
+    std::span<const JsonlField> fields, const std::string &db_path,
+    std::span<const VdsdControlPortStatus> ports,
+    const std::function<std::vector<ControllerTarget>()> &list_targets,
+    bool &reload_requested, Logger &logger) {
+  constexpr std::string_view context = "control request";
+  ControllerConfig config{
+      .address = {},
+      .profile = ControllerProfile::Unspecified,
+      .ports = {},
   };
+  try {
+    const std::string address = normalize_bluetooth_address(
+        require_jsonl_string(fields, "address", context));
+    const ConfigDb current_db = load_config_db(db_path);
+    if (const ControllerConfig *registered =
+            find_controller_config_by_address(current_db, address)) {
+      config = *registered;
+    }
+
+    static constexpr std::string_view expected[] = {
+        "command",
+        "address",
+        "profile",
+        "ports",
+    };
+    reject_unknown_jsonl_fields(fields, expected, context);
+
+    if (!config.address.empty()) {
+      const std::string error = "address is already registered";
+      logger.log("control", LogLevel::Warn,
+                 "attach rejected " + error + ": " + config.address);
+      return format_control_attach_reply(false, error, config);
+    }
+
+    config.address = address;
+    config.profile = parse_controller_profile(
+        require_jsonl_string(fields, "profile", context));
+    config.ports = require_jsonl_unsigned_array(fields, "ports", context);
+
+    const std::vector<ControllerTarget> targets = list_targets();
+    if (find_controller_target_by_address(targets, config.address) == nullptr) {
+      const std::string error =
+          "address is not paired, not supported, or not attachable; run "
+          "vdsctl list-targets";
+      logger.log("control", LogLevel::Warn, "attach rejected " + error);
+      config = {};
+      return format_control_attach_reply(false, error, config);
+    }
+
+    const std::vector<std::string> devices = port_status_paths(ports);
+    bool already_registered = false;
+    update_config_db(db_path, [&](ConfigDb &db) {
+      if (const ControllerConfig *registered =
+              find_controller_config_by_address(db, config.address)) {
+        config = *registered;
+        already_registered = true;
+        return;
+      }
+      upsert_controller_config(db, config);
+      validate_config_assignments(db, devices);
+    });
+    if (already_registered) {
+      const std::string error = "address is already registered";
+      logger.log("control", LogLevel::Warn,
+                 "attach rejected " + error + ": " + config.address);
+      return format_control_attach_reply(false, error, config);
+    }
+  } catch (const std::exception &error) {
+    return format_control_attach_reply(false, error.what(), config);
+  }
+
+  reload_requested = true;
+  logger.log("control", LogLevel::Info,
+             "attached controller config " + format_controller_config(config));
+  return format_control_attach_reply(true, "", config);
+}
+
+std::string handle_detach_control_request(std::span<const JsonlField> fields,
+                                          const std::string &db_path,
+                                          bool &reload_requested,
+                                          Logger &logger) {
+  constexpr std::string_view context = "control request";
+  std::string address;
+  bool removed = false;
+  try {
+    address = normalize_bluetooth_address(
+        require_jsonl_string(fields, "address", context));
+    const ConfigDb current_db = load_config_db(db_path);
+    if (find_controller_config_by_address(current_db, address) == nullptr) {
+      address = {};
+    }
+
+    static constexpr std::string_view expected[] = {
+        "command",
+        "address",
+    };
+    reject_unknown_jsonl_fields(fields, expected, context);
+
+    if (address.empty()) {
+      return format_control_detach_reply(false, "address is not registered",
+                                         address);
+    }
+    update_config_db(db_path, [&](ConfigDb &db) {
+      removed = remove_controller_config(db, address);
+    });
+  } catch (const std::exception &error) {
+    return format_control_detach_reply(false, error.what(), address);
+  }
+  reload_requested = removed;
+  logger.log("control", LogLevel::Info,
+             std::string(removed ? "detached " : "detach ignored ") + address);
+
+  if (!removed) {
+    address = {};
+    return format_control_detach_reply(false, "address is not registered", "");
+  }
+  return format_control_detach_reply(true, "", address);
+}
+
+std::string handle_list_control_request(
+    std::span<const JsonlField> fields, const std::string &db_path,
+    std::span<const VdsdControlControllerStatus> controllers) {
+  constexpr std::string_view context = "control request";
+  static constexpr std::string_view expected[] = {
+      "command",
+  };
+  reject_unknown_jsonl_fields(fields, expected, context);
+  return format_control_list_reply(load_config_db(db_path), controllers);
+}
+
+std::string handle_list_targets_control_request(
+    std::span<const JsonlField> fields, const std::string &db_path,
+    const std::function<std::vector<ControllerTarget>()> &list_targets) {
+  constexpr std::string_view context = "control request";
+  static constexpr std::string_view expected[] = {
+      "command",
+  };
+  reject_unknown_jsonl_fields(fields, expected, context);
+  return format_control_list_targets_reply(load_config_db(db_path),
+                                           list_targets());
+}
+
+std::string handle_trace_control_request(std::span<const JsonlField> fields,
+                                         std::uint32_t &trace_flags,
+                                         Logger &logger) {
+  constexpr std::string_view context = "control request";
+  bool enabled = false;
+  std::uint32_t scope = 0;
+  try {
+    static constexpr std::string_view expected[] = {
+        "command",
+        "mode",
+        "scope",
+    };
+    reject_unknown_jsonl_fields(fields, expected, context);
+
+    const std::string mode = require_jsonl_string(fields, "mode", context);
+    scope = parse_trace_scope(require_jsonl_string(fields, "scope", context));
+    if (mode == "on") {
+      trace_flags |= scope;
+      enabled = true;
+    } else if (mode == "off") {
+      trace_flags &= ~scope;
+    } else {
+      throw std::runtime_error("trace mode must be on or off");
+    }
+  } catch (const std::exception &error) {
+    return format_control_trace_reply(false, error.what(), trace_flags);
+  }
+
+  logger.log("control", LogLevel::Info,
+             "trace " + trace_scope_name(scope) + " " +
+                 (enabled ? "enabled" : "disabled") +
+                 " active=" + active_trace_name(trace_flags));
+  return format_control_trace_reply(true, "", trace_flags);
 }
 
 std::string handle_vdsd_control_command(
-    std::string_view command,
+    std::string_view request, const std::string &db_path,
     std::span<const VdsdControlControllerStatus> controllers,
-    std::span<const VdsdControlPortStatus> ports, std::uint32_t &trace_flags,
-    bool &reload_requested, Logger &logger) {
+    std::span<const VdsdControlPortStatus> ports,
+    const std::function<std::vector<ControllerTarget>()> &list_targets,
+    std::uint32_t &trace_flags, bool &reload_requested, Logger &logger) {
   try {
-    if (command == "RELOAD") {
-      reload_requested = true;
-      logger.log("control", LogLevel::Info, "reload requested");
-      return "OK reloaded\n";
+    constexpr std::string_view context = "control request";
+    const std::vector<JsonlField> fields = parse_jsonl_object(request, context);
+    const std::string command =
+        require_jsonl_string(fields, "command", context);
+    if (command == "attach") {
+      return handle_attach_control_request(fields, db_path, ports, list_targets,
+                                           reload_requested, logger);
     }
-
-    if (command == "LIST") {
-      return format_control_list_reply(controllers);
+    if (command == "detach") {
+      return handle_detach_control_request(fields, db_path, reload_requested,
+                                           logger);
     }
-
-    if (command == "PORTS") {
-      return format_control_ports_reply(ports);
+    if (command == "list") {
+      return handle_list_control_request(fields, db_path, controllers);
     }
-
-    if (command.rfind("TRACE ", 0) == 0) {
-      const VdsdTraceControlResult trace =
-          apply_trace_control_command(command, trace_flags);
-      logger.log("control", LogLevel::Info,
-                 "trace " + trace_scope_name(trace.scope) + " " +
-                     (trace.enabled ? "enabled" : "disabled") +
-                     " active=" + active_trace_name(trace_flags));
-      return trace.reply;
+    if (command == "list-targets") {
+      return handle_list_targets_control_request(fields, db_path, list_targets);
+    }
+    if (command == "trace") {
+      return handle_trace_control_request(fields, trace_flags, logger);
     }
 
     logger.log("control", LogLevel::Warn,
                "unknown command: " + std::string(command));
-    return "ERR unknown command\n";
+    return format_control_error_reply("unknown command: " + command);
   } catch (const std::exception &error) {
-    return std::string("ERR ") + error.what() + "\n";
+    return format_control_error_reply(error.what());
   }
 }
 

@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <iosfwd>
 #include <span>
 #include <string>
@@ -53,6 +54,7 @@ struct VdsdControlPortBinding {
 
 enum class VdsdWorkerLaunchStatus {
   Ready,
+  VirtualPortProviderUnavailable,
   DeviceAddressReserved,
   NoAvailablePort,
 };
@@ -67,12 +69,6 @@ struct VdsdWorkerLaunchDecision {
 struct VdsdWorkerFailureBackoff {
   std::string address;
   std::chrono::steady_clock::time_point retry_after;
-};
-
-struct VdsdTraceControlResult {
-  bool enabled = false;
-  std::uint32_t scope = 0;
-  std::string reply;
 };
 
 VdsdCommonOptions default_vdsd_common_options();
@@ -102,6 +98,7 @@ std::vector<VdsdControlPortStatus> build_vdsd_control_port_statuses(
 VdsdWorkerLaunchDecision select_vdsd_worker_launch_decision(
     const ControllerConfig &config, std::span<const unsigned> available_ports,
     std::span<const unsigned> reserved_ports, std::string_view device_address,
+    bool virtual_port_provider_available,
     std::span<const std::string> reserved_device_addresses);
 bool vdsd_worker_config_is_stale(const ConfigDb &db, std::string_view address,
                                  ControllerProfile profile, unsigned port,
@@ -112,16 +109,11 @@ void record_vdsd_worker_failure(
 bool consume_vdsd_worker_retry(std::vector<VdsdWorkerFailureBackoff> &backoffs,
                                std::string_view address,
                                std::chrono::steady_clock::time_point now);
-std::string format_control_list_reply(
-    std::span<const VdsdControlControllerStatus> controllers);
-std::string
-format_control_ports_reply(std::span<const VdsdControlPortStatus> ports);
-VdsdTraceControlResult apply_trace_control_command(std::string_view command,
-                                                   std::uint32_t &trace_flags);
 std::string handle_vdsd_control_command(
-    std::string_view command,
+    std::string_view request, const std::string &db_path,
     std::span<const VdsdControlControllerStatus> controllers,
-    std::span<const VdsdControlPortStatus> ports, std::uint32_t &trace_flags,
-    bool &reload_requested, Logger &logger);
+    std::span<const VdsdControlPortStatus> ports,
+    const std::function<std::vector<ControllerTarget>()> &list_targets,
+    std::uint32_t &trace_flags, bool &reload_requested, Logger &logger);
 
 } // namespace vds

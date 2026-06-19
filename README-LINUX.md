@@ -31,13 +31,13 @@ Application
   -(Bluetooth HID Control/Interrupt)-> DualSense (Edge) controller
 ```
 
+The future goal is to remove userspace from runtime communication where possible
+and reduce overhead.
+
 The virtual USB HID endpoint descriptors match each controller's USB HID
 specification: DualSense HID IN/OUT use 4 ms intervals, while DualSense Edge HID
 IN uses 1 ms and HID OUT uses 4 ms. vDS uses the HID IN interval to pace virtual
 USB input URB completion.
-
-The future goal is to remove userspace from runtime communication where possible
-and reduce overhead.
 
 ## Dependencies
 
@@ -128,6 +128,24 @@ The installed tools are:
 /usr/local/bin/vdsctl
 ```
 
+To install and remove the `vdsd` systemd service with the userspace tools,
+configure with `INSTALL_SERVICE=YES`:
+
+```sh
+cmake . -B build -DINSTALL_SERVICE=YES
+make -C build
+sudo make -C build install
+sudo make -C build uninstall
+```
+
+When `INSTALL_SERVICE=YES` is used, CMake enables the `vdsd.service` systemd
+service for future boots. The service is not started immediately after
+installation. To start it without rebooting, run:
+
+```sh
+sudo systemctl restart vdsd.service
+```
+
 ## Initial Bluetooth Pairing
 
 > [!IMPORTANT]
@@ -141,6 +159,14 @@ The installed tools are:
 > In simpler terms, using vDS on Linux currently means giving up Bluetooth
 > devices like mice or keyboards. :( A BlueZ userspace stack patch is being
 > prepared to remove this limitation.
+>
+> In the meantime, the helper script `override-bluetoothd.sh` can install or
+> remove the required `bluetooth.service` drop-in override:
+>
+> ```sh
+> sudo ./override-bluetoothd.sh disable-input --restart
+> sudo ./override-bluetoothd.sh enable-input --restart
+> ```
 
 Pair each physical controller once before registering it with `vdsctl`. Start
 `bluetoothctl`, put the controller in Bluetooth pairing mode by holding Create
@@ -244,10 +270,4 @@ Check the virtual USB audio endpoint with standard ALSA tools:
 ```sh
 aplay -l
 speaker-test -D hw:<card-number>,<device-number> -c 4 -r 48000 -F S16_LE -t sine
-```
-
-Inspect daemon logs:
-
-```sh
-sudo tail -f /var/log/vdsd.log
 ```

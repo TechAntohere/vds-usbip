@@ -14,7 +14,7 @@
 namespace vds {
 
 #ifdef _WIN32
-inline constexpr const char *kDefaultDbPath = R"(C:\ProgramData\vds\vdsd.db)";
+inline constexpr const char *kDefaultDbPath = R"(C:\ProgramData\vDS\vdsd.db)";
 #else
 inline constexpr const char *kDefaultDbPath = "/var/lib/vds/vdsd.db";
 #endif
@@ -32,6 +32,13 @@ struct ControllerConfig {
   std::string address;
   ControllerProfile profile = ControllerProfile::Unspecified;
   std::vector<unsigned> ports;
+};
+
+struct ControllerTarget {
+  std::string address;
+  std::string name;
+  ControllerProfile profile = ControllerProfile::Unspecified;
+  bool online = false;
 };
 
 struct ConfigDb {

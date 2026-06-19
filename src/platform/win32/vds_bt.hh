@@ -24,6 +24,7 @@ public:
     (void)report_id;
     return std::nullopt;
   }
+  virtual void write_feature_report(std::span<const std::uint8_t> report) = 0;
   virtual void write_interrupt_packet(std::span<const std::uint8_t> packet) = 0;
   virtual bool
   try_write_interrupt_packet(std::span<const std::uint8_t> packet) = 0;
@@ -38,6 +39,7 @@ public:
 struct HidBluetoothDevice {
   std::string path;
   std::string address;
+  std::string name;
   std::uint32_t profile = VDS_PROFILE_DS5;
   bool profile_valid = false;
   bool filter_backed = false;
@@ -48,6 +50,7 @@ struct HidBluetoothDevice {
 
 std::optional<HidBluetoothDevice>
 find_filter_bluetooth_device(const std::string &address);
+bool filter_provider_available();
 std::vector<HidBluetoothDevice> list_filter_bluetooth_devices();
 std::string describe_bluetooth_lookup(const std::string &address);
 std::unique_ptr<BluetoothTransport>

@@ -6,7 +6,7 @@
 KERNELRELEASE ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KERNELRELEASE)/build
 DKMS_NAME := vds_hcd
-VDS_VERSION ?= $(shell git -C $(CURDIR)/.. describe --always --abbrev=7 --dirty=+ --tags 2>/dev/null || echo unknown)
+VDS_VERSION ?= $(shell if [ -x "$(CURDIR)/../generate-version.sh" ]; then "$(CURDIR)/../generate-version.sh"; else echo unknown; fi)
 DKMS_VERSION := $(VDS_VERSION)
 DKMS_SOURCE_DIR := /usr/src/$(DKMS_NAME)-$(DKMS_VERSION)
 LLVM ?= $(if $(findstring clang,$(shell sed -n 's/^#define[[:space:]]\+LINUX_COMPILER[[:space:]]\+"\(.*\)"/\1/p' "$(KDIR)/include/generated/compile.h" 2>/dev/null)),1,)

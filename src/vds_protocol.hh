@@ -79,6 +79,9 @@ public:
 
 private:
   DsState state_{};
+  std::array<std::uint8_t, 3> light_color_{};
+  std::uint8_t light_brightness_ = 0;
+  bool emulate_light_brightness_ = false;
   std::uint8_t report_sequence_ = 0;
 };
 

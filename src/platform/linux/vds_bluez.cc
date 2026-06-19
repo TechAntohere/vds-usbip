@@ -6,11 +6,14 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <dbus/dbus.h>
 
 #include "vds_bluez.hh"
 #include "vds_config.hh"
+#include "vds_profile.hh"
 
 namespace {
 
@@ -105,6 +108,22 @@ std::optional<std::string> read_dbus_variant_string(DBusMessageIter *iter) {
   return std::string(value);
 }
 
+std::optional<bool> read_dbus_variant_bool(DBusMessageIter *iter) {
+  if (::dbus_message_iter_get_arg_type(iter) != DBUS_TYPE_VARIANT) {
+    return std::nullopt;
+  }
+
+  DBusMessageIter variant;
+  ::dbus_message_iter_recurse(iter, &variant);
+  if (::dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_BOOLEAN) {
+    return std::nullopt;
+  }
+
+  dbus_bool_t value = FALSE;
+  ::dbus_message_iter_get_basic(&variant, &value);
+  return value != FALSE;
+}
+
 DBusConnectionPtr open_system_bus() {
   DBusErrorGuard error;
   DBusConnection *connection = ::dbus_bus_get(DBUS_BUS_SYSTEM, error.get());
@@ -155,6 +174,71 @@ std::optional<std::string> read_device_address(DBusMessageIter *properties) {
   }
 
   return std::nullopt;
+}
+
+std::optional<vds::ControllerTarget>
+read_controller_target(DBusMessageIter *properties) {
+  std::optional<std::string> address;
+  std::optional<std::string> name;
+  std::optional<std::string> alias;
+  std::optional<std::string> modalias;
+  bool paired = false;
+  bool connected = false;
+
+  while (::dbus_message_iter_get_arg_type(properties) != DBUS_TYPE_INVALID) {
+    require_message_type(properties, DBUS_TYPE_DICT_ENTRY,
+                         "BlueZ Device1 property");
+
+    DBusMessageIter property;
+    ::dbus_message_iter_recurse(properties, &property);
+    const char *property_name =
+        read_dbus_string(&property, "BlueZ property name");
+    if (!::dbus_message_iter_next(&property)) {
+      throw std::runtime_error("missing BlueZ property value");
+    }
+
+    if (std::strcmp(property_name, "Address") == 0) {
+      if (const auto value = read_dbus_variant_string(&property)) {
+        try {
+          address = vds::normalize_bluetooth_address(*value);
+        } catch (const std::exception &) {
+          return std::nullopt;
+        }
+      }
+    } else if (std::strcmp(property_name, "Name") == 0) {
+      name = read_dbus_variant_string(&property);
+    } else if (std::strcmp(property_name, "Alias") == 0) {
+      alias = read_dbus_variant_string(&property);
+    } else if (std::strcmp(property_name, "Modalias") == 0) {
+      modalias = read_dbus_variant_string(&property);
+    } else if (std::strcmp(property_name, "Paired") == 0) {
+      paired = read_dbus_variant_bool(&property).value_or(false);
+    } else if (std::strcmp(property_name, "Connected") == 0) {
+      connected = read_dbus_variant_bool(&property).value_or(false);
+    }
+
+    ::dbus_message_iter_next(properties);
+  }
+
+  if (!paired || !address || !modalias) {
+    return std::nullopt;
+  }
+
+  const auto profile = vds::controller_profile_from_modalias(*modalias);
+  if (!profile) {
+    return std::nullopt;
+  }
+
+  std::string display_name = name.value_or(alias.value_or(""));
+  if (display_name.empty()) {
+    display_name = *address;
+  }
+  return vds::ControllerTarget{
+      .address = *address,
+      .name = std::move(display_name),
+      .profile = *profile,
+      .online = connected,
+  };
 }
 
 std::optional<std::string> find_device_path(DBusConnection *connection,
@@ -269,6 +353,69 @@ std::optional<std::string> bluez_device_modalias(const std::string &address) {
     return std::nullopt;
   }
   return get_device_string_property(connection.get(), *path, "Modalias");
+}
+
+std::vector<ControllerTarget> list_bluez_controller_targets() {
+  DBusConnectionPtr connection = open_system_bus();
+  DBusMessagePtr call(::dbus_message_new_method_call(
+      kBluezService, kBluezRootPath, kDbusObjectManagerInterface,
+      "GetManagedObjects"));
+  if (!call) {
+    throw std::runtime_error("failed to allocate BlueZ D-Bus method call");
+  }
+
+  DBusMessagePtr reply = call_dbus_method(connection.get(), call.get(),
+                                          "failed to query BlueZ objects");
+  DBusMessageIter root;
+  if (!::dbus_message_iter_init(reply.get(), &root)) {
+    return {};
+  }
+  require_message_type(&root, DBUS_TYPE_ARRAY, "BlueZ object list");
+
+  std::vector<ControllerTarget> targets;
+  DBusMessageIter objects;
+  ::dbus_message_iter_recurse(&root, &objects);
+  while (::dbus_message_iter_get_arg_type(&objects) != DBUS_TYPE_INVALID) {
+    require_message_type(&objects, DBUS_TYPE_DICT_ENTRY, "BlueZ object");
+
+    DBusMessageIter object;
+    ::dbus_message_iter_recurse(&objects, &object);
+    require_message_type(&object, DBUS_TYPE_OBJECT_PATH, "BlueZ object path");
+    if (!::dbus_message_iter_next(&object)) {
+      throw std::runtime_error("malformed BlueZ object entry");
+    }
+    require_message_type(&object, DBUS_TYPE_ARRAY, "BlueZ interface list");
+
+    DBusMessageIter interfaces;
+    ::dbus_message_iter_recurse(&object, &interfaces);
+    while (::dbus_message_iter_get_arg_type(&interfaces) != DBUS_TYPE_INVALID) {
+      require_message_type(&interfaces, DBUS_TYPE_DICT_ENTRY,
+                           "BlueZ interface entry");
+
+      DBusMessageIter interface_entry;
+      ::dbus_message_iter_recurse(&interfaces, &interface_entry);
+      const char *interface =
+          read_dbus_string(&interface_entry, "BlueZ interface name");
+      if (!::dbus_message_iter_next(&interface_entry)) {
+        throw std::runtime_error("malformed BlueZ interface entry");
+      }
+      require_message_type(&interface_entry, DBUS_TYPE_ARRAY,
+                           "BlueZ interface properties");
+
+      if (std::strcmp(interface, kBluezDeviceInterface) == 0) {
+        DBusMessageIter properties;
+        ::dbus_message_iter_recurse(&interface_entry, &properties);
+        if (auto target = read_controller_target(&properties)) {
+          targets.push_back(std::move(*target));
+        }
+      }
+
+      ::dbus_message_iter_next(&interfaces);
+    }
+
+    ::dbus_message_iter_next(&objects);
+  }
+  return targets;
 }
 
 bool disconnect_bluez_device(const std::string &address) {

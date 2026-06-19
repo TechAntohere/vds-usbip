@@ -55,6 +55,10 @@ using vds::hex_u16;
 using vds::hex_u8;
 
 constexpr const char *kDefaultControlSocket = "/run/vdsd.sock";
+constexpr const char *kVirtualPortProviderUnavailableReason =
+    "virtual port provider unavailable";
+constexpr const char *kLinuxVirtualPortProviderUnavailable =
+    "vds_hcd kernel module is not loaded or no /dev/vds# ports are available";
 constexpr std::size_t kTraceDumpMaxBytes = 96;
 constexpr std::size_t kUsbInputButtonsOffset = 8;
 constexpr std::size_t kUsbInputButtonsSize = 4;
@@ -96,11 +100,6 @@ constexpr std::array<std::uint8_t, 3> kInitialFeatureReportIds = {0x09, 0x20,
                                                                   0x05};
 
 volatile sig_atomic_t g_stop_requested = 0;
-
-struct DeviceId {
-  std::uint16_t vendor;
-  std::uint16_t product;
-};
 
 struct Options {
   std::string socket = kDefaultControlSocket;
@@ -147,7 +146,6 @@ using vds::active_trace_name;
 using vds::kTraceAll;
 using vds::kTraceInput;
 using vds::kTraceOutput;
-using vds::parse_trace_scope;
 using vds::trace_enabled;
 using vds::trace_scope_name;
 using vds::trim_command;
@@ -253,55 +251,6 @@ int open_required(const std::string &path, int flags) {
   return fd;
 }
 
-std::optional<unsigned int> parse_hex_token(std::string_view text,
-                                            std::size_t offset,
-                                            std::size_t max_digits) {
-  unsigned int value = 0;
-  std::size_t digits = 0;
-  for (std::size_t i = offset; i < text.size() && digits < max_digits; ++i) {
-    const char ch = text[i];
-    unsigned int nibble;
-    if (ch >= '0' && ch <= '9') {
-      nibble = static_cast<unsigned int>(ch - '0');
-    } else if (ch >= 'a' && ch <= 'f') {
-      nibble = static_cast<unsigned int>(10 + ch - 'a');
-    } else if (ch >= 'A' && ch <= 'F') {
-      nibble = static_cast<unsigned int>(10 + ch - 'A');
-    } else {
-      break;
-    }
-    value = (value << 4) | nibble;
-    ++digits;
-  }
-
-  if (digits == 0) {
-    return std::nullopt;
-  }
-  return value;
-}
-
-std::optional<DeviceId> parse_modalias_line(std::string_view line) {
-  const std::size_t vendor_marker = line.find('v');
-  if (vendor_marker == std::string_view::npos) {
-    return std::nullopt;
-  }
-  const std::size_t product_marker = line.find('p', vendor_marker + 1);
-  if (product_marker == std::string_view::npos) {
-    return std::nullopt;
-  }
-
-  const bool usb_modalias = line.find("usb:") != std::string_view::npos;
-  const std::size_t digits = usb_modalias ? 4 : 8;
-  const auto vendor = parse_hex_token(line, vendor_marker + 1, digits);
-  const auto product = parse_hex_token(line, product_marker + 1, digits);
-  if (!vendor || !product) {
-    return std::nullopt;
-  }
-
-  return DeviceId{.vendor = static_cast<std::uint16_t>(*vendor & 0xffffu),
-                  .product = static_cast<std::uint16_t>(*product & 0xffffu)};
-}
-
 void trace_output_latency(const std::string &device, std::string_view label,
                           LatencyTraceStats &stats, Clock::duration duration,
                           Clock::duration slow_threshold, vds::Logger &logger) {
@@ -384,21 +333,6 @@ const char *usb_interface_kind_name(std::uint8_t kind) {
   }
 }
 
-std::uint32_t profile_from_device_id(const DeviceId &id) {
-  if (id.vendor != VDS_SONY_VENDOR_ID) {
-    throw std::runtime_error("unsupported controller vendor " +
-                             hex_u16(id.vendor));
-  }
-  if (id.product == VDS_DS5_PRODUCT_ID) {
-    return VDS_PROFILE_DS5;
-  }
-  if (id.product == VDS_DSE_PRODUCT_ID) {
-    return VDS_PROFILE_DSE;
-  }
-  throw std::runtime_error("unsupported Sony controller product " +
-                           hex_u16(id.product));
-}
-
 const char *profile_name(std::uint32_t profile) {
   if (profile == VDS_PROFILE_DSE) {
     return "dualsense-edge";
@@ -411,12 +345,12 @@ std::uint32_t detect_bluetooth_profile(const std::string &address) {
   if (!modalias) {
     throw std::runtime_error("failed to query BlueZ modalias for " + address);
   }
-  const auto id = parse_modalias_line(*modalias);
-  if (!id) {
+  const auto profile = vds::controller_profile_from_modalias(*modalias);
+  if (!profile) {
     throw std::runtime_error("failed to detect Bluetooth device ID for " +
                              address);
   }
-  return profile_from_device_id(*id);
+  return vds::usb_profile_from_controller_profile(*profile);
 }
 
 std::uint32_t resolve_config_profile(const vds::ControllerConfig &controller) {
@@ -1441,6 +1375,14 @@ void handle_bt_accept(std::vector<VirtualPort> &ports,
       }
     }
     if (!port_index) {
+      if (ports.empty()) {
+        controller->last_error = kLinuxVirtualPortProviderUnavailable;
+        logger.log("port", vds::LogLevel::Error,
+                   "rejected raw HID channel address=" + accepted->address +
+                       " reason=" + kVirtualPortProviderUnavailableReason +
+                       " detail=" + kLinuxVirtualPortProviderUnavailable);
+        continue;
+      }
       port_index = available_port_index(ports, controllers, *controller);
       if (!port_index) {
         controller->last_error = "no available virtual port";
@@ -1681,6 +1623,7 @@ void reconcile_controller_configs(std::vector<VirtualPort> &ports,
                                   const std::string &db_path,
                                   vds::Logger &logger) {
   const std::vector<std::string> devices = vds::discover_vds_devices();
+  const bool virtual_port_provider_available = !devices.empty();
   for (auto &controller : controllers) {
     if (!controller_uses_port(controller) ||
         std::binary_search(devices.begin(), devices.end(), controller.device)) {
@@ -1697,6 +1640,11 @@ void reconcile_controller_configs(std::vector<VirtualPort> &ports,
   }
 
   sync_virtual_ports(ports, devices, logger);
+  if (!virtual_port_provider_available) {
+    logger.log("port", vds::LogLevel::Error,
+               std::string(kVirtualPortProviderUnavailableReason) +
+                   " detail=" + kLinuxVirtualPortProviderUnavailable);
+  }
   const vds::ConfigDb db = vds::load_config_db(db_path);
   logger.log("config", vds::LogLevel::Info,
              "loaded controller config count=" +
@@ -1708,13 +1656,19 @@ void reconcile_controller_configs(std::vector<VirtualPort> &ports,
   next_controllers.reserve(db.controllers.size());
 
   for (const auto &config : db.controllers) {
-    if (!controller_has_present_allowed_port(ports, config)) {
+    if (!virtual_port_provider_available) {
+      logger.log("config", vds::LogLevel::Warn,
+                 "controller binding unavailable address=" + config.address +
+                     " reason=" + kVirtualPortProviderUnavailableReason);
+    } else if (!controller_has_present_allowed_port(ports, config)) {
       logger.log("config", vds::LogLevel::Warn,
                  "controller binding unavailable address=" + config.address +
                      " reason=no allowed virtual port present ports=[" +
                      vds::format_ports(config.ports) + "]");
     }
-    preempt_default_bluetooth_owner(config.address, logger);
+    if (virtual_port_provider_available) {
+      preempt_default_bluetooth_owner(config.address, logger);
+    }
     ControllerRuntime next{
         .config = config,
         .device = {},
@@ -1803,6 +1757,7 @@ void reconcile_controller_configs(std::vector<VirtualPort> &ports,
 
 void handle_control_client(int control_fd, std::span<const VirtualPort> ports,
                            std::span<const ControllerRuntime> controllers,
+                           const std::string &db_path,
                            std::uint32_t &trace_flags, bool &reload_requested,
                            vds::Logger &logger) {
   vds::UniqueFd client_fd(
@@ -1875,9 +1830,10 @@ void handle_control_client(int control_fd, std::span<const VirtualPort> ports,
   const std::vector<vds::VdsdControlPortStatus> port_statuses =
       vds::build_vdsd_control_port_statuses(port_candidates, port_bindings);
 
-  reply = vds::handle_vdsd_control_command(command, controller_statuses,
-                                           port_statuses, trace_flags,
-                                           reload_requested, logger);
+  reply = vds::handle_vdsd_control_command(
+      command, db_path, controller_statuses, port_statuses,
+      [] { return vds::list_bluez_controller_targets(); }, trace_flags,
+      reload_requested, logger);
 
   try {
     vds::write_full(client_fd.get(), reply);
@@ -1970,6 +1926,12 @@ int main(int argc, char **argv) {
     logger.log("daemon", vds::LogLevel::Info,
                "started socket=" + options.socket + " log=" + options.log_path +
                    " db=" + options.db_path);
+    if (vds::discover_vds_devices().empty()) {
+      logger.log("port", vds::LogLevel::Error,
+                 std::string(kVirtualPortProviderUnavailableReason) +
+                     " detail=" + kLinuxVirtualPortProviderUnavailable);
+      throw std::runtime_error(kLinuxVirtualPortProviderUnavailable);
+    }
 
     vds::UniqueFd control_fd(open_control_socket(options.socket));
     vds::BtL2capAcceptor bt_acceptor;
@@ -2028,7 +1990,8 @@ int main(int argc, char **argv) {
         if (source.kind == EventKind::Control) {
           if ((revents & EPOLLIN) != 0) {
             handle_control_client(control_fd.get(), ports, controllers,
-                                  trace_flags, reload_requested, logger);
+                                  options.db_path, trace_flags,
+                                  reload_requested, logger);
           }
           if ((revents & (EPOLLERR | EPOLLHUP)) != 0) {
             throw std::runtime_error("control socket epoll error");
