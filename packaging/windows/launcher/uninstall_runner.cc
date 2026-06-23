@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -33,6 +34,62 @@ std::wstring quote_command_argument(std::wstring_view value) {
   result.append(backslash_count * 2, L'\\');
   result.push_back(L'"');
   return result;
+}
+
+std::string utf8_from_wide(std::wstring_view value) {
+  if (value.empty()) {
+    return {};
+  }
+
+  const int length = WideCharToMultiByte(CP_UTF8, 0, value.data(),
+                                         static_cast<int>(value.size()),
+                                         nullptr, 0, nullptr, nullptr);
+  if (length <= 0) {
+    return {};
+  }
+
+  std::string result(static_cast<std::size_t>(length), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                      result.data(), length, nullptr, nullptr);
+  return result;
+}
+
+std::filesystem::path installer_log_path() {
+  std::vector<wchar_t> program_data(32768);
+  const DWORD length =
+      GetEnvironmentVariableW(L"ProgramData", program_data.data(),
+                              static_cast<DWORD>(program_data.size()));
+  if (length == 0 || length >= static_cast<DWORD>(program_data.size())) {
+    throw std::runtime_error("ProgramData is not available");
+  }
+
+  std::filesystem::path path(program_data.data());
+  path /= L"vDS";
+  std::filesystem::create_directories(path);
+  path /= L"installer.log";
+  return path;
+}
+
+void append_installer_log(std::wstring_view message) noexcept {
+  try {
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+
+    wchar_t timestamp[64]{};
+    swprintf_s(timestamp, L"%04hu-%02hu-%02hu %02hu:%02hu:%02hu.%03hu ",
+               time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute,
+               time.wSecond, time.wMilliseconds);
+
+    std::wstring line(timestamp);
+    line += message;
+    line += L"\r\n";
+
+    const std::string bytes = utf8_from_wide(line);
+    std::ofstream stream(installer_log_path(),
+                         std::ios::binary | std::ios::app);
+    stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  } catch (...) {
+  }
 }
 
 bool service_exists(const wchar_t *name) {
@@ -101,6 +158,12 @@ std::wstring read_previous_install_dir() {
 }
 
 int run_process(std::wstring command_line) {
+  {
+    std::wstring message = L"run uninstall script: ";
+    message += command_line;
+    append_installer_log(message);
+  }
+
   STARTUPINFOW startup_info{};
   startup_info.cb = sizeof(startup_info);
   startup_info.dwFlags = STARTF_USESHOWWINDOW;
@@ -110,6 +173,9 @@ int run_process(std::wstring command_line) {
   if (!CreateProcessW(nullptr, command_line.data(), nullptr, nullptr, FALSE,
                       CREATE_NO_WINDOW, nullptr, nullptr, &startup_info,
                       &process_info)) {
+    std::wstring message = L"uninstall script CreateProcessW failed: ";
+    message += std::to_wstring(GetLastError());
+    append_installer_log(message);
     return 1;
   }
 
@@ -121,6 +187,10 @@ int run_process(std::wstring command_line) {
 
   CloseHandle(process_info.hThread);
   CloseHandle(process_info.hProcess);
+
+  std::wstring message = L"uninstall script exit: ";
+  message += std::to_wstring(exit_code);
+  append_installer_log(message);
   return static_cast<int>(exit_code);
 }
 
@@ -148,6 +218,8 @@ int run_powershell_script(const std::filesystem::path &script,
     command_line.push_back(L' ');
     command_line += quote_command_argument(argument);
   }
+  command_line += L" *>> ";
+  command_line += quote_command_argument(installer_log_path().wstring());
 
   return run_process(std::move(command_line));
 }
@@ -157,6 +229,7 @@ int run_powershell_script(const std::filesystem::path &script,
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   std::filesystem::path root;
   try {
+    append_installer_log(L"existing vDS uninstall runner started");
     root = uninstall_root();
     write_payloads(root);
 
@@ -179,12 +252,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     (void)status;
 
     std::filesystem::remove_all(root);
+    append_installer_log(L"existing vDS uninstall runner finished");
     return 0;
   } catch (...) {
     if (!root.empty()) {
       std::error_code ignored;
       std::filesystem::remove_all(root, ignored);
     }
+    append_installer_log(L"existing vDS uninstall runner failed");
     return 1;
   }
 }

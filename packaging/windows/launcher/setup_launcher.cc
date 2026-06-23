@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -61,6 +62,70 @@ std::filesystem::path current_executable_path() {
       return std::filesystem::path(path.data());
     }
     path.resize(path.size() * 2);
+  }
+}
+
+std::string utf8_from_wide(std::wstring_view value) {
+  if (value.empty()) {
+    return {};
+  }
+
+  const int length = WideCharToMultiByte(CP_UTF8, 0, value.data(),
+                                         static_cast<int>(value.size()),
+                                         nullptr, 0, nullptr, nullptr);
+  if (length <= 0) {
+    return {};
+  }
+
+  std::string result(static_cast<std::size_t>(length), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                      result.data(), length, nullptr, nullptr);
+  return result;
+}
+
+std::filesystem::path installer_log_path() {
+  std::vector<wchar_t> program_data(32768);
+  const DWORD length =
+      GetEnvironmentVariableW(L"ProgramData", program_data.data(),
+                              static_cast<DWORD>(program_data.size()));
+  if (length == 0 || length >= static_cast<DWORD>(program_data.size())) {
+    throw std::runtime_error("ProgramData is not available");
+  }
+
+  std::filesystem::path path(program_data.data());
+  path /= L"vDS";
+  std::filesystem::create_directories(path);
+  path /= L"installer.log";
+  return path;
+}
+
+void reset_installer_log() {
+  std::ofstream stream(installer_log_path(),
+                       std::ios::binary | std::ios::trunc);
+  if (!stream) {
+    throw std::runtime_error("failed to create installer log");
+  }
+}
+
+void append_installer_log(std::wstring_view message) noexcept {
+  try {
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+
+    wchar_t timestamp[64]{};
+    swprintf_s(timestamp, L"%04hu-%02hu-%02hu %02hu:%02hu:%02hu.%03hu ",
+               time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute,
+               time.wSecond, time.wMilliseconds);
+
+    std::wstring line(timestamp);
+    line += message;
+    line += L"\r\n";
+
+    const std::string bytes = utf8_from_wide(line);
+    std::ofstream stream(installer_log_path(),
+                         std::ios::binary | std::ios::app);
+    stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  } catch (...) {
   }
 }
 
@@ -142,6 +207,12 @@ void write_payloads(const std::filesystem::path &dir) {
 }
 
 int run_process(std::wstring command_line, int show_window) {
+  {
+    std::wstring message = L"run: ";
+    message += command_line;
+    append_installer_log(message);
+  }
+
   STARTUPINFOW startup_info{};
   startup_info.cb = sizeof(startup_info);
   startup_info.dwFlags = STARTF_USESHOWWINDOW;
@@ -150,6 +221,9 @@ int run_process(std::wstring command_line, int show_window) {
 
   if (!CreateProcessW(nullptr, command_line.data(), nullptr, nullptr, FALSE, 0,
                       nullptr, nullptr, &startup_info, &process_info)) {
+    std::wstring message = L"CreateProcessW failed: ";
+    message += std::to_wstring(GetLastError());
+    append_installer_log(message);
     return 1;
   }
 
@@ -161,6 +235,10 @@ int run_process(std::wstring command_line, int show_window) {
 
   CloseHandle(process_info.hThread);
   CloseHandle(process_info.hProcess);
+
+  std::wstring message = L"exit: ";
+  message += std::to_wstring(exit_code);
+  append_installer_log(message);
   return static_cast<int>(exit_code);
 }
 
@@ -182,6 +260,11 @@ bool is_success_exit_code(int status) {
   return status == 0 || status == 3010 || status == 1641;
 }
 
+void append_msi_log_arguments(std::wstring &command_line) {
+  command_line += L" /l*vx! ";
+  command_line += quote_command_argument(installer_log_path().wstring());
+}
+
 int run_main_msi(const std::filesystem::path &msi,
                  const std::filesystem::path &setup_source) {
   std::wstring command_line =
@@ -191,6 +274,7 @@ int run_main_msi(const std::filesystem::path &msi,
   command_line += L" VDS_SETUP_LAUNCHED=1 VDS_SETUP_SOURCE=";
   command_line += quote_command_argument(setup_source.wstring());
   command_line += L" /norestart";
+  append_msi_log_arguments(command_line);
   return run_process(std::move(command_line), SW_SHOWNORMAL);
 }
 
@@ -204,6 +288,7 @@ int run_main_msi_uninstall(const std::filesystem::path &msi,
                   L"VDS_SETUP_SOURCE=";
   command_line += quote_command_argument(setup_source.wstring());
   command_line += L" /norestart";
+  append_msi_log_arguments(command_line);
   return run_process(std::move(command_line), SW_SHOWNORMAL);
 }
 
@@ -214,6 +299,7 @@ int run_driver_msi(const std::filesystem::path &msi) {
   command_line += quote_command_argument(msi.wstring());
   command_line += L" VDS_FORCE_DRIVER_INSTALL=1";
   command_line += L" /passive /norestart";
+  append_msi_log_arguments(command_line);
   return run_process(std::move(command_line), SW_SHOWNORMAL);
 }
 
@@ -294,8 +380,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
   std::filesystem::path work_dir;
   try {
+    reset_installer_log();
+    append_installer_log(uninstall ? L"vDS setup launcher started: uninstall"
+                                   : L"vDS setup launcher started: install");
+
     work_dir = setup_work_dir();
+    {
+      std::wstring message = L"work dir: ";
+      message += work_dir.wstring();
+      append_installer_log(message);
+    }
     write_payloads(work_dir);
+    append_installer_log(L"payloads extracted");
 
     const std::filesystem::path main_msi = work_dir / L"vDS-setup.msi";
     const int main_status =
@@ -306,12 +402,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         show_failed_status(L"running the main installer", main_status);
       }
       std::filesystem::remove_all(work_dir);
+      append_installer_log(L"main installer failed");
       return main_status;
     }
 
     if (uninstall) {
       std::filesystem::remove_all(work_dir);
       remove_setup_cache_after_exit();
+      append_installer_log(L"vDS setup uninstall finished");
       return 0;
     }
 
@@ -319,6 +417,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (!is_success_exit_code(driver_status)) {
       show_failed_status(L"installing vds_usb.sys", driver_status);
       std::filesystem::remove_all(work_dir);
+      append_installer_log(L"vds_usb installer failed");
       return driver_status;
     }
 
@@ -327,18 +426,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
       if (!is_success_exit_code(driver_status)) {
         show_failed_status(L"installing vds_filter.sys", driver_status);
         std::filesystem::remove_all(work_dir);
+        append_installer_log(L"vds_filter installer failed");
         return driver_status;
       }
     }
 
     prompt_reboot();
     std::filesystem::remove_all(work_dir);
+    append_installer_log(L"vDS setup install finished");
     return 0;
   } catch (const std::exception &) {
     if (!work_dir.empty()) {
       std::error_code ignored;
       std::filesystem::remove_all(work_dir, ignored);
     }
+    append_installer_log(L"vDS setup failed unexpectedly");
     MessageBoxW(nullptr, L"vDS setup failed unexpectedly.", L"vDS Setup",
                 MB_OK | MB_ICONERROR);
     return 1;

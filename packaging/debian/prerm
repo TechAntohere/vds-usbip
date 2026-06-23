@@ -2,8 +2,23 @@
 set -e
 
 DKMS_NAME="vds_hcd"
-DKMS_VERSION="@DKMS_VERSION@"
 UNINSTALL_SERVICE="/usr/share/vds/uninstall-service.sh"
+
+remove_all_dkms_versions() {
+	dkms status -m "$DKMS_NAME" 2>/dev/null |
+	while IFS= read -r line; do
+		case "$line" in
+		"$DKMS_NAME/"*)
+			version=${line#"$DKMS_NAME"/}
+			version=${version%%,*}
+			version=${version%%:*}
+			if [ -n "$version" ]; then
+				dkms remove -m "$DKMS_NAME" -v "$version" --all || true
+			fi
+			;;
+		esac
+	done
+}
 
 case "$1" in
 remove | deconfigure)
@@ -20,9 +35,7 @@ esac
 
 case "$1" in
 remove | upgrade | deconfigure)
-	if dkms status -m "$DKMS_NAME" -v "$DKMS_VERSION" 2>/dev/null | grep -Fq "$DKMS_NAME/$DKMS_VERSION"; then
-		dkms remove -m "$DKMS_NAME" -v "$DKMS_VERSION" --all || true
-	fi
+	remove_all_dkms_versions
 	;;
 esac
 

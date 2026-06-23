@@ -45,6 +45,7 @@ enum vds_frame_type {
 	VDS_FRAME_USB_INTERFACE = 7,
 	VDS_FRAME_BT_CONTROL_PACKET = 8,
 	VDS_FRAME_BT_INTERRUPT_PACKET = 9,
+	VDS_FRAME_USB_AUDIO_IN = 10,
 };
 
 enum vds_status_flags {
@@ -64,7 +65,7 @@ enum vds_port_info_flags {
 	VDS_PORT_INFO_USB_PROFILE_VALID = 1u << 5,
 };
 
-enum vds_usb_interface_kind {
+enum vds_usb_interface_type {
 	VDS_USB_INTERFACE_HID = 0,
 	VDS_USB_INTERFACE_AUDIO_OUT = 1,
 	VDS_USB_INTERFACE_AUDIO_IN = 2,
@@ -93,7 +94,7 @@ struct vds_frame_header {
 struct vds_usb_interface_event {
 	__u8 interface_number;
 	__u8 altsetting;
-	__u8 interface_kind;
+	__u8 interface_type;
 	__u8 reserved;
 };
 

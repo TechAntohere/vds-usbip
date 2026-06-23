@@ -68,7 +68,10 @@ std::string vdsctl_usage(std::string_view version,
           "  vdsctl detach <address>\n"
           "  vdsctl list\n"
           "  vdsctl list-targets\n"
-          "  vdsctl trace on|off [--scope input[,output...]]\n";
+          "  vdsctl trace on|off [--scope <scope>[,<scope>...]]\n"
+          "\n"
+          "trace scopes:\n"
+          "  all, input, input-audio, input-control, output\n";
   return text;
 }
 
@@ -168,7 +171,7 @@ VdsctlTraceCommand parse_vdsctl_trace(int argc, char **argv) {
   const std::string_view mode = argv[2];
   VdsctlTraceCommand command{
       .enabled = false,
-      .scope = "input,output",
+      .scope = "all",
   };
   if (argc == 5) {
     if (std::string_view(argv[3]) != "--scope") {

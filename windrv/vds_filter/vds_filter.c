@@ -474,14 +474,6 @@ static NTSTATUS VdsCompleteStringIoctl(PIRP irp, PCWSTR value) {
   return STATUS_SUCCESS;
 }
 
-static NTSTATUS VdsCompleteIrpWithInformation(PIRP irp, NTSTATUS status,
-                                              ULONG_PTR information) {
-  irp->IoStatus.Status = status;
-  irp->IoStatus.Information = information;
-  IoCompleteRequest(irp, IO_NO_INCREMENT);
-  return status;
-}
-
 static BOOLEAN
 VdsDeviceListContainsAddress(const struct vds_filter_device_list *list,
                              ULONG count, const CHAR address[18]) {

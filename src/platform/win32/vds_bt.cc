@@ -172,19 +172,6 @@ std::string default_bluetooth_device_name(std::uint32_t profile) {
   return "DualSense Wireless Controller";
 }
 
-std::size_t bluetooth_feature_report_length(std::uint8_t report_id) {
-  switch (report_id) {
-  case 0x05:
-    return 41;
-  case 0x09:
-    return 20;
-  case 0x20:
-    return 64;
-  default:
-    return 64;
-  }
-}
-
 std::string compact_bluetooth_address(std::string_view address) {
   std::string compact;
   compact.reserve(address.size());
@@ -226,20 +213,6 @@ bool is_colon_bluetooth_address(std::string_view address) {
 bool is_bluetooth_address(std::string_view address) {
   return is_compact_bluetooth_address(address) ||
          is_colon_bluetooth_address(address);
-}
-
-std::string colon_bluetooth_address(std::string_view compact_address) {
-  std::string address;
-  address.reserve(17);
-  for (std::size_t index = 0; index < compact_address.size() && index < 12;
-       ++index) {
-    if (index != 0 && index % 2 == 0) {
-      address.push_back(':');
-    }
-    address.push_back(static_cast<char>(
-        std::tolower(static_cast<unsigned char>(compact_address[index]))));
-  }
-  return address;
 }
 
 std::optional<std::string>
@@ -532,13 +505,6 @@ private:
                                win32_error_message(GetLastError()));
     }
     return bytes_returned;
-  }
-
-  void push_queued_frame(std::uint16_t type,
-                         std::span<const std::uint8_t> payload) {
-    std::lock_guard guard(queue_mutex_);
-    queued_frames_.push_back(make_bluetooth_frame(type, payload, ++sequence_));
-    SetEvent(queue_event_.get());
   }
 
   std::optional<Frame> pop_queued_frame() {
@@ -1051,9 +1017,6 @@ find_filter_bluetooth_device(const std::string &address) {
   std::vector<HidBluetoothDevice> devices = list_filter_bluetooth_devices();
 
   for (auto &device : devices) {
-    if (!device.bluetooth_connected) {
-      continue;
-    }
     if (!device.filter_backed) {
       continue;
     }

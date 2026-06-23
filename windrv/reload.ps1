@@ -29,7 +29,7 @@ function Test-VdsUsbRootDevice {
   )
 
   if ($Device.InstanceId -eq "ROOT\DEVGEN\VDSUSB0" -or
-  $Device.FriendlyName -eq "vDS Virtual DualSense USB Root") {
+  $Device.FriendlyName -eq "vDS USB Root Hub") {
     return $true
   }
 

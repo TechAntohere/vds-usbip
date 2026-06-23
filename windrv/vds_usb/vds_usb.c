@@ -23,6 +23,8 @@
 #include "vds/ds5_usb.h"
 
 #define VDS_CONFIGURE_HISTORY_SIZE 8
+#define VDS_AUDIO_IN_CHANNELS 2
+#define VDS_AUDIO_IN_BYTES_PER_MS 192
 #define VDS_PCM_CHANNELS 4
 #define VDS_CONTROL_RING_SIZE (256 * 1024)
 #define VDS_HID_FEATURE_REPORT_SIZE 64
@@ -30,16 +32,26 @@
 #define VDS_USB_DESCRIPTOR_TYPE_HID 0x21
 #define VDS_USB_DESCRIPTOR_TYPE_HID_REPORT 0x22
 #define VDS_USB_REQUEST_GET_DESCRIPTOR 0x06
+#define VDS_USB_REQUEST_GET_INTERFACE 0x0a
+#define VDS_USB_REQUEST_SET_INTERFACE 0x0b
 #define VDS_USB_HID_GET_REPORT 0x01
 #define VDS_USB_HID_GET_IDLE 0x02
 #define VDS_USB_HID_GET_PROTOCOL 0x03
 #define VDS_USB_HID_SET_REPORT 0x09
 #define VDS_USB_HID_SET_IDLE 0x0a
 #define VDS_USB_HID_SET_PROTOCOL 0x0b
+#define VDS_USB_AUDIO_SET_CUR 0x01
+#define VDS_USB_AUDIO_GET_CUR 0x81
+#define VDS_USB_AUDIO_GET_MIN 0x82
+#define VDS_USB_AUDIO_GET_MAX 0x83
+#define VDS_USB_AUDIO_GET_RES 0x84
+#define VDS_USB_AUDIO_CONTROL_MUTE 0x01
+#define VDS_USB_AUDIO_CONTROL_VOLUME 0x02
 #define VDS_USB_HID_REPORT_TYPE_INPUT 0x01
 #define VDS_USB_HID_REPORT_TYPE_OUTPUT 0x02
 #define VDS_USB_HID_REPORT_TYPE_FEATURE 0x03
-static const ULONG vds_endpoint_release_delay_ms = 250;
+#define VDS_AUDIO_IN_RING_SIZE 65536
+static const ULONG vds_endpoint_release_delay_ms = 0;
 static const ULONG vds_iso_out_delay_max_us = 20000;
 static const ULONG vds_iso_out_delay_slack_compensation_us = 300;
 
@@ -57,6 +69,11 @@ typedef struct _VDS_CONFIGURE_RECORD {
 typedef struct _VDS_PORT_STATE {
   PUDECXUSBDEVICE_INIT usb_device_init;
   UDECXUSBDEVICE usb_device;
+  UDECXUSBENDPOINT default_endpoint;
+  UDECXUSBENDPOINT audio_out_endpoint;
+  UDECXUSBENDPOINT audio_in_endpoint;
+  UDECXUSBENDPOINT hid_in_endpoint;
+  UDECXUSBENDPOINT hid_out_endpoint;
   BOOLEAN usb_device_plugged;
   ULONG usb_profile;
   BOOLEAN usb_profile_valid;
@@ -74,10 +91,18 @@ typedef struct _VDS_PORT_STATE {
   BOOLEAN have_last_hid_input;
   UCHAR feature_cache[256][VDS_HID_FEATURE_REPORT_SIZE];
   BOOLEAN feature_cache_valid[256];
+  KSPIN_LOCK audio_in_lock;
+  ULONG audio_in_ring_head;
+  ULONG audio_in_ring_size;
+  UCHAR audio_in_ring[VDS_AUDIO_IN_RING_SIZE];
+  UCHAR interface_altsetting[VDS_USB_HID_INTERFACE + 1];
 } VDS_PORT_STATE, *PVDS_PORT_STATE;
 
 typedef struct _VDS_DEVICE_CONTEXT {
-  USB_BUS_INTERFACE_USBDI_V3 usb_bus_interface;
+  USB_BUS_INTERFACE_USBDI_V0 usb_bus_interface_v0;
+  USB_BUS_INTERFACE_USBDI_V1 usb_bus_interface_v1;
+  USB_BUS_INTERFACE_USBDI_V2 usb_bus_interface_v2;
+  USB_BUS_INTERFACE_USBDI_V3 usb_bus_interface_v3;
   ULONG max_port;
   LONG control_urb_count;
   LONG last_control_bm_request;
@@ -88,6 +113,16 @@ typedef struct _VDS_DEVICE_CONTEXT {
   LONG last_control_bytes_completed;
   LONG iso_out_request_count;
   LONG iso_out_byte_count;
+  LONG iso_in_request_count;
+  LONG iso_in_byte_count;
+  LONG audio_in_write_frame_count;
+  LONG audio_in_write_byte_count;
+  LONG audio_in_read_byte_count;
+  LONG audio_in_zero_byte_count;
+  LONG last_audio_in_write_sample[VDS_AUDIO_IN_CHANNELS];
+  LONG last_audio_in_write_peak[VDS_AUDIO_IN_CHANNELS];
+  LONG last_audio_in_read_sample[VDS_AUDIO_IN_CHANNELS];
+  LONG last_audio_in_read_peak[VDS_AUDIO_IN_CHANNELS];
   LONG last_pcm_frame_count;
   LONG last_pcm_sample[VDS_PCM_CHANNELS];
   LONG last_pcm_peak[VDS_PCM_CHANNELS];
@@ -116,6 +151,19 @@ typedef struct _VDS_DEVICE_CONTEXT {
   LONG endpoint_release_delay_count;
   LONG endpoint_release_delay_complete_count;
   LONG endpoint_release_delay_timer_failure_count;
+  LONG endpoint_purge_complete_count;
+  LONG audio_out_delayed_pending_count;
+  LONG audio_out_purge_pending_count;
+  LONG audio_out_purge_work_count;
+  LONG audio_out_purge_complete_count;
+  LONG audio_in_delayed_pending_count;
+  LONG audio_in_purge_pending_count;
+  LONG audio_in_purge_work_count;
+  LONG audio_in_purge_complete_count;
+  LONG hid_in_delayed_pending_count;
+  LONG hid_in_purge_pending_count;
+  LONG hid_in_purge_work_count;
+  LONG hid_in_purge_complete_count;
   WDFQUEUE urb_completion_queue;
   WDFDPC urb_completion_dpc;
   VDS_PORT_STATE port_state[VDS_MAX_PORT_COUNT];
@@ -147,6 +195,7 @@ typedef struct _VDS_UDECX_ENDPOINT_CONTEXT {
   ULONG port_index;
   WDFQUEUE queue;
   UCHAR endpoint_address;
+  BOOLEAN queue_released;
   PFN_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL evt_io_internal_device_control;
 } VDS_UDECX_ENDPOINT_CONTEXT, *PVDS_UDECX_ENDPOINT_CONTEXT;
 
@@ -172,6 +221,7 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(VDS_URB_COMPLETION_DPC_CONTEXT,
 
 typedef struct _VDS_DELAYED_URB_COMPLETION_CONTEXT {
   WDFDEVICE device;
+  WDFQUEUE queue;
   ULONG port_index;
   WDFREQUEST request;
   ULONG bytes_completed;
@@ -204,6 +254,9 @@ typedef struct _VDS_ENDPOINT_QUEUE_CONTEXT {
   UCHAR endpoint_address;
   ULONG request_count;
   ULONGLONG byte_count;
+  KSPIN_LOCK delayed_lock;
+  WDFTIMER delayed_timer;
+  WDFREQUEST delayed_request;
 } VDS_ENDPOINT_QUEUE_CONTEXT, *PVDS_ENDPOINT_QUEUE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(VDS_ENDPOINT_QUEUE_CONTEXT,
@@ -219,6 +272,13 @@ typedef struct _VDS_AUDIO_STATS {
   ULONG last_control_bytes_completed;
   ULONG iso_out_request_count;
   ULONG iso_out_byte_count;
+  ULONG iso_in_request_count;
+  ULONG iso_in_byte_count;
+  ULONG audio_in_write_frame_count;
+  ULONG audio_in_write_byte_count;
+  ULONG audio_in_read_byte_count;
+  ULONG audio_in_zero_byte_count;
+  ULONG audio_in_ring_size;
   LONG last_pcm_frame_count;
   LONG last_pcm_sample[VDS_PCM_CHANNELS];
   LONG last_pcm_peak[VDS_PCM_CHANNELS];
@@ -247,6 +307,23 @@ typedef struct _VDS_AUDIO_STATS {
   ULONG endpoint_release_delay_count;
   ULONG endpoint_release_delay_complete_count;
   ULONG endpoint_release_delay_timer_failure_count;
+  LONG last_audio_in_write_sample[VDS_AUDIO_IN_CHANNELS];
+  LONG last_audio_in_write_peak[VDS_AUDIO_IN_CHANNELS];
+  LONG last_audio_in_read_sample[VDS_AUDIO_IN_CHANNELS];
+  LONG last_audio_in_read_peak[VDS_AUDIO_IN_CHANNELS];
+  ULONG endpoint_purge_complete_count;
+  ULONG audio_out_delayed_pending_count;
+  ULONG audio_out_purge_pending_count;
+  ULONG audio_out_purge_work_count;
+  ULONG audio_out_purge_complete_count;
+  ULONG audio_in_delayed_pending_count;
+  ULONG audio_in_purge_pending_count;
+  ULONG audio_in_purge_work_count;
+  ULONG audio_in_purge_complete_count;
+  ULONG hid_in_delayed_pending_count;
+  ULONG hid_in_purge_pending_count;
+  ULONG hid_in_purge_work_count;
+  ULONG hid_in_purge_complete_count;
 } VDS_AUDIO_STATS, *PVDS_AUDIO_STATS;
 
 typedef struct _VDS_DESCRIPTOR_VIEW {
@@ -523,32 +600,105 @@ VdsUsbBusQueryControllerType(PVOID bus_context, PULONG hcdi_option_flags,
   return STATUS_SUCCESS;
 }
 
-static NTSTATUS VdsAddUsbBusInterface(WDFDEVICE device) {
-  PVDS_DEVICE_CONTEXT context;
+static VOID VdsInitializeUsbBusInterfaceV0(WDFDEVICE device,
+                                           PUSB_BUS_INTERFACE_USBDI_V0 bus) {
+  RtlZeroMemory(bus, sizeof(*bus));
+  bus->Size = sizeof(*bus);
+  bus->Version = USB_BUSIF_USBDI_VERSION_0;
+  bus->BusContext = device;
+  bus->InterfaceReference = VdsUsbBusInterfaceReference;
+  bus->InterfaceDereference = VdsUsbBusInterfaceDereference;
+  bus->GetUSBDIVersion = VdsUsbBusGetUsbdVersion;
+  bus->QueryBusTime = VdsUsbBusQueryBusTime;
+  bus->SubmitIsoOutUrb = VdsUsbBusSubmitIsoOutUrb;
+  bus->QueryBusInformation = VdsUsbBusQueryBusInformation;
+}
+
+static VOID VdsInitializeUsbBusInterfaceV1(WDFDEVICE device,
+                                           PUSB_BUS_INTERFACE_USBDI_V1 bus) {
+  RtlZeroMemory(bus, sizeof(*bus));
+  bus->Size = sizeof(*bus);
+  bus->Version = USB_BUSIF_USBDI_VERSION_1;
+  bus->BusContext = device;
+  bus->InterfaceReference = VdsUsbBusInterfaceReference;
+  bus->InterfaceDereference = VdsUsbBusInterfaceDereference;
+  bus->GetUSBDIVersion = VdsUsbBusGetUsbdVersion;
+  bus->QueryBusTime = VdsUsbBusQueryBusTime;
+  bus->SubmitIsoOutUrb = VdsUsbBusSubmitIsoOutUrb;
+  bus->QueryBusInformation = VdsUsbBusQueryBusInformation;
+  bus->IsDeviceHighSpeed = VdsUsbBusIsDeviceHighSpeed;
+}
+
+static VOID VdsInitializeUsbBusInterfaceV2(WDFDEVICE device,
+                                           PUSB_BUS_INTERFACE_USBDI_V2 bus) {
+  RtlZeroMemory(bus, sizeof(*bus));
+  bus->Size = sizeof(*bus);
+  bus->Version = USB_BUSIF_USBDI_VERSION_2;
+  bus->BusContext = device;
+  bus->InterfaceReference = VdsUsbBusInterfaceReference;
+  bus->InterfaceDereference = VdsUsbBusInterfaceDereference;
+  bus->GetUSBDIVersion = VdsUsbBusGetUsbdVersion;
+  bus->QueryBusTime = VdsUsbBusQueryBusTime;
+  bus->SubmitIsoOutUrb = VdsUsbBusSubmitIsoOutUrb;
+  bus->QueryBusInformation = VdsUsbBusQueryBusInformation;
+  bus->IsDeviceHighSpeed = VdsUsbBusIsDeviceHighSpeed;
+  bus->EnumLogEntry = VdsUsbBusEnumLogEntry;
+}
+
+static VOID VdsInitializeUsbBusInterfaceV3(WDFDEVICE device,
+                                           PUSB_BUS_INTERFACE_USBDI_V3 bus) {
+  RtlZeroMemory(bus, sizeof(*bus));
+  bus->Size = sizeof(*bus);
+  bus->Version = USB_BUSIF_USBDI_VERSION_3;
+  bus->BusContext = device;
+  bus->InterfaceReference = VdsUsbBusInterfaceReference;
+  bus->InterfaceDereference = VdsUsbBusInterfaceDereference;
+  bus->GetUSBDIVersion = VdsUsbBusGetUsbdVersion;
+  bus->QueryBusTime = VdsUsbBusQueryBusTime;
+  bus->SubmitIsoOutUrb = VdsUsbBusSubmitIsoOutUrb;
+  bus->QueryBusInformation = VdsUsbBusQueryBusInformation;
+  bus->IsDeviceHighSpeed = VdsUsbBusIsDeviceHighSpeed;
+  bus->EnumLogEntry = VdsUsbBusEnumLogEntry;
+  bus->QueryBusTimeEx = VdsUsbBusQueryBusTimeEx;
+  bus->QueryControllerType = VdsUsbBusQueryControllerType;
+}
+
+static NTSTATUS VdsRegisterUsbBusInterface(WDFDEVICE device,
+                                           PINTERFACE usb_bus_interface) {
   WDF_QUERY_INTERFACE_CONFIG interface_config;
 
-  context = VdsGetDeviceContext(device);
-  RtlZeroMemory(&context->usb_bus_interface,
-                sizeof(context->usb_bus_interface));
-  context->usb_bus_interface.Size = sizeof(context->usb_bus_interface);
-  context->usb_bus_interface.Version = USB_BUSIF_USBDI_VERSION_3;
-  context->usb_bus_interface.BusContext = device;
-  context->usb_bus_interface.InterfaceReference = VdsUsbBusInterfaceReference;
-  context->usb_bus_interface.InterfaceDereference =
-      VdsUsbBusInterfaceDereference;
-  context->usb_bus_interface.GetUSBDIVersion = VdsUsbBusGetUsbdVersion;
-  context->usb_bus_interface.QueryBusTime = VdsUsbBusQueryBusTime;
-  context->usb_bus_interface.SubmitIsoOutUrb = VdsUsbBusSubmitIsoOutUrb;
-  context->usb_bus_interface.QueryBusInformation = VdsUsbBusQueryBusInformation;
-  context->usb_bus_interface.IsDeviceHighSpeed = VdsUsbBusIsDeviceHighSpeed;
-  context->usb_bus_interface.EnumLogEntry = VdsUsbBusEnumLogEntry;
-  context->usb_bus_interface.QueryBusTimeEx = VdsUsbBusQueryBusTimeEx;
-  context->usb_bus_interface.QueryControllerType = VdsUsbBusQueryControllerType;
-
-  WDF_QUERY_INTERFACE_CONFIG_INIT(&interface_config,
-                                  (PINTERFACE)&context->usb_bus_interface,
+  WDF_QUERY_INTERFACE_CONFIG_INIT(&interface_config, usb_bus_interface,
                                   &USB_BUS_INTERFACE_USBDI_GUID, NULL);
   return WdfDeviceAddQueryInterface(device, &interface_config);
+}
+
+static NTSTATUS VdsAddUsbBusInterface(WDFDEVICE device) {
+  PVDS_DEVICE_CONTEXT context;
+  NTSTATUS status;
+
+  context = VdsGetDeviceContext(device);
+  VdsInitializeUsbBusInterfaceV0(device, &context->usb_bus_interface_v0);
+  VdsInitializeUsbBusInterfaceV1(device, &context->usb_bus_interface_v1);
+  VdsInitializeUsbBusInterfaceV2(device, &context->usb_bus_interface_v2);
+  VdsInitializeUsbBusInterfaceV3(device, &context->usb_bus_interface_v3);
+
+  status = VdsRegisterUsbBusInterface(
+      device, (PINTERFACE)&context->usb_bus_interface_v0);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  status = VdsRegisterUsbBusInterface(
+      device, (PINTERFACE)&context->usb_bus_interface_v1);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  status = VdsRegisterUsbBusInterface(
+      device, (PINTERFACE)&context->usb_bus_interface_v2);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  return VdsRegisterUsbBusInterface(device,
+                                    (PINTERFACE)&context->usb_bus_interface_v3);
 }
 
 static VOID VdsEvtEndpointReset(UDECXUSBENDPOINT endpoint, WDFREQUEST request) {
@@ -595,47 +745,61 @@ static VOID VdsCompleteUrbAsync(WDFDEVICE device, WDFREQUEST request,
                                 NTSTATUS nt_status,
                                 BOOLEAN complete_with_usbd_status) {
   PVDS_DEVICE_CONTEXT device_context;
-  PVDS_URB_REQUEST_CONTEXT request_context;
-  WDF_OBJECT_ATTRIBUTES attributes;
-  NTSTATUS status;
 
   device_context = VdsGetDeviceContext(device);
-  if (device_context->urb_completion_queue == NULL ||
-      device_context->urb_completion_dpc == NULL) {
-    UdecxUrbSetBytesCompleted(request, bytes_completed);
-    if (complete_with_usbd_status) {
-      UdecxUrbComplete(request, usbd_status);
-    } else {
-      UdecxUrbCompleteWithNtStatus(request, nt_status);
-    }
-    return;
+  UdecxUrbSetBytesCompleted(request, bytes_completed);
+  if (complete_with_usbd_status) {
+    UdecxUrbComplete(request, usbd_status);
+  } else {
+    UdecxUrbCompleteWithNtStatus(request, nt_status);
   }
+  InterlockedIncrement(&device_context->async_urb_complete_count);
+}
 
-  WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, VDS_URB_REQUEST_CONTEXT);
-  status =
-      WdfObjectAllocateContext(request, &attributes, (PVOID *)&request_context);
-  if (!NT_SUCCESS(status)) {
-    InterlockedIncrement(&device_context->async_urb_forward_failure_count);
-    UdecxUrbSetBytesCompleted(request, 0);
-    UdecxUrbCompleteWithNtStatus(request, status);
-    return;
+static VOID VdsAdjustEndpointDelayedPending(PVDS_DEVICE_CONTEXT context,
+                                            UCHAR endpoint_address,
+                                            LONG delta) {
+  if (endpoint_address == VDS_USB_AUDIO_OUT_ENDPOINT) {
+    InterlockedExchangeAdd(&context->audio_out_delayed_pending_count, delta);
+  } else if (endpoint_address == VDS_USB_AUDIO_IN_ENDPOINT) {
+    InterlockedExchangeAdd(&context->audio_in_delayed_pending_count, delta);
+  } else if (endpoint_address == VDS_USB_HID_IN_ENDPOINT) {
+    InterlockedExchangeAdd(&context->hid_in_delayed_pending_count, delta);
   }
+}
 
-  request_context->bytes_completed = bytes_completed;
-  request_context->usbd_status = usbd_status;
-  request_context->nt_status = nt_status;
-  request_context->complete_with_usbd_status = complete_with_usbd_status;
-
-  status =
-      WdfRequestForwardToIoQueue(request, device_context->urb_completion_queue);
-  if (!NT_SUCCESS(status)) {
-    InterlockedIncrement(&device_context->async_urb_forward_failure_count);
-    UdecxUrbSetBytesCompleted(request, 0);
-    UdecxUrbCompleteWithNtStatus(request, status);
-    return;
+static VOID VdsIncrementEndpointPurgePending(PVDS_DEVICE_CONTEXT context,
+                                             UCHAR endpoint_address) {
+  if (endpoint_address == VDS_USB_AUDIO_OUT_ENDPOINT) {
+    InterlockedIncrement(&context->audio_out_purge_pending_count);
+  } else if (endpoint_address == VDS_USB_AUDIO_IN_ENDPOINT) {
+    InterlockedIncrement(&context->audio_in_purge_pending_count);
+  } else if (endpoint_address == VDS_USB_HID_IN_ENDPOINT) {
+    InterlockedIncrement(&context->hid_in_purge_pending_count);
   }
+}
 
-  WdfDpcEnqueue(device_context->urb_completion_dpc);
+static VOID VdsIncrementEndpointPurgeWork(PVDS_DEVICE_CONTEXT context,
+                                          UCHAR endpoint_address) {
+  if (endpoint_address == VDS_USB_AUDIO_OUT_ENDPOINT) {
+    InterlockedIncrement(&context->audio_out_purge_work_count);
+  } else if (endpoint_address == VDS_USB_AUDIO_IN_ENDPOINT) {
+    InterlockedIncrement(&context->audio_in_purge_work_count);
+  } else if (endpoint_address == VDS_USB_HID_IN_ENDPOINT) {
+    InterlockedIncrement(&context->hid_in_purge_work_count);
+  }
+}
+
+static VOID VdsIncrementEndpointPurgeComplete(PVDS_DEVICE_CONTEXT context,
+                                              UCHAR endpoint_address) {
+  InterlockedIncrement(&context->endpoint_purge_complete_count);
+  if (endpoint_address == VDS_USB_AUDIO_OUT_ENDPOINT) {
+    InterlockedIncrement(&context->audio_out_purge_complete_count);
+  } else if (endpoint_address == VDS_USB_AUDIO_IN_ENDPOINT) {
+    InterlockedIncrement(&context->audio_in_purge_complete_count);
+  } else if (endpoint_address == VDS_USB_HID_IN_ENDPOINT) {
+    InterlockedIncrement(&context->hid_in_purge_complete_count);
+  }
 }
 
 static VOID VdsEvtDelayedConfigureCompletionTimer(WDFTIMER timer) {
@@ -688,6 +852,7 @@ static BOOLEAN VdsCompleteConfigureAfterDelay(WDFDEVICE device,
 static VOID VdsInitializePortState(PVDS_PORT_STATE port_state) {
   KeInitializeSpinLock(&port_state->control_ring_lock);
   KeInitializeSpinLock(&port_state->hid_state_lock);
+  KeInitializeSpinLock(&port_state->audio_in_lock);
   RtlZeroMemory(port_state->last_hid_input, sizeof(port_state->last_hid_input));
   port_state->last_hid_input[0] = VDS_USB_INPUT_REPORT_ID;
   port_state->last_hid_input[1] = 0x80;
@@ -834,13 +999,8 @@ static NTSTATUS VdsQueueFrame(WDFDEVICE device, ULONG port_index,
   return STATUS_SUCCESS;
 }
 
-static VOID VdsEvtDelayedUrbCompletionTimer(WDFTIMER timer) {
-  PVDS_DELAYED_URB_COMPLETION_CONTEXT timer_context;
-  PVDS_DEVICE_CONTEXT device_context;
-
-  timer_context = VdsGetDelayedUrbCompletionContext(timer);
-  device_context = VdsGetDeviceContext(timer_context->device);
-  InterlockedIncrement(&device_context->delayed_iso_urb_complete_count);
+static VOID
+VdsCompleteDelayedUrb(PVDS_DELAYED_URB_COMPLETION_CONTEXT timer_context) {
   if (timer_context->queue_frame_on_completion) {
     (VOID) VdsQueueFrame(timer_context->device, timer_context->port_index,
                          timer_context->queued_frame_type,
@@ -852,23 +1012,49 @@ static VOID VdsEvtDelayedUrbCompletionTimer(WDFTIMER timer) {
                       timer_context->bytes_completed,
                       timer_context->usbd_status, timer_context->nt_status,
                       timer_context->complete_with_usbd_status);
+}
+
+static VOID VdsEvtDelayedUrbCompletionTimer(WDFTIMER timer) {
+  PVDS_DELAYED_URB_COMPLETION_CONTEXT timer_context;
+  PVDS_ENDPOINT_QUEUE_CONTEXT queue_context;
+  PVDS_DEVICE_CONTEXT device_context;
+  KIRQL old_irql;
+
+  timer_context = VdsGetDelayedUrbCompletionContext(timer);
+  device_context = VdsGetDeviceContext(timer_context->device);
+  queue_context = VdsGetEndpointQueueContext(timer_context->queue);
+
+  KeAcquireSpinLock(&queue_context->delayed_lock, &old_irql);
+  if (queue_context->delayed_timer == timer) {
+    queue_context->delayed_timer = NULL;
+    queue_context->delayed_request = NULL;
+    VdsAdjustEndpointDelayedPending(device_context,
+                                    queue_context->endpoint_address, -1);
+  }
+  KeReleaseSpinLock(&queue_context->delayed_lock, old_irql);
+
+  InterlockedIncrement(&device_context->delayed_iso_urb_complete_count);
+  VdsCompleteDelayedUrb(timer_context);
   WdfObjectDelete(timer);
 }
 
 static BOOLEAN VdsCompleteUrbAfterDelay(
-    WDFDEVICE device, ULONG port_index, WDFREQUEST request,
-    ULONG bytes_completed, USBD_STATUS usbd_status, NTSTATUS nt_status,
+    WDFQUEUE queue, WDFREQUEST request, ULONG bytes_completed,
+    USBD_STATUS usbd_status, NTSTATUS nt_status,
     BOOLEAN complete_with_usbd_status, ULONG delay_us, USHORT queued_frame_type,
     const UCHAR *queued_frame_payload, ULONG queued_frame_length) {
+  PVDS_ENDPOINT_QUEUE_CONTEXT queue_context;
   PVDS_DELAYED_URB_COMPLETION_CONTEXT timer_context;
   PVDS_DEVICE_CONTEXT device_context;
   WDF_OBJECT_ATTRIBUTES attributes;
   WDF_TIMER_CONFIG timer_config;
   WDFTIMER timer;
   LONGLONG due_time;
+  KIRQL old_irql;
   NTSTATUS status;
 
-  device_context = VdsGetDeviceContext(device);
+  queue_context = VdsGetEndpointQueueContext(queue);
+  device_context = VdsGetDeviceContext(queue_context->device);
   if (queued_frame_length > VDS_FRAME_MAX_PAYLOAD) {
     InterlockedIncrement(&device_context->delayed_iso_urb_timer_failure_count);
     return FALSE;
@@ -879,7 +1065,7 @@ static BOOLEAN VdsCompleteUrbAfterDelay(
   timer_config.UseHighResolutionTimer = TRUE;
   WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes,
                                           VDS_DELAYED_URB_COMPLETION_CONTEXT);
-  attributes.ParentObject = device;
+  attributes.ParentObject = queue_context->device;
   status = WdfTimerCreate(&timer_config, &attributes, &timer);
   if (!NT_SUCCESS(status)) {
     InterlockedIncrement(&device_context->delayed_iso_urb_timer_failure_count);
@@ -887,8 +1073,9 @@ static BOOLEAN VdsCompleteUrbAfterDelay(
   }
 
   timer_context = VdsGetDelayedUrbCompletionContext(timer);
-  timer_context->device = device;
-  timer_context->port_index = port_index;
+  timer_context->device = queue_context->device;
+  timer_context->queue = queue;
+  timer_context->port_index = queue_context->port_index;
   timer_context->request = request;
   timer_context->bytes_completed = bytes_completed;
   timer_context->usbd_status = usbd_status;
@@ -902,21 +1089,124 @@ static BOOLEAN VdsCompleteUrbAfterDelay(
     RtlCopyMemory(timer_context->queued_frame_payload, queued_frame_payload,
                   queued_frame_length);
   }
+
+  KeAcquireSpinLock(&queue_context->delayed_lock, &old_irql);
+  if (queue_context->delayed_timer != NULL) {
+    KeReleaseSpinLock(&queue_context->delayed_lock, old_irql);
+    WdfObjectDelete(timer);
+    InterlockedIncrement(&device_context->delayed_iso_urb_timer_failure_count);
+    return FALSE;
+  }
+  queue_context->delayed_timer = timer;
+  queue_context->delayed_request = request;
+  VdsAdjustEndpointDelayedPending(device_context,
+                                  queue_context->endpoint_address, 1);
+  KeReleaseSpinLock(&queue_context->delayed_lock, old_irql);
+
   InterlockedIncrement(&device_context->delayed_iso_urb_count);
   due_time = -((LONGLONG)delay_us * 10);
   WdfTimerStart(timer, due_time);
   return TRUE;
 }
 
+static VOID VdsFlushDelayedEndpointUrb(WDFQUEUE queue) {
+  PVDS_ENDPOINT_QUEUE_CONTEXT queue_context;
+  PVDS_DEVICE_CONTEXT device_context;
+  WDFTIMER timer;
+  BOOLEAN stopped;
+  KIRQL old_irql;
+
+  queue_context = VdsGetEndpointQueueContext(queue);
+  device_context = VdsGetDeviceContext(queue_context->device);
+
+  KeAcquireSpinLock(&queue_context->delayed_lock, &old_irql);
+  timer = queue_context->delayed_timer;
+  if (timer != NULL) {
+    WdfObjectReference(timer);
+    queue_context->delayed_timer = NULL;
+    queue_context->delayed_request = NULL;
+    VdsAdjustEndpointDelayedPending(device_context,
+                                    queue_context->endpoint_address, -1);
+    VdsIncrementEndpointPurgePending(device_context,
+                                     queue_context->endpoint_address);
+  }
+  KeReleaseSpinLock(&queue_context->delayed_lock, old_irql);
+
+  if (timer == NULL) {
+    return;
+  }
+
+  stopped = WdfTimerStop(timer, TRUE);
+  if (stopped) {
+    PVDS_DELAYED_URB_COMPLETION_CONTEXT timer_context;
+
+    timer_context = VdsGetDelayedUrbCompletionContext(timer);
+    VdsIncrementEndpointPurgeWork(device_context,
+                                  queue_context->endpoint_address);
+    InterlockedIncrement(&device_context->delayed_iso_urb_complete_count);
+    VdsCompleteDelayedUrb(timer_context);
+    WdfObjectDelete(timer);
+  }
+  VdsIncrementEndpointPurgeComplete(device_context,
+                                    queue_context->endpoint_address);
+  WdfObjectDereference(timer);
+}
+
+static VOID VdsEvtEndpointStart(UDECXUSBENDPOINT endpoint) {
+  PVDS_UDECX_ENDPOINT_CONTEXT endpoint_context;
+  PVDS_DEVICE_CONTEXT device_context;
+
+  endpoint_context = VdsGetUdecxEndpointContext(endpoint);
+  device_context = VdsGetDeviceContext(endpoint_context->device);
+  InterlockedIncrement(&device_context->endpoint_start_count);
+  if (endpoint_context->queue != NULL) {
+    WdfIoQueueStart(endpoint_context->queue);
+  }
+}
+
+static VOID VdsEvtEndpointQueuePurgeComplete(WDFQUEUE queue,
+                                             WDFCONTEXT context) {
+  UDECXUSBENDPOINT endpoint;
+  PVDS_UDECX_ENDPOINT_CONTEXT endpoint_context;
+  PVDS_ENDPOINT_QUEUE_CONTEXT queue_context;
+  PVDS_DEVICE_CONTEXT device_context;
+
+  endpoint = (UDECXUSBENDPOINT)context;
+  endpoint_context = VdsGetUdecxEndpointContext(endpoint);
+  queue_context = VdsGetEndpointQueueContext(queue);
+  device_context = VdsGetDeviceContext(endpoint_context->device);
+  VdsIncrementEndpointPurgeComplete(device_context,
+                                    queue_context->endpoint_address);
+  UdecxUsbEndpointPurgeComplete(endpoint);
+}
+
+static VOID VdsEvtEndpointPurge(UDECXUSBENDPOINT endpoint) {
+  PVDS_UDECX_ENDPOINT_CONTEXT endpoint_context;
+  PVDS_DEVICE_CONTEXT device_context;
+
+  endpoint_context = VdsGetUdecxEndpointContext(endpoint);
+  device_context = VdsGetDeviceContext(endpoint_context->device);
+  InterlockedIncrement(&device_context->endpoint_purge_count);
+  if (endpoint_context->queue != NULL) {
+    VdsFlushDelayedEndpointUrb(endpoint_context->queue);
+    VdsIncrementEndpointPurgePending(device_context,
+                                     endpoint_context->endpoint_address);
+    WdfIoQueuePurge(endpoint_context->queue, VdsEvtEndpointQueuePurgeComplete,
+                    endpoint);
+    return;
+  }
+  UdecxUsbEndpointPurgeComplete(endpoint);
+}
+
 static VOID VdsQueueInterfaceEvent(WDFDEVICE device, ULONG port_index,
                                    UCHAR interface_number, UCHAR alt_setting,
-                                   UCHAR interface_kind) {
+                                   UCHAR interface_type) {
   struct vds_usb_interface_event event;
 
   RtlZeroMemory(&event, sizeof(event));
   event.interface_number = interface_number;
   event.altsetting = alt_setting;
-  event.interface_kind = interface_kind;
+  event.interface_type = interface_type;
   (VOID) VdsQueueFrame(device, port_index, VDS_FRAME_USB_INTERFACE,
                        (const UCHAR *)&event, sizeof(event));
 }
@@ -1007,6 +1297,134 @@ static VOID VdsStoreInputReport(PVDS_PORT_STATE port_state,
   KeReleaseSpinLock(&port_state->hid_state_lock, old_irql);
 }
 
+static VOID VdsAudioInRingWriteLocked(PVDS_PORT_STATE port_state,
+                                      const UCHAR *payload,
+                                      ULONG payload_size) {
+  ULONG free_size;
+  ULONG tail;
+  ULONG first;
+
+  if (payload_size >= VDS_AUDIO_IN_RING_SIZE) {
+    payload += payload_size - VDS_AUDIO_IN_RING_SIZE;
+    payload_size = VDS_AUDIO_IN_RING_SIZE;
+    port_state->audio_in_ring_head = 0;
+    port_state->audio_in_ring_size = 0;
+  }
+
+  free_size = VDS_AUDIO_IN_RING_SIZE - port_state->audio_in_ring_size;
+  if (payload_size > free_size) {
+    ULONG drop_size = payload_size - free_size;
+    port_state->audio_in_ring_head =
+        (port_state->audio_in_ring_head + drop_size) % VDS_AUDIO_IN_RING_SIZE;
+    port_state->audio_in_ring_size -= drop_size;
+  }
+
+  tail = (port_state->audio_in_ring_head + port_state->audio_in_ring_size) %
+         VDS_AUDIO_IN_RING_SIZE;
+  first = min(payload_size, VDS_AUDIO_IN_RING_SIZE - tail);
+  RtlCopyMemory(port_state->audio_in_ring + tail, payload, first);
+  if (payload_size > first) {
+    RtlCopyMemory(port_state->audio_in_ring, payload + first,
+                  payload_size - first);
+  }
+  port_state->audio_in_ring_size += payload_size;
+}
+
+static VOID VdsStoreAudioInPcm(PVDS_PORT_STATE port_state, const UCHAR *payload,
+                               ULONG payload_size) {
+  KIRQL old_irql;
+
+  if (payload == NULL || payload_size == 0) {
+    return;
+  }
+
+  KeAcquireSpinLock(&port_state->audio_in_lock, &old_irql);
+  VdsAudioInRingWriteLocked(port_state, payload, payload_size);
+  KeReleaseSpinLock(&port_state->audio_in_lock, old_irql);
+}
+
+static VOID VdsResetAudioInPcm(PVDS_PORT_STATE port_state) {
+  KIRQL old_irql;
+
+  KeAcquireSpinLock(&port_state->audio_in_lock, &old_irql);
+  port_state->audio_in_ring_head = 0;
+  port_state->audio_in_ring_size = 0;
+  KeReleaseSpinLock(&port_state->audio_in_lock, old_irql);
+}
+
+static VOID VdsRecordAudioInPcmSamples(LONG sample_stats[VDS_AUDIO_IN_CHANNELS],
+                                       LONG peak_stats[VDS_AUDIO_IN_CHANNELS],
+                                       const UCHAR *buffer, ULONG buffer_size) {
+  const SHORT *samples;
+  ULONG channel;
+  ULONG frame;
+  ULONG frame_count;
+  LONG peaks[VDS_AUDIO_IN_CHANNELS] = {};
+
+  if (buffer == NULL || buffer_size < VDS_AUDIO_IN_CHANNELS * sizeof(SHORT)) {
+    return;
+  }
+
+  samples = (const SHORT *)buffer;
+  frame_count = buffer_size / (VDS_AUDIO_IN_CHANNELS * sizeof(SHORT));
+  for (channel = 0; channel < VDS_AUDIO_IN_CHANNELS; ++channel) {
+    InterlockedExchange(&sample_stats[channel], samples[channel]);
+  }
+
+  for (frame = 0; frame < frame_count; ++frame) {
+    for (channel = 0; channel < VDS_AUDIO_IN_CHANNELS; ++channel) {
+      LONG sample_value = samples[frame * VDS_AUDIO_IN_CHANNELS + channel];
+      LONG magnitude = sample_value < 0 ? -sample_value : sample_value;
+
+      if (magnitude > peaks[channel]) {
+        peaks[channel] = magnitude;
+      }
+    }
+  }
+
+  for (channel = 0; channel < VDS_AUDIO_IN_CHANNELS; ++channel) {
+    InterlockedExchange(&peak_stats[channel], peaks[channel]);
+  }
+}
+
+static ULONG VdsAudioInRingReadLocked(PVDS_PORT_STATE port_state, UCHAR *buffer,
+                                      ULONG buffer_size) {
+  ULONG read_size;
+  ULONG first;
+
+  read_size = min(buffer_size, port_state->audio_in_ring_size);
+  first =
+      min(read_size, VDS_AUDIO_IN_RING_SIZE - port_state->audio_in_ring_head);
+  RtlCopyMemory(buffer,
+                port_state->audio_in_ring + port_state->audio_in_ring_head,
+                first);
+  if (read_size > first) {
+    RtlCopyMemory(buffer + first, port_state->audio_in_ring, read_size - first);
+  }
+  port_state->audio_in_ring_head =
+      (port_state->audio_in_ring_head + read_size) % VDS_AUDIO_IN_RING_SIZE;
+  port_state->audio_in_ring_size -= read_size;
+  return read_size;
+}
+
+static ULONG VdsCopyAudioInPcm(PVDS_PORT_STATE port_state, UCHAR *buffer,
+                               ULONG buffer_size) {
+  ULONG read_size;
+  KIRQL old_irql;
+
+  if (buffer == NULL || buffer_size == 0) {
+    return 0;
+  }
+
+  KeAcquireSpinLock(&port_state->audio_in_lock, &old_irql);
+  read_size = VdsAudioInRingReadLocked(port_state, buffer, buffer_size);
+  KeReleaseSpinLock(&port_state->audio_in_lock, old_irql);
+  if (read_size < buffer_size) {
+    RtlZeroMemory(buffer + read_size, buffer_size - read_size);
+  }
+  return read_size;
+}
+
 static ULONG VdsCopyControlResponse(UCHAR *transfer_buffer,
                                     ULONG transfer_length,
                                     const UCHAR *response,
@@ -1050,6 +1468,72 @@ static ULONG VdsCopyStringDescriptor(UCHAR *transfer_buffer,
   descriptor[1] = VDS_USB_DESCRIPTOR_TYPE_STRING;
   return VdsCopyControlResponse(transfer_buffer, transfer_length, descriptor,
                                 length, requested_length);
+}
+
+static BOOLEAN
+VdsHandleAudioClassControl(const WDF_USB_CONTROL_SETUP_PACKET *setup_packet,
+                           UCHAR *transfer_buffer, ULONG transfer_length,
+                           ULONG *bytes_completed) {
+  const UCHAR entity_id = setup_packet->Packet.wIndex.Bytes.HiByte;
+  const UCHAR interface_number = setup_packet->Packet.wIndex.Bytes.LowByte;
+  const UCHAR control_selector = setup_packet->Packet.wValue.Bytes.HiByte;
+  const BOOLEAN device_to_host =
+      setup_packet->Packet.bm.Request.Dir == BmRequestDeviceToHost;
+  UCHAR response[2] = {};
+  ULONG response_length = 0;
+
+  if (setup_packet->Packet.bm.Request.Type != BmRequestClass ||
+      setup_packet->Packet.bm.Request.Recipient != BmRequestToInterface ||
+      interface_number != VDS_USB_AUDIO_CONTROL_INTERFACE ||
+      (entity_id != VDS_USB_SPEAKER_FEATURE_UNIT &&
+       entity_id != VDS_USB_MIC_FEATURE_UNIT)) {
+    return FALSE;
+  }
+
+  if (!device_to_host) {
+    if (setup_packet->Packet.bRequest == VDS_USB_AUDIO_SET_CUR) {
+      *bytes_completed =
+          min(transfer_length, (ULONG)setup_packet->Packet.wLength);
+      return TRUE;
+    }
+    return FALSE;
+  }
+
+  if (control_selector == VDS_USB_AUDIO_CONTROL_MUTE) {
+    if (setup_packet->Packet.bRequest != VDS_USB_AUDIO_GET_CUR) {
+      return FALSE;
+    }
+    response[0] = 0;
+    response_length = 1;
+  } else if (control_selector == VDS_USB_AUDIO_CONTROL_VOLUME) {
+    switch (setup_packet->Packet.bRequest) {
+    case VDS_USB_AUDIO_GET_CUR:
+    case VDS_USB_AUDIO_GET_MAX:
+      response[0] = 0x00;
+      response[1] = 0x00;
+      response_length = 2;
+      break;
+    case VDS_USB_AUDIO_GET_MIN:
+      response[0] = 0x00;
+      response[1] = 0x80;
+      response_length = 2;
+      break;
+    case VDS_USB_AUDIO_GET_RES:
+      response[0] = 0x00;
+      response[1] = 0x01;
+      response_length = 2;
+      break;
+    default:
+      return FALSE;
+    }
+  } else {
+    return FALSE;
+  }
+
+  *bytes_completed =
+      VdsCopyControlResponse(transfer_buffer, transfer_length, response,
+                             response_length, setup_packet->Packet.wLength);
+  return TRUE;
 }
 
 static VOID VdsEvtControlUrb(WDFQUEUE queue, WDFREQUEST request,
@@ -1129,6 +1613,31 @@ static VOID VdsEvtControlUrb(WDFQUEUE queue, WDFREQUEST request,
   } else if (setup_packet.Packet.bm.Request.Dir == BmRequestDeviceToHost &&
              setup_packet.Packet.bm.Request.Type == BmRequestStandard &&
              setup_packet.Packet.bm.Request.Recipient == BmRequestToInterface &&
+             setup_packet.Packet.bRequest == VDS_USB_REQUEST_GET_INTERFACE) {
+    UCHAR response;
+
+    if (interface_number >= RTL_NUMBER_OF(port_state->interface_altsetting)) {
+      status = STATUS_INVALID_PARAMETER;
+    } else {
+      response = port_state->interface_altsetting[interface_number];
+      bytes_completed =
+          VdsCopyControlResponse(transfer_buffer, transfer_length, &response,
+                                 sizeof(response), setup_packet.Packet.wLength);
+    }
+  } else if (setup_packet.Packet.bm.Request.Dir == BmRequestHostToDevice &&
+             setup_packet.Packet.bm.Request.Type == BmRequestStandard &&
+             setup_packet.Packet.bm.Request.Recipient == BmRequestToInterface &&
+             setup_packet.Packet.bRequest == VDS_USB_REQUEST_SET_INTERFACE) {
+    if (interface_number >= RTL_NUMBER_OF(port_state->interface_altsetting)) {
+      status = STATUS_INVALID_PARAMETER;
+    } else {
+      port_state->interface_altsetting[interface_number] =
+          setup_packet.Packet.wValue.Bytes.LowByte;
+      bytes_completed = 0;
+    }
+  } else if (setup_packet.Packet.bm.Request.Dir == BmRequestDeviceToHost &&
+             setup_packet.Packet.bm.Request.Type == BmRequestStandard &&
+             setup_packet.Packet.bm.Request.Recipient == BmRequestToInterface &&
              setup_packet.Packet.bRequest == VDS_USB_REQUEST_GET_DESCRIPTOR &&
              interface_number == VDS_USB_HID_INTERFACE) {
     if (report_type == VDS_USB_DESCRIPTOR_TYPE_HID_REPORT) {
@@ -1199,6 +1708,8 @@ static VOID VdsEvtControlUrb(WDFQUEUE queue, WDFREQUEST request,
                setup_packet.Packet.bRequest == VDS_USB_HID_SET_PROTOCOL) {
       bytes_completed = 0;
     }
+  } else if (VdsHandleAudioClassControl(&setup_packet, transfer_buffer,
+                                        transfer_length, &bytes_completed)) {
   } else if (transfer_buffer != NULL && transfer_length > 0) {
     bytes_completed = transfer_length < setup_packet.Packet.wLength
                           ? transfer_length
@@ -1399,10 +1910,10 @@ static VOID VdsEvtIsoOutUrb(WDFQUEUE queue, WDFREQUEST request,
      * completion has a small positive slack on this VM, so subtract a measured
      * compensation before converting to the 100 ns relative timeout unit.
      */
-    if (!VdsCompleteUrbAfterDelay(
-            context->device, context->port_index, request, transfer_length,
-            USBD_STATUS_SUCCESS, STATUS_SUCCESS, TRUE, iso_delay_us,
-            VDS_FRAME_USB_AUDIO_OUT, transfer_buffer, transfer_length)) {
+    if (!VdsCompleteUrbAfterDelay(queue, request, transfer_length,
+                                  USBD_STATUS_SUCCESS, STATUS_SUCCESS, TRUE,
+                                  iso_delay_us, VDS_FRAME_USB_AUDIO_OUT,
+                                  transfer_buffer, transfer_length)) {
       if (transfer_buffer != NULL && transfer_length > 0) {
         (VOID) VdsQueueFrame(context->device, context->port_index,
                              VDS_FRAME_USB_AUDIO_OUT, transfer_buffer,
@@ -1441,11 +1952,21 @@ static VOID VdsEvtIsoInUrb(WDFQUEUE queue, WDFREQUEST request,
                            size_t output_buffer_length,
                            size_t input_buffer_length, ULONG io_control_code) {
   PVDS_ENDPOINT_QUEUE_CONTEXT context;
+  PVDS_DEVICE_CONTEXT device_context;
+  PVDS_PORT_STATE port_state;
   PIO_STACK_LOCATION irp_stack;
   PURB urb;
-  PVOID transfer_buffer;
+  PUCHAR mirror_buffer;
+  PUCHAR transfer_buffer;
+  ULONG current_frame;
+  ULONG frame_delay;
+  ULONG mirror_length;
   ULONG transfer_length;
+  ULONG bytes_completed;
+  ULONG read_total;
+  ULONG iso_delay_us;
   ULONG packet;
+  NTSTATUS status;
 
   UNREFERENCED_PARAMETER(output_buffer_length);
   UNREFERENCED_PARAMETER(input_buffer_length);
@@ -1460,8 +1981,6 @@ static VOID VdsEvtIsoInUrb(WDFQUEUE queue, WDFREQUEST request,
   irp_stack = IoGetCurrentIrpStackLocation(WdfRequestWdmGetIrp(request));
   urb = (PURB)irp_stack->Parameters.Others.Argument1;
   if (urb == NULL || urb->UrbHeader.Function != URB_FUNCTION_ISOCH_TRANSFER) {
-    PVDS_DEVICE_CONTEXT device_context;
-
     device_context = VdsGetDeviceContext(context->device);
     InterlockedIncrement(&device_context->non_iso_urb_count);
     InterlockedExchange(&device_context->last_non_iso_function,
@@ -1472,45 +1991,131 @@ static VOID VdsEvtIsoInUrb(WDFQUEUE queue, WDFREQUEST request,
     return;
   }
 
+  device_context = VdsGetDeviceContext(context->device);
+  if (context->port_index >= device_context->max_port) {
+    VdsCompleteUrbAsync(context->device, request, 0, USBD_STATUS_SUCCESS,
+                        STATUS_DEVICE_NOT_READY, FALSE);
+    return;
+  }
+  port_state = &device_context->port_state[context->port_index];
+
   transfer_length = urb->UrbIsochronousTransfer.TransferBufferLength;
-  transfer_buffer = urb->UrbIsochronousTransfer.TransferBuffer;
+  transfer_buffer = (PUCHAR)urb->UrbIsochronousTransfer.TransferBuffer;
   if (transfer_buffer == NULL &&
       urb->UrbIsochronousTransfer.TransferBufferMDL != NULL) {
-    transfer_buffer = MmGetSystemAddressForMdlSafe(
+    transfer_buffer = (PUCHAR)MmGetSystemAddressForMdlSafe(
         urb->UrbIsochronousTransfer.TransferBufferMDL, NormalPagePriority);
   }
-  if (transfer_buffer != NULL && transfer_length > 0) {
-    RtlZeroMemory(transfer_buffer, transfer_length);
+  mirror_buffer = NULL;
+  mirror_length = 0;
+  status = UdecxUrbRetrieveBuffer(request, &mirror_buffer, &mirror_length);
+  if (!NT_SUCCESS(status) || mirror_buffer == transfer_buffer) {
+    mirror_buffer = NULL;
+    mirror_length = 0;
   }
-
+  if (transfer_buffer == NULL && mirror_buffer != NULL) {
+    transfer_buffer = mirror_buffer;
+    if (mirror_length < transfer_length) {
+      transfer_length = mirror_length;
+    }
+    mirror_buffer = NULL;
+    mirror_length = 0;
+  }
   ++context->request_count;
-  context->byte_count += transfer_length;
+  bytes_completed = 0;
+  read_total = 0;
   urb->UrbIsochronousTransfer.ErrorCount = 0;
   for (packet = 0; packet < urb->UrbIsochronousTransfer.NumberOfPackets;
        ++packet) {
+    ULONG audio_length;
+    ULONG packet_capacity;
     ULONG packet_offset;
     ULONG next_offset;
 
     packet_offset = urb->UrbIsochronousTransfer.IsoPacket[packet].Offset;
+    if (packet_offset > transfer_length) {
+      urb->UrbIsochronousTransfer.IsoPacket[packet].Length = 0;
+      urb->UrbIsochronousTransfer.IsoPacket[packet].Status =
+          USBD_STATUS_DATA_OVERRUN;
+      continue;
+    }
     next_offset = packet + 1 < urb->UrbIsochronousTransfer.NumberOfPackets
                       ? urb->UrbIsochronousTransfer.IsoPacket[packet + 1].Offset
                       : transfer_length;
+    if (next_offset > transfer_length) {
+      next_offset = transfer_length;
+    }
 
-    urb->UrbIsochronousTransfer.IsoPacket[packet].Length =
+    packet_capacity =
         next_offset > packet_offset ? next_offset - packet_offset : 0;
+    audio_length = min(packet_capacity, (ULONG)VDS_AUDIO_IN_BYTES_PER_MS);
+    urb->UrbIsochronousTransfer.IsoPacket[packet].Length = audio_length;
+    if (transfer_buffer != NULL) {
+      read_total += VdsCopyAudioInPcm(
+          port_state, transfer_buffer + packet_offset, audio_length);
+      if (audio_length < packet_capacity) {
+        RtlZeroMemory(transfer_buffer + packet_offset + audio_length,
+                      packet_capacity - audio_length);
+      }
+    }
+    if (mirror_buffer != NULL && packet_offset < mirror_length) {
+      ULONG mirror_capacity =
+          min(packet_capacity, mirror_length - packet_offset);
+
+      if (mirror_capacity > 0) {
+        RtlCopyMemory(mirror_buffer + packet_offset,
+                      transfer_buffer + packet_offset, mirror_capacity);
+      }
+    }
+    bytes_completed += audio_length;
     urb->UrbIsochronousTransfer.IsoPacket[packet].Status = USBD_STATUS_SUCCESS;
   }
-
-  urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
-  if (context->request_count <= 16 || (context->request_count % 1000) == 0) {
-    KdPrint(("vds_usb: ISO IN ep=0x%02x request=%lu length=%lu "
-             "packets=%lu total=%llu\n",
-             context->endpoint_address, context->request_count, transfer_length,
-             urb->UrbIsochronousTransfer.NumberOfPackets, context->byte_count));
+  context->byte_count += bytes_completed;
+  if (transfer_buffer != NULL) {
+    VdsRecordAudioInPcmSamples(device_context->last_audio_in_read_sample,
+                               device_context->last_audio_in_read_peak,
+                               transfer_buffer, transfer_length);
   }
 
-  VdsCompleteUrbAsync(context->device, request, transfer_length,
-                      USBD_STATUS_SUCCESS, STATUS_SUCCESS, TRUE);
+  InterlockedIncrement(&device_context->iso_in_request_count);
+  InterlockedExchangeAdd(&device_context->iso_in_byte_count,
+                         (LONG)bytes_completed);
+  InterlockedExchange(&device_context->last_iso_packets,
+                      urb->UrbIsochronousTransfer.NumberOfPackets);
+  InterlockedExchange(&device_context->last_iso_length, (LONG)transfer_length);
+  InterlockedExchangeAdd(&device_context->audio_in_read_byte_count,
+                         (LONG)read_total);
+  InterlockedExchangeAdd(&device_context->audio_in_zero_byte_count,
+                         (LONG)(bytes_completed - read_total));
+
+  urb->UrbIsochronousTransfer.TransferBufferLength = bytes_completed;
+  urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+  frame_delay = 0;
+  if ((urb->UrbIsochronousTransfer.TransferFlags &
+       USBD_START_ISO_TRANSFER_ASAP) == 0) {
+    current_frame = (ULONG)(KeQueryInterruptTime() / 10000);
+    if ((LONG)(urb->UrbIsochronousTransfer.StartFrame - current_frame) > 0) {
+      frame_delay = urb->UrbIsochronousTransfer.StartFrame - current_frame;
+    }
+  }
+  iso_delay_us =
+      (frame_delay + urb->UrbIsochronousTransfer.NumberOfPackets) * 1000;
+  iso_delay_us = max(iso_delay_us, 1000UL);
+  iso_delay_us = min(iso_delay_us, vds_iso_out_delay_max_us);
+  if (context->request_count <= 16 || (context->request_count % 1000) == 0) {
+    KdPrint(("vds_usb: ISO IN ep=0x%02x request=%lu length=%lu complete=%lu "
+             "packets=%lu delay_us=%lu total=%llu\n",
+             context->endpoint_address, context->request_count, transfer_length,
+             bytes_completed, urb->UrbIsochronousTransfer.NumberOfPackets,
+             iso_delay_us, context->byte_count));
+  }
+
+  if (!VdsCompleteUrbAfterDelay(queue, request, bytes_completed,
+                                USBD_STATUS_SUCCESS, STATUS_SUCCESS, TRUE,
+                                iso_delay_us, 0, NULL, 0)) {
+    VdsCompleteUrbAsync(context->device, request, bytes_completed,
+                        USBD_STATUS_SUCCESS, STATUS_SUCCESS, TRUE);
+  }
 }
 
 static VOID VdsEvtHidOutUrb(WDFQUEUE queue, WDFREQUEST request,
@@ -1606,9 +2211,9 @@ static VOID VdsEvtHidInUrb(WDFQUEUE queue, WDFREQUEST request,
              bytes_completed > 0 ? transfer_buffer[0] : 0));
   }
 
-  if (!VdsCompleteUrbAfterDelay(context->device, context->port_index, request,
-                                bytes_completed, USBD_STATUS_SUCCESS,
-                                STATUS_SUCCESS, TRUE, 4, 0, NULL, 0)) {
+  if (!VdsCompleteUrbAfterDelay(queue, request, bytes_completed,
+                                USBD_STATUS_SUCCESS, STATUS_SUCCESS, TRUE, 4, 0,
+                                NULL, 0)) {
     VdsCompleteUrbAsync(context->device, request, bytes_completed,
                         USBD_STATUS_SUCCESS, STATUS_SUCCESS, TRUE);
   }
@@ -1640,6 +2245,9 @@ static NTSTATUS VdsCreateEndpointQueue(
   context->endpoint_address = endpoint_address;
   context->request_count = 0;
   context->byte_count = 0;
+  KeInitializeSpinLock(&context->delayed_lock);
+  context->delayed_timer = NULL;
+  context->delayed_request = NULL;
   return STATUS_SUCCESS;
 }
 
@@ -1666,6 +2274,7 @@ static NTSTATUS VdsAssignFreshEndpointQueue(UDECXUSBENDPOINT endpoint) {
 
   UdecxUsbEndpointSetWdfIoQueue(endpoint, queue);
   endpoint_context->queue = queue;
+  endpoint_context->queue_released = FALSE;
   WdfIoQueueStart(queue);
   InterlockedIncrement(&device_context->endpoint_queue_refresh_count);
   KdPrint(("vds_usb: fresh queue assigned ep=0x%02x\n",
@@ -1707,18 +2316,24 @@ static NTSTATUS VdsCreateUrbCompletionObjects(WDFDEVICE device) {
   return STATUS_SUCCESS;
 }
 
-static NTSTATUS VdsEvtDefaultEndpointAdd(UDECXUSBDEVICE usb_device,
-                                         PUDECXUSBENDPOINT_INIT endpoint_init) {
-  PVDS_UDECX_DEVICE_CONTEXT device_context;
+static NTSTATUS VdsCreateSimpleEndpoint(
+    UDECXUSBDEVICE usb_device, WDFDEVICE device, ULONG port_index,
+    UCHAR endpoint_address,
+    PFN_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL evt_io_internal_device_control,
+    UDECXUSBENDPOINT *endpoint_out) {
   PVDS_UDECX_ENDPOINT_CONTEXT endpoint_context;
+  PUDECXUSBENDPOINT_INIT endpoint_init;
   WDF_OBJECT_ATTRIBUTES attributes;
   UDECX_USB_ENDPOINT_CALLBACKS callbacks;
   UDECXUSBENDPOINT endpoint;
   NTSTATUS status;
 
-  device_context = VdsGetUdecxDeviceContext(usb_device);
+  endpoint_init = UdecxUsbSimpleEndpointInitAllocate(usb_device);
+  if (endpoint_init == NULL) {
+    return STATUS_INSUFFICIENT_RESOURCES;
+  }
 
-  UdecxUsbEndpointInitSetEndpointAddress(endpoint_init, 0x00);
+  UdecxUsbEndpointInitSetEndpointAddress(endpoint_init, endpoint_address);
   UDECX_USB_ENDPOINT_CALLBACKS_INIT(&callbacks, VdsEvtEndpointReset);
   UdecxUsbEndpointInitSetCallbacks(endpoint_init, &callbacks);
 
@@ -1726,65 +2341,25 @@ static NTSTATUS VdsEvtDefaultEndpointAdd(UDECXUSBDEVICE usb_device,
                                           VDS_UDECX_ENDPOINT_CONTEXT);
   status = UdecxUsbEndpointCreate(&endpoint_init, &attributes, &endpoint);
   if (!NT_SUCCESS(status)) {
+    UdecxUsbEndpointInitFree(endpoint_init);
     return status;
   }
 
   endpoint_context = VdsGetUdecxEndpointContext(endpoint);
-  endpoint_context->device = device_context->wdf_device;
-  endpoint_context->port_index = device_context->port_index;
+  endpoint_context->device = device;
+  endpoint_context->port_index = port_index;
   endpoint_context->queue = NULL;
-  endpoint_context->endpoint_address = 0x00;
-  endpoint_context->evt_io_internal_device_control = VdsEvtControlUrb;
-  return VdsAssignFreshEndpointQueue(endpoint);
-}
-
-static NTSTATUS
-VdsEvtEndpointAdd(UDECXUSBDEVICE usb_device,
-                  PUDECX_USB_ENDPOINT_INIT_AND_METADATA endpoint_to_create) {
-  PVDS_UDECX_DEVICE_CONTEXT device_context;
-  PVDS_UDECX_ENDPOINT_CONTEXT endpoint_context;
-  PUSB_ENDPOINT_DESCRIPTOR descriptor;
-  WDF_OBJECT_ATTRIBUTES attributes;
-  UDECX_USB_ENDPOINT_CALLBACKS callbacks;
-  UDECXUSBENDPOINT endpoint;
-  NTSTATUS status;
-
-  device_context = VdsGetUdecxDeviceContext(usb_device);
-  descriptor = endpoint_to_create->EndpointDescriptor;
-
-  UDECX_USB_ENDPOINT_CALLBACKS_INIT(&callbacks, VdsEvtEndpointReset);
-  UdecxUsbEndpointInitSetCallbacks(endpoint_to_create->UdecxUsbEndpointInit,
-                                   &callbacks);
-
-  WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes,
-                                          VDS_UDECX_ENDPOINT_CONTEXT);
-  status = UdecxUsbEndpointCreate(&endpoint_to_create->UdecxUsbEndpointInit,
-                                  &attributes, &endpoint);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-
-  endpoint_context = VdsGetUdecxEndpointContext(endpoint);
-  endpoint_context->device = device_context->wdf_device;
-  endpoint_context->port_index = device_context->port_index;
-  endpoint_context->queue = NULL;
-  endpoint_context->endpoint_address = descriptor->bEndpointAddress;
-  if (descriptor->bEndpointAddress == VDS_USB_HID_IN_ENDPOINT) {
-    endpoint_context->evt_io_internal_device_control = VdsEvtHidInUrb;
-  } else if (descriptor->bEndpointAddress == VDS_USB_HID_OUT_ENDPOINT) {
-    endpoint_context->evt_io_internal_device_control = VdsEvtHidOutUrb;
-  } else {
-    endpoint_context->evt_io_internal_device_control =
-        (descriptor->bEndpointAddress & 0x80) != 0 ? VdsEvtIsoInUrb
-                                                   : VdsEvtIsoOutUrb;
-  }
+  endpoint_context->queue_released = FALSE;
+  endpoint_context->endpoint_address = endpoint_address;
+  endpoint_context->evt_io_internal_device_control =
+      evt_io_internal_device_control;
   status = VdsAssignFreshEndpointQueue(endpoint);
   if (!NT_SUCCESS(status)) {
     return status;
   }
 
-  KdPrint(("vds_usb: endpoint added 0x%02x attributes=0x%02x\n",
-           descriptor->bEndpointAddress, descriptor->bmAttributes));
+  *endpoint_out = endpoint;
+  KdPrint(("vds_usb: simple endpoint added 0x%02x\n", endpoint_address));
   return STATUS_SUCCESS;
 }
 
@@ -1798,6 +2373,11 @@ static VOID VdsEvtEndpointsConfigure(UDECXUSBDEVICE usb_device,
   ULONG configure_endpoint_addresses;
   ULONG released_endpoint_addresses;
   ULONG endpoint_index;
+  BOOLEAN audio_out_configured;
+  BOOLEAN audio_out_released;
+  BOOLEAN audio_in_configured;
+  BOOLEAN audio_in_released;
+  BOOLEAN interface_setting_change;
   NTSTATUS status;
 
   udecx_context = VdsGetUdecxDeviceContext(usb_device);
@@ -1824,27 +2404,59 @@ static VOID VdsEvtEndpointsConfigure(UDECXUSBDEVICE usb_device,
   configure_record->alt_setting = params->NewInterfaceSetting;
   configure_record->endpoints_to_configure = params->EndpointsToConfigureCount;
   configure_record->released_endpoints = params->ReleasedEndpointsCount;
+  interface_setting_change = params->ConfigureType ==
+                             UdecxEndpointsConfigureTypeInterfaceSettingChange;
+  audio_out_configured = FALSE;
+  audio_out_released = FALSE;
+  audio_in_configured = FALSE;
+  audio_in_released = FALSE;
   configure_endpoint_addresses = 0;
-  for (endpoint_index = 0; endpoint_index < params->EndpointsToConfigureCount &&
-                           endpoint_index < sizeof(ULONG);
+  if (interface_setting_change &&
+      params->InterfaceNumber <
+          RTL_NUMBER_OF(device_context->port_state[udecx_context->port_index]
+                            .interface_altsetting)) {
+    device_context->port_state[udecx_context->port_index]
+        .interface_altsetting[params->InterfaceNumber] =
+        (UCHAR)params->NewInterfaceSetting;
+  }
+  for (endpoint_index = 0; endpoint_index < params->EndpointsToConfigureCount;
        ++endpoint_index) {
     PVDS_UDECX_ENDPOINT_CONTEXT endpoint_context;
 
     endpoint_context = VdsGetUdecxEndpointContext(
         params->EndpointsToConfigure[endpoint_index]);
-    configure_endpoint_addresses |= (ULONG)endpoint_context->endpoint_address
-                                    << (endpoint_index * 8);
+    if (endpoint_context->endpoint_address == VDS_USB_AUDIO_OUT_ENDPOINT) {
+      audio_out_configured = TRUE;
+    }
+    if (endpoint_context->endpoint_address == VDS_USB_AUDIO_IN_ENDPOINT) {
+      audio_in_configured = TRUE;
+    }
+    if (endpoint_index < sizeof(ULONG)) {
+      configure_endpoint_addresses |= (ULONG)endpoint_context->endpoint_address
+                                      << (endpoint_index * 8);
+    }
   }
   released_endpoint_addresses = 0;
-  for (endpoint_index = 0; endpoint_index < params->ReleasedEndpointsCount &&
-                           endpoint_index < sizeof(ULONG);
+  for (endpoint_index = 0; endpoint_index < params->ReleasedEndpointsCount;
        ++endpoint_index) {
     PVDS_UDECX_ENDPOINT_CONTEXT endpoint_context;
 
     endpoint_context =
         VdsGetUdecxEndpointContext(params->ReleasedEndpoints[endpoint_index]);
-    released_endpoint_addresses |= (ULONG)endpoint_context->endpoint_address
-                                   << (endpoint_index * 8);
+    if (endpoint_context->queue != NULL) {
+      VdsFlushDelayedEndpointUrb(endpoint_context->queue);
+    }
+    endpoint_context->queue_released = TRUE;
+    if (endpoint_context->endpoint_address == VDS_USB_AUDIO_OUT_ENDPOINT) {
+      audio_out_released = TRUE;
+    }
+    if (endpoint_context->endpoint_address == VDS_USB_AUDIO_IN_ENDPOINT) {
+      audio_in_released = TRUE;
+    }
+    if (endpoint_index < sizeof(ULONG)) {
+      released_endpoint_addresses |= (ULONG)endpoint_context->endpoint_address
+                                     << (endpoint_index * 8);
+    }
   }
   configure_record->configure_endpoint_addresses = configure_endpoint_addresses;
   configure_record->released_endpoint_addresses = released_endpoint_addresses;
@@ -1856,35 +2468,72 @@ static VOID VdsEvtEndpointsConfigure(UDECXUSBDEVICE usb_device,
            params->ReleasedEndpointsCount, configure_endpoint_addresses,
            released_endpoint_addresses));
 
-  if (params->InterfaceNumber == 1) {
+  for (endpoint_index = 0; endpoint_index < params->EndpointsToConfigureCount;
+       ++endpoint_index) {
+    PVDS_UDECX_ENDPOINT_CONTEXT endpoint_context;
+
+    endpoint_context = VdsGetUdecxEndpointContext(
+        params->EndpointsToConfigure[endpoint_index]);
+    if (endpoint_context->queue_released || endpoint_context->queue == NULL) {
+      status = VdsAssignFreshEndpointQueue(
+          params->EndpointsToConfigure[endpoint_index]);
+      if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(request, status);
+        return;
+      }
+    }
+  }
+
+  if (audio_out_released && !audio_out_configured) {
+    device_context->port_state[udecx_context->port_index]
+        .interface_altsetting[VDS_USB_AUDIO_OUT_INTERFACE] = 0;
     VdsQueueInterfaceEvent(udecx_context->wdf_device, udecx_context->port_index,
-                           (UCHAR)params->InterfaceNumber,
+                           VDS_USB_AUDIO_OUT_INTERFACE, 0,
+                           VDS_USB_INTERFACE_AUDIO_OUT);
+  } else if (interface_setting_change &&
+             params->InterfaceNumber == VDS_USB_AUDIO_OUT_INTERFACE) {
+    VdsQueueInterfaceEvent(udecx_context->wdf_device, udecx_context->port_index,
+                           VDS_USB_AUDIO_OUT_INTERFACE,
                            (UCHAR)params->NewInterfaceSetting,
                            VDS_USB_INTERFACE_AUDIO_OUT);
-  } else if (params->InterfaceNumber == 2) {
+  }
+  if (audio_in_released && !audio_in_configured) {
+    device_context->port_state[udecx_context->port_index]
+        .interface_altsetting[VDS_USB_AUDIO_IN_INTERFACE] = 0;
     VdsQueueInterfaceEvent(udecx_context->wdf_device, udecx_context->port_index,
-                           (UCHAR)params->InterfaceNumber,
+                           VDS_USB_AUDIO_IN_INTERFACE, 0,
+                           VDS_USB_INTERFACE_AUDIO_IN);
+  } else if (interface_setting_change &&
+             params->InterfaceNumber == VDS_USB_AUDIO_IN_INTERFACE) {
+    VdsQueueInterfaceEvent(udecx_context->wdf_device, udecx_context->port_index,
+                           VDS_USB_AUDIO_IN_INTERFACE,
                            (UCHAR)params->NewInterfaceSetting,
                            VDS_USB_INTERFACE_AUDIO_IN);
-  } else if (params->InterfaceNumber == VDS_USB_HID_INTERFACE) {
+  } else if (audio_in_configured) {
+    device_context->port_state[udecx_context->port_index]
+        .interface_altsetting[VDS_USB_AUDIO_IN_INTERFACE] = 1;
+    VdsQueueInterfaceEvent(udecx_context->wdf_device, udecx_context->port_index,
+                           VDS_USB_AUDIO_IN_INTERFACE, 1,
+                           VDS_USB_INTERFACE_AUDIO_IN);
+  }
+  if (interface_setting_change &&
+      params->InterfaceNumber == VDS_USB_HID_INTERFACE) {
     VdsQueueInterfaceEvent(udecx_context->wdf_device, udecx_context->port_index,
                            (UCHAR)params->InterfaceNumber,
                            (UCHAR)params->NewInterfaceSetting,
                            VDS_USB_INTERFACE_HID);
   }
 
-  /* Endpoint queues are assigned when UdeCx creates each endpoint. */
-  status = STATUS_SUCCESS;
-
-  if (NT_SUCCESS(status) && params->ReleasedEndpointsCount > 0) {
-    /* Complete release synchronously unless a nonzero delay is selected. */
+  if (params->ReleasedEndpointsCount > 0 &&
+      params->EndpointsToConfigureCount == 0) {
     if (VdsCompleteConfigureAfterDelay(udecx_context->wdf_device, request,
-                                       status, vds_endpoint_release_delay_ms)) {
+                                       STATUS_SUCCESS,
+                                       vds_endpoint_release_delay_ms)) {
       return;
     }
   }
 
-  WdfRequestComplete(request, status);
+  WdfRequestComplete(request, STATUS_SUCCESS);
 }
 
 static NTSTATUS VdsEvtDeviceLinkPowerEntry(WDFDEVICE device,
@@ -1945,6 +2594,11 @@ static NTSTATUS VdsDeleteUsbChildDevice(WDFDEVICE device, ULONG port_index) {
   KeAcquireSpinLock(&context->port_state_lock, &old_irql);
   if (port_state->usb_device == usb_device) {
     port_state->usb_device = NULL;
+    port_state->default_endpoint = NULL;
+    port_state->audio_out_endpoint = NULL;
+    port_state->audio_in_endpoint = NULL;
+    port_state->hid_in_endpoint = NULL;
+    port_state->hid_out_endpoint = NULL;
     port_state->usb_device_plugged = FALSE;
     port_state->usb_profile = 0;
     port_state->usb_profile_valid = FALSE;
@@ -1994,8 +2648,6 @@ static NTSTATUS VdsCreateUsbChildDevice(WDFDEVICE device, ULONG port_index) {
   }
 
   UDECX_USB_DEVICE_CALLBACKS_INIT(&callbacks);
-  callbacks.EvtUsbDeviceDefaultEndpointAdd = VdsEvtDefaultEndpointAdd;
-  callbacks.EvtUsbDeviceEndpointAdd = VdsEvtEndpointAdd;
   callbacks.EvtUsbDeviceEndpointsConfigure = VdsEvtEndpointsConfigure;
   callbacks.EvtUsbDeviceLinkPowerEntry = VdsEvtDeviceLinkPowerEntry;
   callbacks.EvtUsbDeviceLinkPowerExit = VdsEvtDeviceLinkPowerExit;
@@ -2004,7 +2656,7 @@ static NTSTATUS VdsCreateUsbChildDevice(WDFDEVICE device, ULONG port_index) {
 
   UdecxUsbDeviceInitSetSpeed(port_state->usb_device_init, UdecxUsbHighSpeed);
   UdecxUsbDeviceInitSetEndpointsType(port_state->usb_device_init,
-                                     UdecxEndpointTypeDynamic);
+                                     UdecxEndpointTypeSimple);
 
   status = UdecxUsbDeviceInitAddDescriptor(port_state->usb_device_init,
                                            (PUCHAR)device_descriptor.data,
@@ -2051,6 +2703,36 @@ static NTSTATUS VdsCreateUsbChildDevice(WDFDEVICE device, ULONG port_index) {
   udecx_context = VdsGetUdecxDeviceContext(port_state->usb_device);
   udecx_context->wdf_device = device;
   udecx_context->port_index = port_index;
+  status =
+      VdsCreateSimpleEndpoint(port_state->usb_device, device, port_index, 0x00,
+                              VdsEvtControlUrb, &port_state->default_endpoint);
+  if (!NT_SUCCESS(status)) {
+    return VdsStageFailure(status, 0x107);
+  }
+  status = VdsCreateSimpleEndpoint(port_state->usb_device, device, port_index,
+                                   VDS_USB_AUDIO_OUT_ENDPOINT, VdsEvtIsoOutUrb,
+                                   &port_state->audio_out_endpoint);
+  if (!NT_SUCCESS(status)) {
+    return VdsStageFailure(status, 0x108);
+  }
+  status = VdsCreateSimpleEndpoint(port_state->usb_device, device, port_index,
+                                   VDS_USB_AUDIO_IN_ENDPOINT, VdsEvtIsoInUrb,
+                                   &port_state->audio_in_endpoint);
+  if (!NT_SUCCESS(status)) {
+    return VdsStageFailure(status, 0x109);
+  }
+  status = VdsCreateSimpleEndpoint(port_state->usb_device, device, port_index,
+                                   VDS_USB_HID_IN_ENDPOINT, VdsEvtHidInUrb,
+                                   &port_state->hid_in_endpoint);
+  if (!NT_SUCCESS(status)) {
+    return VdsStageFailure(status, 0x10a);
+  }
+  status = VdsCreateSimpleEndpoint(port_state->usb_device, device, port_index,
+                                   VDS_USB_HID_OUT_ENDPOINT, VdsEvtHidOutUrb,
+                                   &port_state->hid_out_endpoint);
+  if (!NT_SUCCESS(status)) {
+    return VdsStageFailure(status, 0x10b);
+  }
   port_state->usb_profile = profile;
   port_state->usb_profile_valid = TRUE;
 
@@ -2122,8 +2804,10 @@ static VOID VdsEvtDeviceContextCleanup(WDFOBJECT device_object) {
 
 static VOID VdsCompleteAudioStats(WDFDEVICE device, WDFREQUEST request) {
   PVDS_DEVICE_CONTEXT context;
+  PVDS_PORT_STATE port_state;
   PVDS_AUDIO_STATS stats;
   ULONG channel;
+  KIRQL old_irql;
   NTSTATUS status;
 
   status = WdfRequestRetrieveOutputBuffer(request, sizeof(*stats),
@@ -2152,6 +2836,32 @@ static VOID VdsCompleteAudioStats(WDFDEVICE device, WDFREQUEST request) {
       (ULONG)InterlockedOr(&context->iso_out_request_count, 0);
   stats->iso_out_byte_count =
       (ULONG)InterlockedOr(&context->iso_out_byte_count, 0);
+  stats->iso_in_request_count =
+      (ULONG)InterlockedOr(&context->iso_in_request_count, 0);
+  stats->iso_in_byte_count =
+      (ULONG)InterlockedOr(&context->iso_in_byte_count, 0);
+  stats->audio_in_write_frame_count =
+      (ULONG)InterlockedOr(&context->audio_in_write_frame_count, 0);
+  stats->audio_in_write_byte_count =
+      (ULONG)InterlockedOr(&context->audio_in_write_byte_count, 0);
+  stats->audio_in_read_byte_count =
+      (ULONG)InterlockedOr(&context->audio_in_read_byte_count, 0);
+  stats->audio_in_zero_byte_count =
+      (ULONG)InterlockedOr(&context->audio_in_zero_byte_count, 0);
+  port_state = &context->port_state[0];
+  KeAcquireSpinLock(&port_state->audio_in_lock, &old_irql);
+  stats->audio_in_ring_size = port_state->audio_in_ring_size;
+  KeReleaseSpinLock(&port_state->audio_in_lock, old_irql);
+  for (channel = 0; channel < VDS_AUDIO_IN_CHANNELS; ++channel) {
+    stats->last_audio_in_write_sample[channel] =
+        (LONG)InterlockedOr(&context->last_audio_in_write_sample[channel], 0);
+    stats->last_audio_in_write_peak[channel] =
+        (LONG)InterlockedOr(&context->last_audio_in_write_peak[channel], 0);
+    stats->last_audio_in_read_sample[channel] =
+        (LONG)InterlockedOr(&context->last_audio_in_read_sample[channel], 0);
+    stats->last_audio_in_read_peak[channel] =
+        (LONG)InterlockedOr(&context->last_audio_in_read_peak[channel], 0);
+  }
   stats->last_pcm_frame_count =
       (LONG)InterlockedOr(&context->last_pcm_frame_count, 0);
   for (channel = 0; channel < VDS_PCM_CHANNELS; ++channel) {
@@ -2205,6 +2915,32 @@ static VOID VdsCompleteAudioStats(WDFDEVICE device, WDFREQUEST request) {
       (ULONG)InterlockedOr(&context->endpoint_release_delay_complete_count, 0);
   stats->endpoint_release_delay_timer_failure_count = (ULONG)InterlockedOr(
       &context->endpoint_release_delay_timer_failure_count, 0);
+  stats->endpoint_purge_complete_count =
+      (ULONG)InterlockedOr(&context->endpoint_purge_complete_count, 0);
+  stats->audio_out_delayed_pending_count =
+      (ULONG)InterlockedOr(&context->audio_out_delayed_pending_count, 0);
+  stats->audio_out_purge_pending_count =
+      (ULONG)InterlockedOr(&context->audio_out_purge_pending_count, 0);
+  stats->audio_out_purge_work_count =
+      (ULONG)InterlockedOr(&context->audio_out_purge_work_count, 0);
+  stats->audio_out_purge_complete_count =
+      (ULONG)InterlockedOr(&context->audio_out_purge_complete_count, 0);
+  stats->audio_in_delayed_pending_count =
+      (ULONG)InterlockedOr(&context->audio_in_delayed_pending_count, 0);
+  stats->audio_in_purge_pending_count =
+      (ULONG)InterlockedOr(&context->audio_in_purge_pending_count, 0);
+  stats->audio_in_purge_work_count =
+      (ULONG)InterlockedOr(&context->audio_in_purge_work_count, 0);
+  stats->audio_in_purge_complete_count =
+      (ULONG)InterlockedOr(&context->audio_in_purge_complete_count, 0);
+  stats->hid_in_delayed_pending_count =
+      (ULONG)InterlockedOr(&context->hid_in_delayed_pending_count, 0);
+  stats->hid_in_purge_pending_count =
+      (ULONG)InterlockedOr(&context->hid_in_purge_pending_count, 0);
+  stats->hid_in_purge_work_count =
+      (ULONG)InterlockedOr(&context->hid_in_purge_work_count, 0);
+  stats->hid_in_purge_complete_count =
+      (ULONG)InterlockedOr(&context->hid_in_purge_complete_count, 0);
   WdfRequestCompleteWithInformation(request, STATUS_SUCCESS, sizeof(*stats));
 }
 
@@ -2309,6 +3045,7 @@ static VOID VdsBindPort(PVDS_CONTROL_DEVICE_CONTEXT control_context,
   port_state->bound = TRUE;
   port_state->bound_file = file_object;
   KeReleaseSpinLock(&device_context->port_state_lock, old_irql);
+  VdsResetAudioInPcm(port_state);
 
   status = VdsPlugUsbChildDevice(control_context->parent_device,
                                  control_context->port_index);
@@ -2359,6 +3096,7 @@ static VOID VdsUnbindPort(PVDS_CONTROL_DEVICE_CONTEXT control_context,
   KeReleaseSpinLock(&device_context->port_state_lock, old_irql);
 
   if (NT_SUCCESS(status)) {
+    VdsResetAudioInPcm(port_state);
     status = VdsDeleteUsbChildDevice(control_context->parent_device,
                                      control_context->port_index);
   }
@@ -2475,6 +3213,16 @@ static VOID VdsEvtControlWrite(WDFQUEUE queue, WDFREQUEST request,
       VdsUpdateFeatureCache(
           &device_context->port_state[control_context->port_index], payload,
           header.length);
+    } else if (header.type == VDS_FRAME_USB_AUDIO_IN) {
+      InterlockedIncrement(&device_context->audio_in_write_frame_count);
+      InterlockedExchangeAdd(&device_context->audio_in_write_byte_count,
+                             (LONG)header.length);
+      VdsRecordAudioInPcmSamples(device_context->last_audio_in_write_sample,
+                                 device_context->last_audio_in_write_peak,
+                                 payload, header.length);
+      VdsStoreAudioInPcm(
+          &device_context->port_state[control_context->port_index], payload,
+          header.length);
     }
 
     offset += frame_size;
@@ -2560,6 +3308,7 @@ static VOID VdsEvtControlFileCleanup(WDFFILEOBJECT file_object) {
   KeReleaseSpinLock(&device_context->port_state_lock, old_irql);
 
   if (unbound) {
+    VdsResetAudioInPcm(port_state);
     KdPrint(("vds_usb: port %lu unbound by file cleanup\n",
              control_context->port_index));
   }
