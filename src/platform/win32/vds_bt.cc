@@ -923,10 +923,11 @@ std::string find_hid_bluetooth_device_path(const std::string &address) {
   return *first_match;
 }
 
-UniqueHandle open_filter_control_handle() {
-  UniqueHandle handle(CreateFileA(kVdsFilterControlPath, GENERIC_READ,
+UniqueHandle open_filter_control_handle(DWORD desired_access = GENERIC_READ,
+                                        DWORD flags = FILE_ATTRIBUTE_NORMAL) {
+  UniqueHandle handle(CreateFileA(kVdsFilterControlPath, desired_access,
                                   kDeviceShareMode, nullptr, OPEN_EXISTING,
-                                  FILE_ATTRIBUTE_NORMAL, nullptr));
+                                  flags, nullptr));
   if (handle) {
     return handle;
   }
@@ -960,11 +961,11 @@ bool filter_provider_available() {
   return static_cast<bool>(open_filter_control_handle());
 }
 
-std::vector<HidBluetoothDevice> list_filter_bluetooth_devices() {
-  std::vector<HidBluetoothDevice> devices;
+HidBluetoothDeviceSnapshot list_filter_bluetooth_device_snapshot() {
+  HidBluetoothDeviceSnapshot snapshot;
   UniqueHandle handle = open_filter_control_handle();
   if (!handle) {
-    return devices;
+    return snapshot;
   }
 
   vds_filter_device_list list{};
@@ -981,9 +982,10 @@ std::vector<HidBluetoothDevice> list_filter_bluetooth_devices() {
     throw std::runtime_error("invalid vds_filter device list reply");
   }
 
+  snapshot.generation = list.generation;
   const std::uint32_t count =
       std::min<std::uint32_t>(list.count, VDS_FILTER_MAX_DEVICES);
-  devices.reserve(count);
+  snapshot.devices.reserve(count);
   for (std::uint32_t index = 0; index < count; ++index) {
     const std::string address = address_from_filter_info(list.devices[index]);
     const auto info = query_bluetooth_device_info(address);
@@ -991,7 +993,7 @@ std::vector<HidBluetoothDevice> list_filter_bluetooth_devices() {
     if (name.empty()) {
       name = default_bluetooth_device_name(list.devices[index].profile);
     }
-    devices.push_back(HidBluetoothDevice{
+    snapshot.devices.push_back(HidBluetoothDevice{
         .path = address,
         .address = address,
         .name = std::move(name),
@@ -1005,7 +1007,109 @@ std::vector<HidBluetoothDevice> list_filter_bluetooth_devices() {
                               VDS_FILTER_DEVICE_ACCESS_RESTRICTED) != 0,
     });
   }
-  return devices;
+  return snapshot;
+}
+
+std::vector<HidBluetoothDevice> list_filter_bluetooth_devices() {
+  return list_filter_bluetooth_device_snapshot().devices;
+}
+
+FilterBluetoothDeviceChangeWait::FilterBluetoothDeviceChangeWait()
+    : event_(CreateEventA(nullptr, TRUE, FALSE, nullptr)) {
+  if (!event_) {
+    throw std::runtime_error("failed to create vds_filter wait event: " +
+                             win32_error_message(GetLastError()));
+  }
+}
+
+FilterBluetoothDeviceChangeWait::~FilterBluetoothDeviceChangeWait() {
+  try {
+    cancel();
+  } catch (...) {
+  }
+}
+
+bool FilterBluetoothDeviceChangeWait::arm(std::uint32_t generation) {
+  if (pending_) {
+    return false;
+  }
+
+  if (!handle_) {
+    handle_ = open_filter_control_handle(GENERIC_READ | GENERIC_WRITE,
+                                         FILE_ATTRIBUTE_NORMAL |
+                                             FILE_FLAG_OVERLAPPED);
+    if (!handle_) {
+      return false;
+    }
+  }
+
+  ResetEvent(event_.get());
+  overlapped_ = OVERLAPPED{};
+  overlapped_.hEvent = event_.get();
+  change_ = vds_filter_device_change{
+      .version = VDS_FILTER_DEVICE_CHANGE_VERSION,
+      .size = static_cast<std::uint32_t>(sizeof(vds_filter_device_change)),
+      .generation = generation,
+      .reserved = 0,
+  };
+  DWORD bytes_returned = 0;
+  if (DeviceIoControl(handle_.get(), VDS_FILTER_IOCTL_WAIT_DEVICE_CHANGE,
+                      &change_, sizeof(change_), &change_, sizeof(change_),
+                      &bytes_returned, &overlapped_)) {
+    return true;
+  }
+
+  const DWORD error = GetLastError();
+  if (error != ERROR_IO_PENDING) {
+    throw std::runtime_error("failed to wait for vds_filter device change: " +
+                             win32_error_message(error));
+  }
+
+  pending_ = true;
+  return false;
+}
+
+bool FilterBluetoothDeviceChangeWait::complete() {
+  if (!pending_) {
+    return false;
+  }
+
+  DWORD bytes_returned = 0;
+  if (!GetOverlappedResult(handle_.get(), &overlapped_, &bytes_returned,
+                           FALSE)) {
+    const DWORD error = GetLastError();
+    pending_ = false;
+    if (error == ERROR_OPERATION_ABORTED) {
+      return false;
+    }
+    throw std::runtime_error("failed to complete vds_filter device wait: " +
+                             win32_error_message(error));
+  }
+  pending_ = false;
+  return true;
+}
+
+void FilterBluetoothDeviceChangeWait::cancel() {
+  if (!pending_) {
+    return;
+  }
+
+  if (!CancelIoEx(handle_.get(), &overlapped_) &&
+      GetLastError() != ERROR_NOT_FOUND) {
+    pending_ = false;
+    handle_.reset();
+    return;
+  }
+
+  DWORD bytes_returned = 0;
+  if (!GetOverlappedResult(handle_.get(), &overlapped_, &bytes_returned,
+                           TRUE) &&
+      GetLastError() != ERROR_OPERATION_ABORTED) {
+    pending_ = false;
+    handle_.reset();
+    return;
+  }
+  pending_ = false;
 }
 
 std::optional<HidBluetoothDevice>

@@ -10,7 +10,6 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -126,9 +125,11 @@ using vds::hidp_output_packet;
 using vds::win::BluetoothTransport;
 using vds::win::describe_bluetooth_lookup;
 using vds::win::filter_provider_available;
-using vds::win::find_filter_bluetooth_device;
+using vds::win::FilterBluetoothDeviceChangeWait;
 using vds::win::Frame;
 using vds::win::HidBluetoothDevice;
+using vds::win::HidBluetoothDeviceSnapshot;
+using vds::win::list_filter_bluetooth_device_snapshot;
 using vds::win::list_filter_bluetooth_devices;
 using vds::win::make_filter_bluetooth_transport;
 using vds::win::UniqueHandle;
@@ -445,42 +446,29 @@ vds::ConfigDb load_config_db_for_attempt(const Options &options,
 
 std::optional<HidBluetoothDevice>
 find_connected_bluetooth_device(const std::string &address,
+                                std::span<const HidBluetoothDevice> devices,
                                 std::string *failure_reason = nullptr) {
-  try {
-    if (const auto device = find_filter_bluetooth_device(address)) {
-      if (device->filter_backed && device->report_target &&
-          device->access_restricted) {
-        return device;
-      }
-      if (failure_reason != nullptr) {
-        *failure_reason =
-            "Sony Bluetooth HID is visible to vds_filter for address=" +
-            address + " but physical HID access is not restricted";
-      }
-      return std::nullopt;
+  for (const auto &device : devices) {
+    if (vds::normalize_bluetooth_address(device.address) != address) {
+      continue;
     }
-    for (const auto &device : list_filter_bluetooth_devices()) {
-      if (vds::normalize_bluetooth_address(device.address) == address) {
-        if (failure_reason != nullptr) {
-          if (!device.bluetooth_connected) {
-            *failure_reason = "Windows Bluetooth reports address=" + address +
-                              " connected=no";
-          } else if (device.report_target && !device.access_restricted) {
-            *failure_reason =
-                "vds_filter sees Bluetooth HID report target for address=" +
-                address + " but physical HID access is not restricted";
-          } else {
-            *failure_reason =
-                "vds_filter sees Bluetooth service for address=" + address +
-                " but no HID report target is present";
-          }
-        }
-        return std::nullopt;
-      }
+    if (device.filter_backed && device.report_target &&
+        device.access_restricted) {
+      return device;
     }
-  } catch (const std::exception &error) {
     if (failure_reason != nullptr) {
-      *failure_reason = std::string("vds_filter query failed: ") + error.what();
+      if (!device.bluetooth_connected) {
+        *failure_reason =
+            "Windows Bluetooth reports address=" + address + " connected=no";
+      } else if (device.report_target && !device.access_restricted) {
+        *failure_reason =
+            "vds_filter sees Bluetooth HID report target for address=" +
+            address + " but physical HID access is not restricted";
+      } else {
+        *failure_reason =
+            "vds_filter sees Bluetooth service for address=" + address +
+            " but no HID report target is present";
+      }
     }
     return std::nullopt;
   }
@@ -491,6 +479,21 @@ find_connected_bluetooth_device(const std::string &address,
                       address + "; " + describe_bluetooth_lookup(address);
   }
   return std::nullopt;
+}
+
+std::optional<HidBluetoothDevice>
+find_connected_bluetooth_device(const std::string &address,
+                                std::string *failure_reason = nullptr) {
+  try {
+    return find_connected_bluetooth_device(
+        address, list_filter_bluetooth_device_snapshot().devices,
+        failure_reason);
+  } catch (const std::exception &error) {
+    if (failure_reason != nullptr) {
+      *failure_reason = std::string("vds_filter query failed: ") + error.what();
+    }
+    return std::nullopt;
+  }
 }
 
 std::vector<vds::ControllerTarget> list_windows_controller_targets() {
@@ -2257,6 +2260,7 @@ struct BridgeWorker {
   unsigned port = 0;
   vds::ControllerProfile profile = vds::ControllerProfile::Unspecified;
   std::string last_error;
+  UniqueHandle done_event;
   std::thread thread;
   std::atomic_bool stop_requested = false;
   std::atomic_bool done = false;
@@ -2265,78 +2269,291 @@ struct BridgeWorker {
 class ControlPipeServer {
 public:
   ControlPipeServer(std::string pipe_name, vds::Logger &logger)
-      : logger_(logger), pipe_name_(std::move(pipe_name)) {
-    pipe_.reset(CreateNamedPipeA(pipe_name_.c_str(), PIPE_ACCESS_DUPLEX,
-                                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE |
-                                     PIPE_NOWAIT,
-                                 1, 4096, 4096, 0, nullptr));
-    if (!pipe_) {
-      logger_.log(vds::LogScope::Control, vds::LogLevel::Error,
-                  "failed to create control pipe " + pipe_name_ + ": " +
-                      win32_error_message(GetLastError()));
+      : logger_(logger), pipe_name_(std::move(pipe_name)),
+        stop_event_(CreateEventA(nullptr, TRUE, FALSE, nullptr)),
+        command_event_(CreateEventA(nullptr, TRUE, FALSE, nullptr)) {
+    if (!stop_event_ || !command_event_) {
+      throw std::runtime_error("failed to create control pipe event: " +
+                               win32_error_message(GetLastError()));
+    }
+    thread_ = std::thread([this] { thread_main(); });
+  }
+
+  ~ControlPipeServer() { stop(); }
+
+  ControlPipeServer(const ControlPipeServer &) = delete;
+  ControlPipeServer &operator=(const ControlPipeServer &) = delete;
+
+  HANDLE command_event() const { return command_event_.get(); }
+
+  template <typename Handler> void service_ready(Handler &&handler) {
+    while (true) {
+      std::shared_ptr<ControlRequest> request;
+      {
+        std::lock_guard lock(mutex_);
+        if (requests_.empty()) {
+          ResetEvent(command_event_.get());
+          return;
+        }
+        request = requests_.front();
+        requests_.pop_front();
+      }
+
+      std::string reply;
+      if (request->command.empty()) {
+        reply = "{\"OK\":false,\"error\":\"empty command\"}\n";
+      } else {
+        reply = handler(trim_command(request->command));
+      }
+
+      {
+        std::lock_guard lock(request->mutex);
+        request->reply = std::move(reply);
+      }
+      SetEvent(request->done_event.get());
     }
   }
 
-  template <typename Handler> bool service_once(Handler &&handler) {
-    if (!pipe_) {
+  void stop() {
+    if (stop_requested_.exchange(true)) {
+      return;
+    }
+    SetEvent(stop_event_.get());
+    complete_queued_requests("{\"OK\":false,\"error\":\"daemon stopping\"}\n");
+
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+private:
+  struct ControlRequest {
+    std::string command;
+    std::string reply;
+    UniqueHandle done_event;
+    std::mutex mutex;
+  };
+
+  void complete_queued_requests(std::string reply) {
+    std::deque<std::shared_ptr<ControlRequest>> requests;
+    {
+      std::lock_guard lock(mutex_);
+      requests.swap(requests_);
+      ResetEvent(command_event_.get());
+    }
+    for (const auto &request : requests) {
+      {
+        std::lock_guard lock(request->mutex);
+        request->reply = reply;
+      }
+      SetEvent(request->done_event.get());
+    }
+  }
+
+  std::string queue_command(std::string command) {
+    auto request = std::make_shared<ControlRequest>();
+    request->command = std::move(command);
+    request->done_event.reset(CreateEventA(nullptr, TRUE, FALSE, nullptr));
+    if (!request->done_event) {
+      return "{\"OK\":false,\"error\":\"failed to queue command\"}\n";
+    }
+
+    {
+      std::lock_guard lock(mutex_);
+      if (stop_requested_) {
+        return "{\"OK\":false,\"error\":\"daemon stopping\"}\n";
+      }
+      requests_.push_back(request);
+      SetEvent(command_event_.get());
+    }
+
+    HANDLE wait_handles[2] = {request->done_event.get(), stop_event_.get()};
+    const DWORD wait_result =
+        WaitForMultipleObjects(2, wait_handles, FALSE, INFINITE);
+    if (wait_result != WAIT_OBJECT_0) {
+      return "{\"OK\":false,\"error\":\"daemon stopping\"}\n";
+    }
+
+    std::lock_guard lock(request->mutex);
+    return request->reply;
+  }
+
+  void thread_main() {
+    while (!stop_requested_) {
+      UniqueHandle pipe(CreateNamedPipeA(
+          pipe_name_.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+          PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 4096, 4096,
+          0, nullptr));
+      if (!pipe) {
+        logger_.log(vds::LogScope::Control, vds::LogLevel::Error,
+                    "failed to create control pipe " + pipe_name_ + ": " +
+                        win32_error_message(GetLastError()));
+        WaitForSingleObject(stop_event_.get(), 1000);
+        continue;
+      }
+
+      if (!connect_client(pipe.get()) || stop_requested_) {
+        DisconnectNamedPipe(pipe.get());
+        continue;
+      }
+
+      handle_client(pipe.get());
+      DisconnectNamedPipe(pipe.get());
+    }
+  }
+
+  bool wait_for_pipe_io(HANDLE pipe, OVERLAPPED &overlapped,
+                        DWORD &bytes_transferred, std::string_view label) {
+    HANDLE wait_handles[2] = {overlapped.hEvent, stop_event_.get()};
+    const DWORD wait_result =
+        WaitForMultipleObjects(2, wait_handles, FALSE, INFINITE);
+    if (wait_result == WAIT_OBJECT_0 + 1) {
+      CancelIoEx(pipe, &overlapped);
+      (void)GetOverlappedResult(pipe, &overlapped, &bytes_transferred, TRUE);
+      return false;
+    }
+    if (wait_result != WAIT_OBJECT_0) {
+      CancelIoEx(pipe, &overlapped);
+      (void)GetOverlappedResult(pipe, &overlapped, &bytes_transferred, TRUE);
+      if (!stop_requested_) {
+        logger_.log(vds::LogScope::Control, vds::LogLevel::Warn,
+                    std::string(label) +
+                        " wait failed: " + win32_error_message(GetLastError()));
+      }
+      return false;
+    }
+    if (!GetOverlappedResult(pipe, &overlapped, &bytes_transferred, FALSE)) {
+      const DWORD error = GetLastError();
+      if (!stop_requested_ && error != ERROR_NO_DATA &&
+          error != ERROR_BROKEN_PIPE) {
+        logger_.log(vds::LogScope::Control, vds::LogLevel::Warn,
+                    std::string(label) +
+                        " completion failed: " + win32_error_message(error));
+      }
+      return false;
+    }
+    return true;
+  }
+
+  bool connect_client(HANDLE pipe) {
+    UniqueHandle event(CreateEventA(nullptr, TRUE, FALSE, nullptr));
+    if (!event) {
+      logger_.log(vds::LogScope::Control, vds::LogLevel::Error,
+                  "failed to create control pipe connect event: " +
+                      win32_error_message(GetLastError()));
       return false;
     }
 
-    if (!ConnectNamedPipe(pipe_.get(), nullptr)) {
-      const DWORD error = GetLastError();
-      if (error == ERROR_PIPE_LISTENING) {
-        return false;
-      }
-      if (error == ERROR_NO_DATA || error == ERROR_BROKEN_PIPE) {
-        DisconnectNamedPipe(pipe_.get());
-        return false;
-      }
-      if (error != ERROR_PIPE_CONNECTED) {
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = event.get();
+    if (ConnectNamedPipe(pipe, &overlapped)) {
+      return true;
+    }
+
+    const DWORD error = GetLastError();
+    if (error == ERROR_PIPE_CONNECTED) {
+      return true;
+    }
+    if (error != ERROR_IO_PENDING) {
+      if (!stop_requested_) {
         logger_.log(vds::LogScope::Control, vds::LogLevel::Warn,
                     "control pipe connect failed: " +
                         win32_error_message(error));
-        DisconnectNamedPipe(pipe_.get());
-        return false;
       }
+      return false;
+    }
+
+    DWORD ignored = 0;
+    return wait_for_pipe_io(pipe, overlapped, ignored, "control pipe connect");
+  }
+
+  std::optional<std::string> read_command(HANDLE pipe) {
+    UniqueHandle event(CreateEventA(nullptr, TRUE, FALSE, nullptr));
+    if (!event) {
+      logger_.log(vds::LogScope::Control, vds::LogLevel::Error,
+                  "failed to create control pipe read event: " +
+                      win32_error_message(GetLastError()));
+      return std::nullopt;
     }
 
     std::array<char, 512> buffer{};
     DWORD got = 0;
-    if (!ReadFile(pipe_.get(), buffer.data(),
-                  static_cast<DWORD>(buffer.size() - 1), &got, nullptr)) {
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = event.get();
+    const BOOL started =
+        ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size() - 1),
+                 &got, &overlapped);
+    if (!started) {
       const DWORD error = GetLastError();
-      if (error != ERROR_NO_DATA && error != ERROR_BROKEN_PIPE) {
-        logger_.log(vds::LogScope::Control, vds::LogLevel::Warn,
-                    "control pipe read failed: " + win32_error_message(error));
+      if (error != ERROR_IO_PENDING) {
+        if (!stop_requested_ && error != ERROR_NO_DATA &&
+            error != ERROR_BROKEN_PIPE) {
+          logger_.log(vds::LogScope::Control, vds::LogLevel::Warn,
+                      "control pipe read failed: " +
+                          win32_error_message(error));
+        }
+        return std::nullopt;
       }
-      DisconnectNamedPipe(pipe_.get());
+      if (!wait_for_pipe_io(pipe, overlapped, got, "control pipe read")) {
+        return std::nullopt;
+      }
+    }
+    if (got == 0) {
+      return std::nullopt;
+    }
+    return std::string(buffer.data(), static_cast<std::size_t>(got));
+  }
+
+  bool write_reply(HANDLE pipe, const std::string &reply) {
+    UniqueHandle event(CreateEventA(nullptr, TRUE, FALSE, nullptr));
+    if (!event) {
+      logger_.log(vds::LogScope::Control, vds::LogLevel::Error,
+                  "failed to create control pipe write event: " +
+                      win32_error_message(GetLastError()));
       return false;
     }
 
-    std::string reply;
-    if (got == 0) {
-      reply = "{\"OK\":false,\"error\":\"empty command\"}\n";
-    } else {
-      reply = handler(trim_command(
-          std::string(buffer.data(), static_cast<std::size_t>(got))));
-    }
-
     DWORD written = 0;
-    if (!WriteFile(pipe_.get(), reply.data(), static_cast<DWORD>(reply.size()),
-                   &written, nullptr)) {
-      logger_.log(vds::LogScope::Control, vds::LogLevel::Warn,
-                  "control pipe reply failed: " +
-                      win32_error_message(GetLastError()));
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = event.get();
+    const BOOL started =
+        WriteFile(pipe, reply.data(), static_cast<DWORD>(reply.size()),
+                  &written, &overlapped);
+    if (!started) {
+      const DWORD error = GetLastError();
+      if (error != ERROR_IO_PENDING) {
+        if (!stop_requested_) {
+          logger_.log(vds::LogScope::Control, vds::LogLevel::Warn,
+                      "control pipe reply failed: " +
+                          win32_error_message(error));
+        }
+        return false;
+      }
+      if (!wait_for_pipe_io(pipe, overlapped, written, "control pipe reply")) {
+        return false;
+      }
     }
-    FlushFileBuffers(pipe_.get());
-    DisconnectNamedPipe(pipe_.get());
     return true;
   }
 
-private:
+  void handle_client(HANDLE pipe) {
+    const auto command = read_command(pipe);
+    if (!command) {
+      return;
+    }
+
+    const std::string reply = queue_command(*command);
+    (void)write_reply(pipe, reply);
+  }
+
   vds::Logger &logger_;
   std::string pipe_name_;
-  UniqueHandle pipe_;
+  UniqueHandle stop_event_;
+  UniqueHandle command_event_;
+  std::thread thread_;
+  std::atomic_bool stop_requested_ = false;
+  std::mutex mutex_;
+  std::deque<std::shared_ptr<ControlRequest>> requests_;
 };
 
 bool worker_is_connected(const BridgeWorker &worker) {
@@ -2430,15 +2647,57 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
   std::vector<std::string> no_port_warned_addresses;
   std::vector<std::string> port_binding_warned_states;
   ControlPipeServer control_pipe(options.pipe, logger);
+  FilterBluetoothDeviceChangeWait filter_change_wait;
+  UniqueHandle retry_timer(CreateWaitableTimerExA(
+      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+      TIMER_MODIFY_STATE | SYNCHRONIZE));
+  if (!retry_timer) {
+    retry_timer.reset(CreateWaitableTimerExA(nullptr, nullptr, 0,
+                                             TIMER_MODIFY_STATE | SYNCHRONIZE));
+  }
+  if (!retry_timer) {
+    throw std::runtime_error("failed to create supervisor retry timer: " +
+                             win32_error_message(GetLastError()));
+  }
   std::atomic_uint32_t trace_flags = 0;
+  std::uint32_t filter_generation = 0;
   bool reload_requested = false;
+  bool scan_requested = true;
+  bool provider_retry_required = false;
   bool config_load_logged = false;
   bool filter_provider_warned = false;
   bool virtual_port_provider_warned = false;
   logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
              "Windows bridge supervisor started pipe=" + options.pipe);
 
+  enum class WaitKind {
+    Stop,
+    Control,
+    FilterChange,
+    Retry,
+    WorkerDone,
+  };
+  struct WaitTarget {
+    HANDLE handle = nullptr;
+    WaitKind kind = WaitKind::Stop;
+    std::size_t index = 0;
+  };
+  auto arm_retry_timer = [&](Clock::duration duration) {
+    using HundredNanoseconds =
+        std::chrono::duration<long long, std::ratio<1, 10000000>>;
+    const auto ticks = std::max<long long>(
+        1, std::chrono::duration_cast<HundredNanoseconds>(duration).count());
+    LARGE_INTEGER due_time{};
+    due_time.QuadPart = -ticks;
+    if (!SetWaitableTimerEx(retry_timer.get(), &due_time, 0, nullptr, nullptr,
+                            nullptr, 0)) {
+      throw std::runtime_error("failed to arm supervisor retry timer: " +
+                               win32_error_message(GetLastError()));
+    }
+  };
+
   while (!g_stop_requested) {
+    bool worker_removed = false;
     for (auto worker = workers.begin(); worker != workers.end();) {
       if ((*worker)->done.load()) {
         if ((*worker)->thread.joinable()) {
@@ -2450,213 +2709,388 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
               Clock::now() + kBridgeWorkerFailureRetryDelay);
         }
         worker = workers.erase(worker);
+        worker_removed = true;
       } else {
         ++worker;
       }
     }
+    if (worker_removed) {
+      scan_requested = true;
+    }
 
-    (void)control_pipe.service_once([&](const std::string &command) {
-      std::uint32_t current_trace_flags = trace_flags.load();
-      const std::string reply = handle_supervisor_control_command(
-          command, workers, options.db_path, current_trace_flags,
-          reload_requested, logger);
-      trace_flags.store(current_trace_flags);
-      return reply;
-    });
+    if (reload_requested) {
+      scan_requested = true;
+    }
 
-    try {
-      const vds::ConfigDb db = load_config_db_for_attempt(options, logger);
-      if (!config_load_logged || reload_requested) {
-        logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
-                   "loaded controller config count=" +
-                       std::to_string(db.controllers.size()));
-        config_load_logged = true;
-      }
-      const std::vector<unsigned> enabled_ports = enabled_virtual_ports();
-      const bool virtual_port_provider_is_available = !enabled_ports.empty();
-      if (!virtual_port_provider_is_available) {
-        if (!virtual_port_provider_warned) {
-          logger.log(vds::LogScope::Port, vds::LogLevel::Error,
-                     std::string(kVirtualPortProviderUnavailableReason) +
-                         " detail=" + kWindowsVirtualPortProviderUnavailable);
-          virtual_port_provider_warned = true;
+    if (std::any_of(worker_failure_backoffs.begin(),
+                    worker_failure_backoffs.end(), [](const auto &backoff) {
+                      return Clock::now() >= backoff.retry_after;
+                    })) {
+      scan_requested = true;
+    }
+
+    if (scan_requested) {
+      filter_change_wait.cancel();
+      scan_requested = false;
+      provider_retry_required = false;
+      try {
+        const vds::ConfigDb db = load_config_db_for_attempt(options, logger);
+        if (!config_load_logged || reload_requested) {
+          logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
+                     "loaded controller config count=" +
+                         std::to_string(db.controllers.size()));
+          config_load_logged = true;
         }
-      } else if (virtual_port_provider_warned) {
-        logger.log(vds::LogScope::Port, vds::LogLevel::Info,
-                   "virtual port provider recovered");
-        virtual_port_provider_warned = false;
-      }
-
-      const bool filter_provider_is_available = filter_provider_available();
-      if (!filter_provider_is_available) {
-        if (!filter_provider_warned) {
-          logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Error,
-                     "filter provider unavailable detail=" +
-                         std::string(kWindowsFilterProviderUnavailable));
-          filter_provider_warned = true;
+        const std::vector<unsigned> enabled_ports = enabled_virtual_ports();
+        const bool virtual_port_provider_is_available = !enabled_ports.empty();
+        if (!virtual_port_provider_is_available) {
+          provider_retry_required = true;
+          if (!virtual_port_provider_warned) {
+            logger.log(vds::LogScope::Port, vds::LogLevel::Error,
+                       std::string(kVirtualPortProviderUnavailableReason) +
+                           " detail=" + kWindowsVirtualPortProviderUnavailable);
+            virtual_port_provider_warned = true;
+          }
+        } else if (virtual_port_provider_warned) {
+          logger.log(vds::LogScope::Port, vds::LogLevel::Info,
+                     "virtual port provider recovered");
+          virtual_port_provider_warned = false;
         }
-      } else if (filter_provider_warned) {
-        logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Info,
-                   "filter provider recovered");
-        filter_provider_warned = false;
-      }
 
-      for (const auto &worker : workers) {
-        const bool stale = vds::vdsd_worker_config_is_stale(
-            db, worker->address, worker->profile, worker->port,
-            virtual_port_is_enabled(worker->port));
-        if (stale && !worker->stop_requested.exchange(true)) {
+        const bool filter_provider_is_available = filter_provider_available();
+        HidBluetoothDeviceSnapshot filter_snapshot;
+        if (!filter_provider_is_available) {
+          provider_retry_required = true;
+          if (!filter_provider_warned) {
+            logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Error,
+                       "filter provider unavailable detail=" +
+                           std::string(kWindowsFilterProviderUnavailable));
+            filter_provider_warned = true;
+          }
+        } else if (filter_provider_warned) {
+          logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Info,
+                     "filter provider recovered");
+          filter_provider_warned = false;
+        }
+        if (filter_provider_is_available) {
+          filter_snapshot = list_filter_bluetooth_device_snapshot();
+          filter_generation = filter_snapshot.generation;
+          if (filter_generation == 0) {
+            provider_retry_required = true;
+          }
+        }
+
+        for (const auto &worker : workers) {
+          const bool stale = vds::vdsd_worker_config_is_stale(
+              db, worker->address, worker->profile, worker->port,
+              virtual_port_is_enabled(worker->port));
+          if (stale && !worker->stop_requested.exchange(true)) {
+            logger.log(
+                vds::LogScope::Daemon, vds::LogLevel::Info,
+                "Windows bridge worker retiring address=" + worker->address +
+                    " port=" + std::to_string(worker->port));
+          }
+        }
+
+        std::vector<unsigned> reserved_ports;
+        reserved_ports.reserve(workers.size());
+        std::vector<std::string> reserved_device_addresses;
+        reserved_device_addresses.reserve(workers.size());
+        for (const auto &worker : workers) {
+          reserved_ports.push_back(worker->port);
+          reserved_device_addresses.push_back(worker->device_address);
+        }
+
+        for (const auto &config : db.controllers) {
+          if (!vds::consume_vdsd_worker_retry(worker_failure_backoffs,
+                                              config.address, Clock::now())) {
+            continue;
+          }
+
+          const auto existing = std::find_if(
+              workers.begin(), workers.end(), [&](const auto &worker) {
+                return worker->address == config.address;
+              });
+          if (existing != workers.end()) {
+            continue;
+          }
+          if (!virtual_port_provider_is_available) {
+            if (vds::remember_vdsd_warning_state(
+                    port_binding_warned_states, config.address,
+                    kVirtualPortProviderUnavailableReason)) {
+              logger.log(
+                  vds::LogScope::Daemon, vds::LogLevel::Warn,
+                  "controller binding unavailable address=" + config.address +
+                      " reason=" + kVirtualPortProviderUnavailableReason);
+            }
+            continue;
+          }
+          const std::string port_binding_error =
+              "no allowed virtual port enabled ports=[" +
+              vds::format_ports(config.ports) + "]";
+          if (!controller_has_enabled_virtual_port(config, enabled_ports)) {
+            if (vds::remember_vdsd_warning_state(port_binding_warned_states,
+                                                 config.address,
+                                                 port_binding_error)) {
+              logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
+                         "controller binding unavailable address=" +
+                             config.address + " reason=" + port_binding_error);
+            }
+            continue;
+          }
+          vds::forget_vdsd_warning_state(port_binding_warned_states,
+                                         config.address);
+          if (!filter_provider_is_available) {
+            if (vds::remember_vdsd_warning_state(
+                    discovery_warned_states, config.address,
+                    "filter provider unavailable")) {
+              logger.log(
+                  vds::LogScope::Daemon, vds::LogLevel::Warn,
+                  "controller filter unavailable address=" + config.address +
+                      " reason=filter provider unavailable");
+            }
+            continue;
+          }
+          std::string discovery_error;
+          const auto connected_device = find_connected_bluetooth_device(
+              config.address, filter_snapshot.devices, &discovery_error);
+          if (!connected_device) {
+            if (vds::remember_vdsd_warning_state(
+                    discovery_warned_states, config.address, discovery_error)) {
+              logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
+                         "controller filter unavailable address=" +
+                             config.address + " reason=" + discovery_error);
+            }
+            continue;
+          }
+          vds::forget_vdsd_warning_state(discovery_warned_states,
+                                         config.address);
+          const vds::VdsdWorkerLaunchDecision launch =
+              vds::select_vdsd_worker_launch_decision(
+                  config, available_virtual_ports(), reserved_ports,
+                  config.address, virtual_port_provider_is_available,
+                  reserved_device_addresses);
+          if (launch.status ==
+              vds::VdsdWorkerLaunchStatus::VirtualPortProviderUnavailable) {
+            if (vds::remember_vdsd_warning_state(
+                    port_binding_warned_states, config.address,
+                    kVirtualPortProviderUnavailableReason)) {
+              logger.log(
+                  vds::LogScope::Daemon, vds::LogLevel::Warn,
+                  "rejected filter device address=" + config.address +
+                      " reason=" + kVirtualPortProviderUnavailableReason);
+            }
+            continue;
+          }
+          if (launch.status ==
+              vds::VdsdWorkerLaunchStatus::DeviceAddressReserved) {
+            continue;
+          }
+          if (launch.status == vds::VdsdWorkerLaunchStatus::NoAvailablePort) {
+            if (vds::remember_vdsd_warning(no_port_warned_addresses,
+                                           config.address)) {
+              logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
+                         "rejected filter device address=" + config.address +
+                             " reason=no available virtual port");
+            }
+            continue;
+          }
+          vds::forget_vdsd_warning(no_port_warned_addresses, config.address);
+
+          auto worker = std::make_unique<BridgeWorker>();
+          worker->address = config.address;
+          worker->device_address = launch.device_address;
+          worker->port = launch.port;
+          worker->profile = config.profile;
+          worker->done_event.reset(CreateEventA(nullptr, TRUE, FALSE, nullptr));
+          if (!worker->done_event) {
+            throw std::runtime_error("failed to create worker event: " +
+                                     win32_error_message(GetLastError()));
+          }
+          BridgeWorker *worker_ptr = worker.get();
+          worker->thread = std::thread([worker_config = launch.config,
+                                        device_address = launch.device_address,
+                                        &logger, worker_ptr, &trace_flags] {
+            run_configured_bridge_worker(worker_config, device_address, logger,
+                                         worker_ptr->stop_requested,
+                                         worker_ptr->done,
+                                         worker_ptr->last_error, trace_flags);
+            SetEvent(worker_ptr->done_event.get());
+          });
           logger.log(
               vds::LogScope::Daemon, vds::LogLevel::Info,
-              "Windows bridge worker retiring address=" + worker->address +
-                  " port=" + std::to_string(worker->port));
+              "Windows bridge worker launched address=" + config.address +
+                  " port=" + std::to_string(launch.port) +
+                  " device_address=" + launch.device_address);
+          workers.push_back(std::move(worker));
+          reserved_ports.push_back(launch.port);
+          reserved_device_addresses.push_back(launch.device_address);
         }
+      } catch (const std::exception &error) {
+        logger.log(vds::LogScope::Daemon, vds::LogLevel::Error,
+                   std::string("Windows bridge supervisor scan failed: ") +
+                       error.what());
+        scan_requested = true;
+        provider_retry_required = true;
       }
-
-      std::vector<unsigned> reserved_ports;
-      reserved_ports.reserve(workers.size());
-      std::vector<std::string> reserved_device_addresses;
-      reserved_device_addresses.reserve(workers.size());
-      for (const auto &worker : workers) {
-        reserved_ports.push_back(worker->port);
-        reserved_device_addresses.push_back(worker->device_address);
-      }
-
-      for (const auto &config : db.controllers) {
-        if (!vds::consume_vdsd_worker_retry(worker_failure_backoffs,
-                                            config.address, Clock::now())) {
-          continue;
-        }
-
-        const auto existing = std::find_if(
-            workers.begin(), workers.end(), [&](const auto &worker) {
-              return worker->address == config.address;
-            });
-        if (existing != workers.end()) {
-          continue;
-        }
-        if (!virtual_port_provider_is_available) {
-          if (vds::remember_vdsd_warning_state(
-                  port_binding_warned_states, config.address,
-                  kVirtualPortProviderUnavailableReason)) {
-            logger.log(
-                vds::LogScope::Daemon, vds::LogLevel::Warn,
-                "controller binding unavailable address=" + config.address +
-                    " reason=" + kVirtualPortProviderUnavailableReason);
-          }
-          continue;
-        }
-        const std::string port_binding_error =
-            "no allowed virtual port enabled ports=[" +
-            vds::format_ports(config.ports) + "]";
-        if (!controller_has_enabled_virtual_port(config, enabled_ports)) {
-          if (vds::remember_vdsd_warning_state(port_binding_warned_states,
-                                               config.address,
-                                               port_binding_error)) {
-            logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
-                       "controller binding unavailable address=" +
-                           config.address + " reason=" + port_binding_error);
-          }
-          continue;
-        }
-        vds::forget_vdsd_warning_state(port_binding_warned_states,
-                                       config.address);
-        if (!filter_provider_is_available) {
-          if (vds::remember_vdsd_warning_state(discovery_warned_states,
-                                               config.address,
-                                               "filter provider unavailable")) {
-            logger.log(
-                vds::LogScope::Daemon, vds::LogLevel::Warn,
-                "controller filter unavailable address=" + config.address +
-                    " reason=filter provider unavailable");
-          }
-          continue;
-        }
-        std::string discovery_error;
-        const auto connected_device =
-            find_connected_bluetooth_device(config.address, &discovery_error);
-        if (!connected_device) {
-          if (vds::remember_vdsd_warning_state(
-                  discovery_warned_states, config.address, discovery_error)) {
-            logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
-                       "controller filter unavailable address=" +
-                           config.address + " reason=" + discovery_error);
-          }
-          continue;
-        }
-        vds::forget_vdsd_warning_state(discovery_warned_states, config.address);
-        const vds::VdsdWorkerLaunchDecision launch =
-            vds::select_vdsd_worker_launch_decision(
-                config, available_virtual_ports(), reserved_ports,
-                config.address, virtual_port_provider_is_available,
-                reserved_device_addresses);
-        if (launch.status ==
-            vds::VdsdWorkerLaunchStatus::VirtualPortProviderUnavailable) {
-          if (vds::remember_vdsd_warning_state(
-                  port_binding_warned_states, config.address,
-                  kVirtualPortProviderUnavailableReason)) {
-            logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
-                       "rejected filter device address=" + config.address +
-                           " reason=" + kVirtualPortProviderUnavailableReason);
-          }
-          continue;
-        }
-        if (launch.status ==
-            vds::VdsdWorkerLaunchStatus::DeviceAddressReserved) {
-          continue;
-        }
-        if (launch.status == vds::VdsdWorkerLaunchStatus::NoAvailablePort) {
-          if (vds::remember_vdsd_warning(no_port_warned_addresses,
-                                         config.address)) {
-            logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
-                       "rejected filter device address=" + config.address +
-                           " reason=no available virtual port");
-          }
-          continue;
-        }
-        vds::forget_vdsd_warning(no_port_warned_addresses, config.address);
-
-        auto worker = std::make_unique<BridgeWorker>();
-        worker->address = config.address;
-        worker->device_address = launch.device_address;
-        worker->port = launch.port;
-        worker->profile = config.profile;
-        BridgeWorker *worker_ptr = worker.get();
-        worker->thread = std::thread([worker_config = launch.config,
-                                      device_address = launch.device_address,
-                                      &logger, worker_ptr, &trace_flags] {
-          run_configured_bridge_worker(
-              worker_config, device_address, logger, worker_ptr->stop_requested,
-              worker_ptr->done, worker_ptr->last_error, trace_flags);
-        });
-        logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
-                   "Windows bridge worker launched address=" + config.address +
-                       " port=" + std::to_string(launch.port) +
-                       " device_address=" + launch.device_address);
-        workers.push_back(std::move(worker));
-        reserved_ports.push_back(launch.port);
-        reserved_device_addresses.push_back(launch.device_address);
-      }
-    } catch (const std::exception &error) {
-      logger.log(vds::LogScope::Daemon, vds::LogLevel::Error,
-                 std::string("Windows bridge supervisor scan failed: ") +
-                     error.what());
     }
 
     if (reload_requested) {
       reload_requested = false;
-      continue;
     }
 
-    if (g_stop_event != nullptr) {
-      (void)WaitForSingleObject(
-          g_stop_event,
-          static_cast<DWORD>(
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  kBridgeOpenRetryDelay)
-                  .count()));
+    std::optional<Clock::time_point> retry_after;
+    const auto now = Clock::now();
+    if (provider_retry_required) {
+      retry_after = now + kBridgeOpenRetryDelay;
+    }
+    if (!worker_failure_backoffs.empty()) {
+      const auto next_retry = std::min_element(
+          worker_failure_backoffs.begin(), worker_failure_backoffs.end(),
+          [](const auto &left, const auto &right) {
+            return left.retry_after < right.retry_after;
+          });
+      if (next_retry != worker_failure_backoffs.end()) {
+        if (next_retry->retry_after <= now) {
+          scan_requested = true;
+          continue;
+        }
+        retry_after =
+            retry_after
+                ? std::min(*retry_after, next_retry->retry_after)
+                : std::optional<Clock::time_point>(next_retry->retry_after);
+      }
+    }
+
+    bool retry_timer_armed = false;
+    if (retry_after) {
+      arm_retry_timer(*retry_after - now);
+      retry_timer_armed = true;
     } else {
-      std::this_thread::sleep_for(kBridgeOpenRetryDelay);
+      CancelWaitableTimer(retry_timer.get());
+    }
+
+    if (!provider_retry_required && filter_generation != 0) {
+      try {
+        if (!filter_change_wait.pending()) {
+          if (filter_change_wait.arm(filter_generation)) {
+            scan_requested = true;
+            continue;
+          }
+          if (!filter_change_wait.pending()) {
+            scan_requested = true;
+            provider_retry_required = true;
+            continue;
+          }
+        }
+      } catch (const std::exception &error) {
+        logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Warn,
+                   std::string("filter device-change wait failed: ") +
+                       error.what());
+        scan_requested = true;
+        provider_retry_required = true;
+        continue;
+      }
+    } else {
+      filter_change_wait.cancel();
+    }
+
+    std::vector<WaitTarget> wait_targets;
+    wait_targets.reserve(workers.size() + 4);
+    if (g_stop_event != nullptr) {
+      wait_targets.push_back(WaitTarget{
+          .handle = g_stop_event,
+          .kind = WaitKind::Stop,
+          .index = 0,
+      });
+    }
+    wait_targets.push_back(WaitTarget{
+        .handle = control_pipe.command_event(),
+        .kind = WaitKind::Control,
+        .index = 0,
+    });
+    if (filter_change_wait.pending()) {
+      wait_targets.push_back(WaitTarget{
+          .handle = filter_change_wait.event(),
+          .kind = WaitKind::FilterChange,
+          .index = 0,
+      });
+    }
+    if (retry_timer_armed) {
+      wait_targets.push_back(WaitTarget{
+          .handle = retry_timer.get(),
+          .kind = WaitKind::Retry,
+          .index = 0,
+      });
+    }
+    for (std::size_t index = 0; index < workers.size(); ++index) {
+      if (!workers[index]->done_event) {
+        continue;
+      }
+      wait_targets.push_back(WaitTarget{
+          .handle = workers[index]->done_event.get(),
+          .kind = WaitKind::WorkerDone,
+          .index = index,
+      });
+    }
+
+    std::vector<HANDLE> wait_handles;
+    wait_handles.reserve(wait_targets.size());
+    for (const auto &target : wait_targets) {
+      wait_handles.push_back(target.handle);
+    }
+
+    const DWORD wait_result =
+        WaitForMultipleObjects(static_cast<DWORD>(wait_handles.size()),
+                               wait_handles.data(), FALSE, INFINITE);
+    if (wait_result == WAIT_FAILED) {
+      throw std::runtime_error("Windows bridge supervisor wait failed: " +
+                               win32_error_message(GetLastError()));
+    }
+
+    const DWORD wait_index = wait_result - WAIT_OBJECT_0;
+    if (wait_index >= wait_targets.size()) {
+      throw std::runtime_error("Windows bridge supervisor wait returned an "
+                               "unexpected object index");
+    }
+
+    switch (wait_targets[wait_index].kind) {
+    case WaitKind::Stop:
+      g_stop_requested = true;
+      break;
+    case WaitKind::Control:
+      control_pipe.service_ready([&](const std::string &command) {
+        std::uint32_t current_trace_flags = trace_flags.load();
+        const std::string reply = handle_supervisor_control_command(
+            command, workers, options.db_path, current_trace_flags,
+            reload_requested, logger);
+        trace_flags.store(current_trace_flags);
+        return reply;
+      });
+      if (reload_requested) {
+        scan_requested = true;
+      }
+      break;
+    case WaitKind::FilterChange:
+      try {
+        if (filter_change_wait.complete()) {
+          scan_requested = true;
+        }
+      } catch (const std::exception &error) {
+        logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Warn,
+                   std::string("filter device-change wait failed: ") +
+                       error.what());
+        scan_requested = true;
+        provider_retry_required = true;
+      }
+      break;
+    case WaitKind::Retry:
+      CancelWaitableTimer(retry_timer.get());
+      scan_requested = true;
+      break;
+    case WaitKind::WorkerDone:
+      scan_requested = true;
+      break;
     }
   }
 

@@ -29,6 +29,8 @@ vds_filter.sys=1
 %VdsFilterDeviceName%=UsbHidCollectionInstall_amd64, HID\VID_054C&PID_0CE6&MI_03
 %VdsFilterDeviceName%=UsbHidCollectionInstall_amd64, HID\VID_054C&PID_0DF2&MI_03
 ; Bluetooth Classic HID service UUID 0x1124 in Bluetooth base UUID form.
+%VdsFilterDeviceName%=BthHidDeviceInstall_amd64, BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6
+%VdsFilterDeviceName%=BthHidDeviceInstall_amd64, BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0DF2
 %VdsFilterDeviceName%=HidDeviceInstall_amd64, HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6
 %VdsFilterDeviceName%=HidDeviceInstall_amd64, HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6&Col01
 %VdsFilterDeviceName%=HidDeviceInstall_amd64, HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6&Col02
@@ -86,6 +88,19 @@ vds_filter.sys
 [HidDeviceInstall_amd64.Services]
 Include=input.inf
 Needs=HID_Raw_Inst.NT.Services
+AddService=vds_filter,,ServiceInstall
+
+[BthHidDeviceInstall_amd64]
+Include=hidbth.inf
+Needs=HIDBTH_Inst.NT
+CopyFiles=DriverCopyFiles
+
+[BthHidDeviceInstall_amd64.HW]
+AddReg=UpperFilterAddReg
+
+[BthHidDeviceInstall_amd64.Services]
+Include=hidbth.inf
+Needs=HIDBTH_Inst.NT.Services
 AddService=vds_filter,,ServiceInstall
 
 [ServiceInstall]

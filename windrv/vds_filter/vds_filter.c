@@ -52,8 +52,115 @@ typedef struct _VDS_FILTER_EXTENSION {
 
 static FAST_MUTEX vds_device_list_lock;
 static LIST_ENTRY vds_device_list;
+static KSPIN_LOCK vds_device_wait_lock;
+static LIST_ENTRY vds_device_wait_irps;
+static IO_CSQ vds_device_wait_queue;
 static PDEVICE_OBJECT vds_control_device;
+static ULONG vds_device_generation;
 static volatile LONG vds_next_filter_instance;
+
+typedef struct _VDS_FILTER_WAIT_CONTEXT {
+  ULONG generation;
+} VDS_FILTER_WAIT_CONTEXT, *PVDS_FILTER_WAIT_CONTEXT;
+
+static VOID VdsCompleteDeviceChangeIrp(PIRP irp, NTSTATUS status,
+                                       ULONG generation) {
+  struct vds_filter_device_change *output;
+
+  irp->IoStatus.Status = status;
+  irp->IoStatus.Information = 0;
+  if (NT_SUCCESS(status)) {
+    output = (struct vds_filter_device_change *)irp->AssociatedIrp.SystemBuffer;
+    RtlZeroMemory(output, sizeof(*output));
+    output->version = VDS_FILTER_DEVICE_CHANGE_VERSION;
+    output->size = sizeof(*output);
+    output->generation = generation;
+    irp->IoStatus.Information = sizeof(*output);
+  }
+  IoCompleteRequest(irp, IO_NO_INCREMENT);
+}
+
+static NTSTATUS VdsWaitQueueInsertIrpEx(PIO_CSQ csq, PIRP irp,
+                                        PVOID insert_context) {
+  PVDS_FILTER_WAIT_CONTEXT context;
+
+  UNREFERENCED_PARAMETER(csq);
+
+  context = (PVDS_FILTER_WAIT_CONTEXT)insert_context;
+  if (context == NULL || context->generation != vds_device_generation) {
+    return STATUS_RETRY;
+  }
+  InsertTailList(&vds_device_wait_irps, &irp->Tail.Overlay.ListEntry);
+  return STATUS_SUCCESS;
+}
+
+static VOID VdsWaitQueueRemoveIrp(PIO_CSQ csq, PIRP irp) {
+  UNREFERENCED_PARAMETER(csq);
+
+  RemoveEntryList(&irp->Tail.Overlay.ListEntry);
+}
+
+static PIRP VdsWaitQueuePeekNextIrp(PIO_CSQ csq, PIRP irp, PVOID peek_context) {
+  PLIST_ENTRY entry;
+
+  UNREFERENCED_PARAMETER(csq);
+  UNREFERENCED_PARAMETER(peek_context);
+
+  entry = irp == NULL ? vds_device_wait_irps.Flink
+                      : irp->Tail.Overlay.ListEntry.Flink;
+  if (entry == &vds_device_wait_irps) {
+    return NULL;
+  }
+  return CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
+}
+
+static VOID VdsWaitQueueAcquireLock(PIO_CSQ csq, PKIRQL irql) {
+  UNREFERENCED_PARAMETER(csq);
+
+  KeAcquireSpinLock(&vds_device_wait_lock, irql);
+}
+
+static VOID VdsWaitQueueReleaseLock(PIO_CSQ csq, KIRQL irql) {
+  UNREFERENCED_PARAMETER(csq);
+
+  KeReleaseSpinLock(&vds_device_wait_lock, irql);
+}
+
+static VOID VdsWaitQueueCompleteCanceledIrp(PIO_CSQ csq, PIRP irp) {
+  UNREFERENCED_PARAMETER(csq);
+
+  VdsCompleteDeviceChangeIrp(irp, STATUS_CANCELLED, 0);
+}
+
+static ULONG VdsCurrentDeviceGeneration(void) {
+  KIRQL irql;
+  ULONG generation;
+
+  KeAcquireSpinLock(&vds_device_wait_lock, &irql);
+  generation = vds_device_generation;
+  KeReleaseSpinLock(&vds_device_wait_lock, irql);
+  return generation;
+}
+
+static VOID VdsCompleteDeviceWaitQueue(NTSTATUS status, ULONG generation) {
+  PIRP irp;
+
+  while ((irp = IoCsqRemoveNextIrp(&vds_device_wait_queue, NULL)) != NULL) {
+    VdsCompleteDeviceChangeIrp(irp, status, generation);
+  }
+}
+
+static VOID VdsNotifyDeviceListChanged(void) {
+  KIRQL irql;
+  ULONG generation;
+
+  KeAcquireSpinLock(&vds_device_wait_lock, &irql);
+  ++vds_device_generation;
+  generation = vds_device_generation;
+  KeReleaseSpinLock(&vds_device_wait_lock, irql);
+
+  VdsCompleteDeviceWaitQueue(STATUS_SUCCESS, generation);
+}
 
 static BOOLEAN VdsAsciiEqualInsensitive(const CHAR *left, const CHAR *right) {
   CHAR left_char;
@@ -355,20 +462,24 @@ static VOID VdsReadPhysicalDeviceProfile(PDEVICE_OBJECT physical_device_object,
   ExFreePoolWithTag(parent_id, VDS_FILTER_POOL_TAG);
 }
 
-static VOID VdsUpdateDeviceListMembership(PVDS_FILTER_EXTENSION extension) {
+static BOOLEAN VdsUpdateDeviceListMembership(PVDS_FILTER_EXTENSION extension) {
   const BOOLEAN should_list =
       extension->report_target || extension->address[0] != '\0';
+  BOOLEAN changed = FALSE;
 
   ExAcquireFastMutex(&vds_device_list_lock);
   if (should_list && !extension->listed) {
     InsertTailList(&vds_device_list, &extension->list_entry);
     extension->listed = TRUE;
+    changed = TRUE;
   } else if (!should_list && extension->listed) {
     RemoveEntryList(&extension->list_entry);
     InitializeListHead(&extension->list_entry);
     extension->listed = FALSE;
+    changed = TRUE;
   }
   ExReleaseFastMutex(&vds_device_list_lock);
+  return changed;
 }
 
 static VOID VdsDeleteSymbolicLink(PVDS_FILTER_EXTENSION extension) {
@@ -584,10 +695,15 @@ static NTSTATUS VdsDispatchDeviceControl(PDEVICE_OBJECT device_object,
                                          PIRP irp) {
   PVDS_FILTER_EXTENSION extension;
   PIO_STACK_LOCATION stack;
+  struct vds_filter_device_change *change;
   struct vds_filter_device_list *output;
+  VDS_FILTER_WAIT_CONTEXT wait_context;
   PLIST_ENTRY entry;
   ULONG count;
+  ULONG input_length;
   ULONG output_length;
+  ULONG generation;
+  NTSTATUS status;
 
   extension = (PVDS_FILTER_EXTENSION)device_object->DeviceExtension;
   if (!extension->is_control) {
@@ -611,6 +727,39 @@ static NTSTATUS VdsDispatchDeviceControl(PDEVICE_OBJECT device_object,
   switch (stack->Parameters.DeviceIoControl.IoControlCode) {
   case VDS_FILTER_IOCTL_GET_DEVICES:
     break;
+  case VDS_FILTER_IOCTL_WAIT_DEVICE_CHANGE:
+    input_length = stack->Parameters.DeviceIoControl.InputBufferLength;
+    output_length = stack->Parameters.DeviceIoControl.OutputBufferLength;
+    if (input_length < sizeof(struct vds_filter_device_change) ||
+        output_length < sizeof(struct vds_filter_device_change)) {
+      return VdsCompleteIrp(irp, STATUS_BUFFER_TOO_SMALL);
+    }
+
+    change = (struct vds_filter_device_change *)irp->AssociatedIrp.SystemBuffer;
+    if (change->version != VDS_FILTER_DEVICE_CHANGE_VERSION ||
+        change->size != sizeof(*change)) {
+      return VdsCompleteIrp(irp, STATUS_INVALID_PARAMETER);
+    }
+
+    generation = VdsCurrentDeviceGeneration();
+    if (change->generation != generation) {
+      VdsCompleteDeviceChangeIrp(irp, STATUS_SUCCESS, generation);
+      return STATUS_SUCCESS;
+    }
+
+    IoMarkIrpPending(irp);
+    wait_context.generation = change->generation;
+    status = IoCsqInsertIrpEx(&vds_device_wait_queue, irp, NULL, &wait_context);
+    if (status == STATUS_RETRY) {
+      VdsCompleteDeviceChangeIrp(irp, STATUS_SUCCESS,
+                                 VdsCurrentDeviceGeneration());
+      return STATUS_PENDING;
+    }
+    if (!NT_SUCCESS(status)) {
+      VdsCompleteIrp(irp, status);
+      return STATUS_PENDING;
+    }
+    return STATUS_PENDING;
   default:
     return VdsCompleteIrp(irp, STATUS_INVALID_DEVICE_REQUEST);
   }
@@ -626,6 +775,7 @@ static NTSTATUS VdsDispatchDeviceControl(PDEVICE_OBJECT device_object,
   output->size = sizeof(*output);
 
   ExAcquireFastMutex(&vds_device_list_lock);
+  output->generation = VdsCurrentDeviceGeneration();
   count = 0;
   for (entry = vds_device_list.Flink;
        entry != &vds_device_list && count < VDS_FILTER_MAX_DEVICES;
@@ -669,6 +819,7 @@ static NTSTATUS VdsDispatchPnp(PDEVICE_OBJECT device_object, PIRP irp) {
   PDEVICE_OBJECT lower_device;
   KEVENT event;
   NTSTATUS status;
+  BOOLEAN list_changed;
 
   extension = (PVDS_FILTER_EXTENSION)device_object->DeviceExtension;
   if (extension->is_control) {
@@ -687,8 +838,11 @@ static NTSTATUS VdsDispatchPnp(PDEVICE_OBJECT device_object, PIRP irp) {
     }
     if (NT_SUCCESS(status)) {
       VdsReadPhysicalDeviceProfile(extension->physical_device, extension);
-      VdsUpdateDeviceListMembership(extension);
+      list_changed = VdsUpdateDeviceListMembership(extension);
       VdsUpdateSymbolicLink(extension);
+      if (list_changed || extension->listed) {
+        VdsNotifyDeviceListChanged();
+      }
       KdPrint(("vds_filter: started Bluetooth HID stack address=%s "
                "profile=%lu report_target=%u listed=%u\n",
                extension->address, extension->profile, extension->report_target,
@@ -708,8 +862,11 @@ static NTSTATUS VdsDispatchPnp(PDEVICE_OBJECT device_object, PIRP irp) {
     RemoveEntryList(&extension->list_entry);
     InitializeListHead(&extension->list_entry);
     extension->listed = FALSE;
+    ExReleaseFastMutex(&vds_device_list_lock);
+    VdsNotifyDeviceListChanged();
+  } else {
+    ExReleaseFastMutex(&vds_device_list_lock);
   }
-  ExReleaseFastMutex(&vds_device_list_lock);
   VdsDeleteSymbolicLink(extension);
 
   lower_device = extension->lower_device;
@@ -785,7 +942,9 @@ static NTSTATUS VdsAddDevice(PDRIVER_OBJECT driver_object,
                           (DO_BUFFERED_IO | DO_DIRECT_IO | DO_POWER_PAGABLE);
   filter_device->Flags &= ~DO_DEVICE_INITIALIZING;
 
-  VdsUpdateDeviceListMembership(extension);
+  if (VdsUpdateDeviceListMembership(extension)) {
+    VdsNotifyDeviceListChanged();
+  }
   VdsUpdateSymbolicLink(extension);
 
   KdPrint(("vds_filter: attached to Bluetooth HID stack address=%s "
@@ -834,6 +993,8 @@ static VOID VdsUnload(PDRIVER_OBJECT driver_object) {
   UNREFERENCED_PARAMETER(driver_object);
 
   if (vds_control_device != NULL) {
+    VdsCompleteDeviceWaitQueue(STATUS_DELETE_PENDING,
+                               VdsCurrentDeviceGeneration());
     RtlInitUnicodeString(&symbolic_name, VDS_FILTER_SYMBOLIC_NAME);
     IoDeleteSymbolicLink(&symbolic_name);
     IoDeleteDevice(vds_control_device);
@@ -850,6 +1011,16 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver_object,
 
   ExInitializeFastMutex(&vds_device_list_lock);
   InitializeListHead(&vds_device_list);
+  KeInitializeSpinLock(&vds_device_wait_lock);
+  InitializeListHead(&vds_device_wait_irps);
+  vds_device_generation = 1;
+  status = IoCsqInitializeEx(&vds_device_wait_queue, VdsWaitQueueInsertIrpEx,
+                             VdsWaitQueueRemoveIrp, VdsWaitQueuePeekNextIrp,
+                             VdsWaitQueueAcquireLock, VdsWaitQueueReleaseLock,
+                             VdsWaitQueueCompleteCanceledIrp);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
 
   for (index = 0; index <= IRP_MJ_MAXIMUM_FUNCTION; ++index) {
     driver_object->MajorFunction[index] = VdsPassThrough;

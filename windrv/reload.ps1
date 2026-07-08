@@ -53,6 +53,14 @@ function Test-VdsUsbRootDevice {
   return $false
 }
 
+function Get-VdsUsbRootDevice {
+  Get-PnpDevice |
+    Where-Object {
+    Test-VdsUsbRootDevice $_
+  } |
+    Select-Object -First 1
+}
+
 function Reload-VdsUsb {
   param(
     [string]$UsbPackageDir = ""
@@ -68,29 +76,29 @@ function Reload-VdsUsb {
 
   Push-Location $UsbPackageDir
   try {
-    $Device = Get-PnpDevice |
-      Where-Object {
-      Test-VdsUsbRootDevice $_
-    } |
-      Select-Object -First 1
+    $Device = Get-VdsUsbRootDevice
     if (!$Device) {
-      $Devgen = (Get-Command devgen).Source
-      & $Devgen /add /bus ROOT /instanceid "VDSUSB0" /hardwareid "Root\VDSUSB" | Out-Host
-      if ($LASTEXITCODE -ne 0) {
-        throw "devgen failed with exit code $LASTEXITCODE"
+      $RootDeviceInstaller = Join-Path $WindrvDir "vds-root-device-installer.exe"
+      if (!(Test-Path -LiteralPath $RootDeviceInstaller -PathType Leaf)) {
+        throw "vDS USB root device installer not found: $RootDeviceInstaller"
       }
 
-      $Devcon = (Get-Command devcon).Source
-      & $Devcon update "vds_usb.inf" "Root\VDSUSB" | Out-Host
+      $UsbInfPath = Join-Path $UsbPackageDir "vds_usb.inf"
+      & $RootDeviceInstaller $UsbInfPath | Out-Host
       if ($LASTEXITCODE -ne 0) {
-        throw "devcon update failed with exit code $LASTEXITCODE"
+        throw "vDS USB root device installer failed with exit code $LASTEXITCODE"
       }
 
-      $Device = Get-PnpDevice |
-        Where-Object {
-        Test-VdsUsbRootDevice $_
-      } |
-        Select-Object -First 1
+      pnputil /scan-devices | Out-Host
+      if ($LASTEXITCODE -ne 0) {
+        Write-Warning "pnputil scan-devices failed with exit code $LASTEXITCODE"
+        $global:LASTEXITCODE = 0
+      }
+
+      for ($Attempt = 0; $Attempt -lt 10 -and !$Device; ++$Attempt) {
+        Start-Sleep -Milliseconds 500
+        $Device = Get-VdsUsbRootDevice
+      }
     }
 
     if (!$Device) {
@@ -116,6 +124,8 @@ function Reload-VdsFilter {
 
   Get-PnpDevice |
     Where-Object {
+    $_.InstanceId -like "BTHENUM\{$BtHidServiceGuid}_VID&0002054C_PID&0CE6*" -or
+    $_.InstanceId -like "BTHENUM\{$BtHidServiceGuid}_VID&0002054C_PID&0DF2*" -or
     $_.InstanceId -like "HID\{$BtHidServiceGuid}_VID&0002054C_PID&0CE6*" -or
     $_.InstanceId -like "HID\{$BtHidServiceGuid}_VID&0002054C_PID&0DF2*"
   } |

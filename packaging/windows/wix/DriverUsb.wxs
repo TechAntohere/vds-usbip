@@ -15,6 +15,7 @@
               <File Id="fil_usb_windrv_install" Source="$(var.WindrvDir)\install.ps1" KeyPath="yes"/>
               <File Id="fil_usb_windrv_reload" Source="$(var.WindrvDir)\reload.ps1"/>
               <File Id="fil_usb_windrv_uninstall" Source="$(var.WindrvDir)\uninstall.ps1"/>
+              <File Id="fil_usb_root_device_installer" Source="$(var.RootDeviceInstaller)"/>
             </Component>
             <Directory Id="UsbDriverDir" Name="vds_usb">
               <Component Id="cmp_usb_registry" Guid="{781F671F-31BC-409C-8636-B9EAE02D7217}">

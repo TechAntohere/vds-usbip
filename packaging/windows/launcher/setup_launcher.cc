@@ -5,6 +5,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include <windows.h>
@@ -33,6 +35,19 @@ std::wstring quote_command_argument(std::wstring_view value) {
   }
   result.append(backslash_count * 2, L'\\');
   result.push_back(L'"');
+  return result;
+}
+
+std::wstring quote_powershell_single_quoted_string(std::wstring_view value) {
+  std::wstring result = L"'";
+  for (const wchar_t ch : value) {
+    if (ch == L'\'') {
+      result += L"''";
+    } else {
+      result.push_back(ch);
+    }
+  }
+  result.push_back(L'\'');
   return result;
 }
 
@@ -65,24 +80,6 @@ std::filesystem::path current_executable_path() {
   }
 }
 
-std::string utf8_from_wide(std::wstring_view value) {
-  if (value.empty()) {
-    return {};
-  }
-
-  const int length = WideCharToMultiByte(CP_UTF8, 0, value.data(),
-                                         static_cast<int>(value.size()),
-                                         nullptr, 0, nullptr, nullptr);
-  if (length <= 0) {
-    return {};
-  }
-
-  std::string result(static_cast<std::size_t>(length), '\0');
-  WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
-                      result.data(), length, nullptr, nullptr);
-  return result;
-}
-
 std::filesystem::path installer_log_path() {
   std::vector<wchar_t> program_data(32768);
   const DWORD length =
@@ -105,6 +102,8 @@ void reset_installer_log() {
   if (!stream) {
     throw std::runtime_error("failed to create installer log");
   }
+  constexpr wchar_t bom = 0xfeff;
+  stream.write(reinterpret_cast<const char *>(&bom), sizeof(bom));
 }
 
 void append_installer_log(std::wstring_view message) noexcept {
@@ -121,10 +120,20 @@ void append_installer_log(std::wstring_view message) noexcept {
     line += message;
     line += L"\r\n";
 
-    const std::string bytes = utf8_from_wide(line);
-    std::ofstream stream(installer_log_path(),
-                         std::ios::binary | std::ios::app);
-    stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    const std::filesystem::path log_path = installer_log_path();
+    bool write_bom = true;
+    std::error_code error;
+    if (std::filesystem::exists(log_path, error)) {
+      write_bom = std::filesystem::file_size(log_path, error) == 0;
+    }
+
+    std::ofstream stream(log_path, std::ios::binary | std::ios::app);
+    if (write_bom) {
+      constexpr wchar_t bom = 0xfeff;
+      stream.write(reinterpret_cast<const char *>(&bom), sizeof(bom));
+    }
+    stream.write(reinterpret_cast<const char *>(line.data()),
+                 static_cast<std::streamsize>(line.size() * sizeof(wchar_t)));
   } catch (...) {
   }
 }
@@ -260,6 +269,299 @@ bool is_success_exit_code(int status) {
   return status == 0 || status == 3010 || status == 1641;
 }
 
+struct ServiceHandle {
+  SC_HANDLE value = nullptr;
+
+  ServiceHandle() = default;
+  explicit ServiceHandle(SC_HANDLE value) : value(value) {}
+  ServiceHandle(const ServiceHandle &) = delete;
+  ServiceHandle &operator=(const ServiceHandle &) = delete;
+
+  ServiceHandle &operator=(ServiceHandle &&other) noexcept {
+    if (this != &other) {
+      if (value) {
+        CloseServiceHandle(value);
+      }
+      value = other.value;
+      other.value = nullptr;
+    }
+    return *this;
+  }
+
+  ~ServiceHandle() {
+    if (value) {
+      CloseServiceHandle(value);
+    }
+  }
+
+  SC_HANDLE get() const { return value; }
+};
+
+void append_win32_error_log(std::wstring_view prefix, DWORD error) noexcept {
+  std::wstring message(prefix);
+  message += L": ";
+  message += std::to_wstring(error);
+  append_installer_log(message);
+}
+
+std::wstring wide_from_ascii(std::string_view text) {
+  std::wstring result;
+  result.reserve(text.size());
+  for (const unsigned char ch : text) {
+    if (ch >= 0x20 && ch < 0x7f) {
+      result.push_back(static_cast<wchar_t>(ch));
+    } else {
+      result.push_back(L'?');
+    }
+  }
+  return result;
+}
+
+std::filesystem::path program_files_path() {
+  std::vector<wchar_t> program_files(MAX_PATH + 1);
+  DWORD length =
+      GetEnvironmentVariableW(L"ProgramW6432", program_files.data(),
+                              static_cast<DWORD>(program_files.size()));
+  if (length == 0) {
+    length = GetEnvironmentVariableW(L"ProgramFiles", program_files.data(),
+                                     static_cast<DWORD>(program_files.size()));
+  }
+  if (length == 0 || length >= program_files.size()) {
+    throw std::runtime_error("Program Files is not available");
+  }
+
+  return std::filesystem::path(program_files.data());
+}
+
+std::wstring read_hklm_string(const wchar_t *subkey, const wchar_t *name,
+                              DWORD *value_type = nullptr) {
+  DWORD type = 0;
+  DWORD byte_count = 0;
+  LSTATUS status = RegGetValueW(HKEY_LOCAL_MACHINE, subkey, name,
+                                RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, &type,
+                                nullptr, &byte_count);
+  if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND) {
+    return {};
+  }
+  if (status != ERROR_SUCCESS || byte_count == 0) {
+    return {};
+  }
+
+  std::wstring value(byte_count / sizeof(wchar_t), L'\0');
+  status = RegGetValueW(HKEY_LOCAL_MACHINE, subkey, name,
+                        RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, &type,
+                        value.data(), &byte_count);
+  if (status != ERROR_SUCCESS) {
+    return {};
+  }
+  while (!value.empty() && value.back() == L'\0') {
+    value.pop_back();
+  }
+  if (value_type) {
+    *value_type = type;
+  }
+  return value;
+}
+
+std::filesystem::path installed_vds_dir() {
+  const std::wstring install_dir =
+      read_hklm_string(L"Software\\vDS\\Setup", L"InstallDir");
+  if (!install_dir.empty()) {
+    return std::filesystem::path(install_dir);
+  }
+
+  std::filesystem::path path = program_files_path();
+  path /= L"vDS";
+  return path;
+}
+
+std::wstring lowercase_ascii(std::wstring value) {
+  for (wchar_t &ch : value) {
+    if (ch >= L'A' && ch <= L'Z') {
+      ch = static_cast<wchar_t>(ch - L'A' + L'a');
+    }
+  }
+  return value;
+}
+
+std::wstring path_entry_key(std::wstring value) {
+  if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"') {
+    value = value.substr(1, value.size() - 2);
+  }
+  while (!value.empty() && (value.back() == L'\\' || value.back() == L'/')) {
+    value.pop_back();
+  }
+  return lowercase_ascii(std::move(value));
+}
+
+bool machine_path_contains(std::wstring_view path_value,
+                           const std::wstring &install_dir) {
+  const std::wstring wanted = path_entry_key(install_dir);
+  std::wstring entry;
+  for (const wchar_t ch : path_value) {
+    if (ch == L';') {
+      if (path_entry_key(entry) == wanted) {
+        return true;
+      }
+      entry.clear();
+      continue;
+    }
+    entry.push_back(ch);
+  }
+  return path_entry_key(entry) == wanted;
+}
+
+void broadcast_environment_change() {
+  DWORD_PTR result = 0;
+  SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                      reinterpret_cast<LPARAM>(L"Environment"),
+                      SMTO_ABORTIFHUNG, 5000, &result);
+}
+
+bool path_install_was_requested() {
+  return read_hklm_string(L"Software\\vDS\\Setup", L"PathEntry") == L"1";
+}
+
+void ensure_machine_path(const std::filesystem::path &install_dir) {
+  if (!path_install_was_requested()) {
+    append_installer_log(L"machine PATH update was not requested");
+    return;
+  }
+
+  DWORD type = REG_EXPAND_SZ;
+  std::wstring path =
+      read_hklm_string(L"SYSTEM\\CurrentControlSet\\Control\\Session "
+                       L"Manager\\Environment",
+                       L"Path", &type);
+  const std::wstring install_dir_string = install_dir.wstring();
+  if (machine_path_contains(path, install_dir_string)) {
+    append_installer_log(L"machine PATH already contains vDS install dir");
+    broadcast_environment_change();
+    return;
+  }
+
+  if (!path.empty() && path.back() != L';') {
+    path.push_back(L';');
+  }
+  path += install_dir_string;
+
+  HKEY key = nullptr;
+  const LSTATUS status = RegOpenKeyExW(
+      HKEY_LOCAL_MACHINE,
+      L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", 0,
+      KEY_SET_VALUE, &key);
+  if (status != ERROR_SUCCESS) {
+    append_win32_error_log(L"failed to open machine environment registry key",
+                           status);
+    return;
+  }
+
+  if (type != REG_EXPAND_SZ) {
+    type = REG_SZ;
+  }
+  RegSetValueExW(key, L"Path", 0, type,
+                 reinterpret_cast<const BYTE *>(path.data()),
+                 static_cast<DWORD>((path.size() + 1) * sizeof(wchar_t)));
+  RegCloseKey(key);
+  broadcast_environment_change();
+  append_installer_log(L"machine PATH updated with vDS install dir");
+}
+
+void ensure_vdsd_service_registered(const std::filesystem::path &install_dir) {
+  const std::filesystem::path vdsd_path = install_dir / L"vdsd.exe";
+  if (!std::filesystem::exists(vdsd_path)) {
+    throw std::runtime_error("vdsd.exe was not installed");
+  }
+
+  ServiceHandle scm(OpenSCManagerW(
+      nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE));
+  if (!scm.get()) {
+    throw std::runtime_error("failed to open service control manager");
+  }
+
+  ServiceHandle service(OpenServiceW(scm.get(), L"vdsd",
+                                     SERVICE_CHANGE_CONFIG |
+                                         SERVICE_QUERY_STATUS | SERVICE_START));
+  if (!service.get()) {
+    const DWORD error = GetLastError();
+    if (error != ERROR_SERVICE_DOES_NOT_EXIST) {
+      throw std::runtime_error("failed to open vdsd service");
+    }
+
+    const std::wstring binary_path =
+        quote_command_argument(vdsd_path.wstring());
+    service = ServiceHandle(CreateServiceW(
+        scm.get(), L"vdsd", L"vDS Daemon",
+        SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS | SERVICE_START,
+        SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+        binary_path.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr));
+    if (!service.get()) {
+      throw std::runtime_error("failed to create vdsd service");
+    }
+    append_installer_log(L"vdsd service was created");
+  }
+
+  const std::wstring binary_path = quote_command_argument(vdsd_path.wstring());
+  if (!ChangeServiceConfigW(service.get(), SERVICE_NO_CHANGE,
+                            SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+                            binary_path.c_str(), nullptr, nullptr, nullptr,
+                            nullptr, nullptr, L"vDS Daemon")) {
+    throw std::runtime_error("failed to configure vdsd service");
+  }
+
+  SERVICE_DESCRIPTIONW description{};
+  description.lpDescription = const_cast<LPWSTR>(L"vDS userspace daemon");
+  ChangeServiceConfig2W(service.get(), SERVICE_CONFIG_DESCRIPTION,
+                        &description);
+  append_installer_log(L"vdsd service is registered for automatic startup");
+}
+
+void start_vdsd_service() {
+  ServiceHandle scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+  if (!scm.get()) {
+    append_win32_error_log(L"failed to open service control manager",
+                           GetLastError());
+    return;
+  }
+
+  ServiceHandle service(
+      OpenServiceW(scm.get(), L"vdsd", SERVICE_QUERY_STATUS | SERVICE_START));
+  if (!service.get()) {
+    append_win32_error_log(L"failed to open vdsd service", GetLastError());
+    return;
+  }
+
+  SERVICE_STATUS_PROCESS status{};
+  DWORD bytes_needed = 0;
+  if (QueryServiceStatusEx(service.get(), SC_STATUS_PROCESS_INFO,
+                           reinterpret_cast<LPBYTE>(&status), sizeof(status),
+                           &bytes_needed) &&
+      status.dwCurrentState == SERVICE_RUNNING) {
+    append_installer_log(L"vdsd service is already running");
+    return;
+  }
+
+  if (!StartServiceW(service.get(), 0, nullptr)) {
+    const DWORD error = GetLastError();
+    if (error != ERROR_SERVICE_ALREADY_RUNNING) {
+      append_win32_error_log(L"failed to start vdsd service", error);
+      return;
+    }
+  }
+
+  for (int attempt = 0; attempt < 40; ++attempt) {
+    if (QueryServiceStatusEx(service.get(), SC_STATUS_PROCESS_INFO,
+                             reinterpret_cast<LPBYTE>(&status), sizeof(status),
+                             &bytes_needed) &&
+        status.dwCurrentState == SERVICE_RUNNING) {
+      append_installer_log(L"vdsd service started");
+      return;
+    }
+    Sleep(250);
+  }
+  append_installer_log(L"vdsd service did not report running after start");
+}
+
 void append_msi_log_arguments(std::wstring &command_line) {
   command_line += L" /l*vx! ";
   command_line += quote_command_argument(installer_log_path().wstring());
@@ -271,7 +573,8 @@ int run_main_msi(const std::filesystem::path &msi,
       quote_command_argument(system_executable(L"msiexec.exe").wstring());
   command_line += L" /i ";
   command_line += quote_command_argument(msi.wstring());
-  command_line += L" VDS_SETUP_LAUNCHED=1 VDS_SETUP_SOURCE=";
+  command_line += L" ADDLOCAL=MainFeature VDS_SETUP_LAUNCHED=1 "
+                  L"VDS_SETUP_SOURCE=";
   command_line += quote_command_argument(setup_source.wstring());
   command_line += L" /norestart";
   append_msi_log_arguments(command_line);
@@ -303,15 +606,6 @@ int run_driver_msi(const std::filesystem::path &msi) {
   return run_process(std::move(command_line), SW_SHOWNORMAL);
 }
 
-bool filter_driver_selected() {
-  std::vector<wchar_t> value(64);
-  DWORD bytes = static_cast<DWORD>(value.size() * sizeof(wchar_t));
-  const LSTATUS status =
-      RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\vDS\\Setup", L"FilterDriver",
-                   RRF_RT_REG_SZ, nullptr, value.data(), &bytes);
-  return status != ERROR_SUCCESS || std::wstring_view(value.data()) == L"1";
-}
-
 void reboot_now() {
   std::wstring command_line =
       quote_command_argument(system_executable(L"shutdown.exe").wstring());
@@ -330,10 +624,24 @@ void remove_setup_cache_after_exit() {
   std::filesystem::path cache_dir(temp_path.data());
   cache_dir /= L"vDSSetup";
 
-  std::wstring command_line =
-      quote_command_argument(system_executable(L"cmd.exe").wstring());
-  command_line += L" /d /c ping -n 3 127.0.0.1 > nul & rmdir /s /q ";
-  command_line += quote_command_argument(cache_dir.wstring());
+  std::wstring command_line = quote_command_argument(
+      system_executable(L"WindowsPowerShell\\v1.0\\powershell.exe").wstring());
+  command_line += L" -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+                  L"-WindowStyle Hidden -Command ";
+
+  const std::wstring quoted_cache_dir =
+      quote_powershell_single_quoted_string(cache_dir.wstring());
+  std::wstring script = L"Start-Sleep -Seconds 2; "
+                        L"for ($i = 0; $i -lt 30; ++$i) { "
+                        L"Remove-Item -LiteralPath ";
+  script += quoted_cache_dir;
+  script += L" -Recurse -Force -ErrorAction SilentlyContinue; "
+            L"if (!(Test-Path -LiteralPath ";
+  script += quoted_cache_dir;
+  script += L")) { break }; "
+            L"Start-Sleep -Seconds 1 "
+            L"}";
+  command_line += quote_command_argument(script);
   launch_process(std::move(command_line), SW_HIDE);
 }
 
@@ -381,6 +689,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   std::filesystem::path work_dir;
   try {
     reset_installer_log();
+    {
+      std::wstring message = L"vDS setup version: ";
+      message += kVdsSetupVersion;
+      append_installer_log(message);
+    }
     append_installer_log(uninstall ? L"vDS setup launcher started: uninstall"
                                    : L"vDS setup launcher started: install");
 
@@ -413,6 +726,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
       return 0;
     }
 
+    const std::filesystem::path install_dir = installed_vds_dir();
+    {
+      std::wstring message = L"installed vDS dir: ";
+      message += install_dir.wstring();
+      append_installer_log(message);
+    }
+    ensure_vdsd_service_registered(install_dir);
+    ensure_machine_path(install_dir);
+
     int driver_status = run_driver_msi(work_dir / L"vDS-usb-setup.msi");
     if (!is_success_exit_code(driver_status)) {
       show_failed_status(L"installing vds_usb.sys", driver_status);
@@ -421,26 +743,29 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
       return driver_status;
     }
 
-    if (filter_driver_selected()) {
-      driver_status = run_driver_msi(work_dir / L"vDS-filter-setup.msi");
-      if (!is_success_exit_code(driver_status)) {
-        show_failed_status(L"installing vds_filter.sys", driver_status);
-        std::filesystem::remove_all(work_dir);
-        append_installer_log(L"vds_filter installer failed");
-        return driver_status;
-      }
+    driver_status = run_driver_msi(work_dir / L"vDS-filter-setup.msi");
+    if (!is_success_exit_code(driver_status)) {
+      show_failed_status(L"installing vds_filter.sys", driver_status);
+      std::filesystem::remove_all(work_dir);
+      append_installer_log(L"vds_filter installer failed");
+      return driver_status;
     }
+
+    ensure_vdsd_service_registered(install_dir);
+    start_vdsd_service();
 
     prompt_reboot();
     std::filesystem::remove_all(work_dir);
     append_installer_log(L"vDS setup install finished");
     return 0;
-  } catch (const std::exception &) {
+  } catch (const std::exception &error) {
     if (!work_dir.empty()) {
       std::error_code ignored;
       std::filesystem::remove_all(work_dir, ignored);
     }
-    append_installer_log(L"vDS setup failed unexpectedly");
+    std::wstring message = L"vDS setup failed unexpectedly: ";
+    message += wide_from_ascii(error.what());
+    append_installer_log(message);
     MessageBoxW(nullptr, L"vDS setup failed unexpectedly.", L"vDS Setup",
                 MB_OK | MB_ICONERROR);
     return 1;

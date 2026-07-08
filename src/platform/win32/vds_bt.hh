@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "uapi/vds.h"
+#include "unique_handle.hh"
 #include "vds_io.hh"
 
 namespace vds::win {
@@ -48,9 +49,40 @@ struct HidBluetoothDevice {
   bool access_restricted = false;
 };
 
+struct HidBluetoothDeviceSnapshot {
+  std::uint32_t generation = 0;
+  std::vector<HidBluetoothDevice> devices;
+};
+
+class FilterBluetoothDeviceChangeWait {
+public:
+  FilterBluetoothDeviceChangeWait();
+  ~FilterBluetoothDeviceChangeWait();
+
+  FilterBluetoothDeviceChangeWait(const FilterBluetoothDeviceChangeWait &) =
+      delete;
+  FilterBluetoothDeviceChangeWait &
+  operator=(const FilterBluetoothDeviceChangeWait &) = delete;
+
+  bool arm(std::uint32_t generation);
+  bool complete();
+  void cancel();
+
+  HANDLE event() const { return event_.get(); }
+  bool pending() const { return pending_; }
+
+private:
+  UniqueHandle handle_;
+  UniqueHandle event_;
+  OVERLAPPED overlapped_{};
+  vds_filter_device_change change_{};
+  bool pending_ = false;
+};
+
 std::optional<HidBluetoothDevice>
 find_filter_bluetooth_device(const std::string &address);
 bool filter_provider_available();
+HidBluetoothDeviceSnapshot list_filter_bluetooth_device_snapshot();
 std::vector<HidBluetoothDevice> list_filter_bluetooth_devices();
 std::string describe_bluetooth_lookup(const std::string &address);
 std::unique_ptr<BluetoothTransport>

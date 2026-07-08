@@ -284,7 +284,9 @@ function New-SetupPayloadHeader {
     [Parameter(Mandatory = $true)]
     [string]$UsbMsiPath,
     [Parameter(Mandatory = $true)]
-    [string]$FilterMsiPath
+    [string]$FilterMsiPath,
+    [Parameter(Mandatory = $true)]
+    [string]$DisplayVersion
   )
 
   $Payloads = @(
@@ -310,6 +312,9 @@ function New-SetupPayloadHeader {
   [void]$Builder.AppendLine()
   [void]$Builder.AppendLine("#include <cstddef>")
   [void]$Builder.AppendLine("#include <cstdint>")
+  [void]$Builder.AppendLine()
+  $EscapedDisplayVersion = $DisplayVersion.Replace("\", "\\").Replace('"', '\"')
+  [void]$Builder.AppendLine("inline constexpr const wchar_t *kVdsSetupVersion = L`"$EscapedDisplayVersion`";")
   [void]$Builder.AppendLine()
   [void]$Builder.AppendLine("struct VdsSetupPayload {")
   [void]$Builder.AppendLine("  const wchar_t *file_name;")
@@ -421,6 +426,7 @@ function Resolve-VsDevCmd {
 
   $InstallPath = & $VsWhere `
     -latest `
+    -products "*" `
     -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
     -property installationPath
   if ($LASTEXITCODE -eq 0 -and ![string]::IsNullOrWhiteSpace($InstallPath)) {
@@ -451,7 +457,8 @@ function Build-NativeLauncher {
     [Parameter(Mandatory = $true)]
     [string]$OutputPath,
     [string]$IncludeDir = "",
-    [string]$ManifestPath = ""
+    [string]$ManifestPath = "",
+    [string[]]$LinkLibraries = @()
   )
 
   $Args = @(
@@ -476,6 +483,9 @@ function Build-NativeLauncher {
   "Shell32.lib",
   "User32.lib"
   )
+  foreach ($Library in $LinkLibraries) {
+    $Args += $Library
+  }
   if (![string]::IsNullOrWhiteSpace($ManifestPath)) {
     $Args += @(
     "/MANIFEST:EMBED",
@@ -549,6 +559,7 @@ $SetupPath = Join-Path $ResolvedOutputDir $SetupExeFileName
 
 $UninstallRunnerSource = Resolve-VdsPath -Path (Join-Path $ScriptDir "launcher\uninstall_runner.cc")
 $DriverScriptRunnerSource = Resolve-VdsPath -Path (Join-Path $ScriptDir "launcher\driver_script_runner.cc")
+$RootDeviceInstallerSource = Resolve-VdsPath -Path (Join-Path $ScriptDir "launcher\root_device_installer.cc")
 $SetupActionsSource = Resolve-VdsPath -Path (Join-Path $ScriptDir "launcher\setup_actions.cc")
 $SetupLauncherSource = Resolve-VdsPath -Path (Join-Path $ScriptDir "launcher\setup_launcher.cc")
 
@@ -558,6 +569,7 @@ $SetupPayloadHeader = Join-Path $GeneratedDir "setup_payload.hh"
 $SetupLauncherManifest = Join-Path $GeneratedDir "setup-launcher.manifest"
 $UninstallRunnerPath = Join-Path $GeneratedDir "vds-uninstall-runner.exe"
 $DriverScriptRunnerPath = Join-Path $GeneratedDir "vds-driver-script-runner.exe"
+$RootDeviceInstallerPath = Join-Path $GeneratedDir "vds-root-device-installer.exe"
 $SetupActionsPath = Join-Path $GeneratedDir "vds-setup-actions.dll"
 $MainMsiPath = Join-Path $GeneratedDir "vDS-setup.msi"
 $UsbMsiPath = Join-Path $GeneratedDir "vDS-usb-setup.msi"
@@ -575,6 +587,10 @@ Build-NativeLauncher `
 Build-NativeLauncher `
   -SourcePath $DriverScriptRunnerSource `
   -OutputPath $DriverScriptRunnerPath
+Build-NativeLauncher `
+  -SourcePath $RootDeviceInstallerSource `
+  -OutputPath $RootDeviceInstallerPath `
+  -LinkLibraries @("Newdev.lib", "Setupapi.lib")
 Build-NativeDll `
   -SourcePath $SetupActionsSource `
   -OutputPath $SetupActionsPath
@@ -587,6 +603,7 @@ Invoke-WixBuild `
 "-d", "DriverPackageRoot=$ResolvedDriverPackageRoot",
 "-d", "WindrvDir=$(Join-Path $RepoRoot "windrv")",
 "-d", "DriverScriptRunner=$DriverScriptRunnerPath",
+"-d", "RootDeviceInstaller=$RootDeviceInstallerPath",
 "-out", $UsbMsiPath
 ) `
   -FailureMessage "wix USB driver MSI build failed"
@@ -621,7 +638,8 @@ New-SetupPayloadHeader `
   -OutputPath $SetupPayloadHeader `
   -MainMsiPath $MainMsiPath `
   -UsbMsiPath $UsbMsiPath `
-  -FilterMsiPath $FilterMsiPath
+  -FilterMsiPath $FilterMsiPath `
+  -DisplayVersion $ResolvedDisplayVersion
 New-SetupLauncherManifest -OutputPath $SetupLauncherManifest
 Build-NativeLauncher `
   -SourcePath $SetupLauncherSource `

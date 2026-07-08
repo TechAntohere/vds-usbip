@@ -75,6 +75,7 @@ enum {
 	VDS_PORT_INFO_VERSION = 2,
 	VDS_PORT_BIND_VERSION = 1,
 	VDS_FILTER_DEVICE_LIST_VERSION = 1,
+	VDS_FILTER_DEVICE_CHANGE_VERSION = 1,
 	VDS_FILTER_MAX_DEVICES = 8,
 };
 
@@ -137,8 +138,15 @@ struct vds_filter_device_list {
 	__u32 version;
 	__u32 size;
 	__u32 count;
-	__u32 reserved;
+	__u32 generation;
 	struct vds_filter_device_info devices[VDS_FILTER_MAX_DEVICES];
+};
+
+struct vds_filter_device_change {
+	__u32 version;
+	__u32 size;
+	__u32 generation;
+	__u32 reserved;
 };
 
 #ifdef _WIN32
@@ -164,6 +172,10 @@ struct vds_filter_device_list {
 #define VDS_FILTER_IOCTL_GET_DEVICES                         \
 	VDS_WIN_CTL_CODE(VDS_WIN_FILE_DEVICE_UNKNOWN, 0x900, \
 			 VDS_WIN_METHOD_BUFFERED, VDS_WIN_FILE_READ_DATA)
+#define VDS_FILTER_IOCTL_WAIT_DEVICE_CHANGE                  \
+	VDS_WIN_CTL_CODE(VDS_WIN_FILE_DEVICE_UNKNOWN, 0x901, \
+			 VDS_WIN_METHOD_BUFFERED,            \
+			 VDS_WIN_FILE_READ_DATA | VDS_WIN_FILE_WRITE_DATA)
 #else
 #define VDS_IOC_GET_STATUS _IOR(VDS_IOC_MAGIC, 0x01, struct vds_status)
 #define VDS_IOC_SET_PROFILE _IOW(VDS_IOC_MAGIC, 0x02, struct vds_profile_config)

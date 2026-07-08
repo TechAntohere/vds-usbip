@@ -8,7 +8,8 @@
     <Property Id="INSTALL_USERSPACE" Value="1"/>
     <Property Id="INSTALL_PATH" Value="1" Secure="yes"/>
     <Property Id="INSTALL_VDS_USB" Value="1"/>
-    <Property Id="INSTALL_VDS_FILTER" Value="1" Secure="yes"/>
+    <Property Id="INSTALL_VDS_FILTER" Value="1"/>
+    <Property Id="ADDLOCAL" Value="MainFeature" Secure="yes"/>
     <Property Id="REMOVE_PROGRAMDATA" Secure="yes"/>
     <Property Id="REINSTALL" Secure="yes"/>
     <Property Id="REINSTALLMODE" Secure="yes"/>
@@ -38,11 +39,8 @@
           <File Id="fil_opus_dll" Source="$(var.ToolsDir)\opus.dll" KeyPath="yes"/>
         </Component>
         <Component Id="cmp_machine_path" Guid="{BF2684F5-F63B-4EB6-90A0-8A9F9A0E14FD}" Condition="INSTALL_PATH = &quot;1&quot;">
-          <Environment Id="env_machine_path" Name="PATH" Value="[INSTALLFOLDER]" Action="set" Part="last" System="yes"/>
+          <Environment Id="env_machine_path" Name="Path" Value="[INSTALLFOLDER]" Action="set" Part="last" System="yes"/>
           <RegistryValue Root="HKLM" Key="Software\vDS\Setup" Name="PathEntry" Type="string" Value="1" KeyPath="yes"/>
-        </Component>
-        <Component Id="cmp_filter_selection_marker" Guid="{8890110B-719B-46FC-8E0A-9200A5C30612}">
-          <RegistryValue Root="HKLM" Key="Software\vDS\Setup" Name="FilterDriver" Type="string" Value="[INSTALL_VDS_FILTER]" KeyPath="yes"/>
         </Component>
       </Directory>
     </StandardDirectory>
@@ -51,7 +49,6 @@
       <ComponentRef Id="cmp_vdsctl_exe"/>
       <ComponentRef Id="cmp_opus_dll"/>
       <ComponentRef Id="cmp_machine_path"/>
-      <ComponentRef Id="cmp_filter_selection_marker"/>
     </Feature>
     <CustomAction Id="SetVdsRepair" Property="VDS_REPAIR" Value="1"/>
     <CustomAction Id="SetVdsRerunInstall" Property="VDS_RERUN_INSTALL" Value="1"/>
@@ -67,7 +64,6 @@
     <CustomAction Id="PromptRebootAfterUninstall" BinaryRef="bin_setup_actions" DllEntry="PromptRebootAfterUninstall" Execute="immediate" Return="ignore"/>
     <CustomAction Id="UpdateDisplayVersion" BinaryRef="bin_setup_actions" DllEntry="UpdateDisplayVersion" Execute="immediate" Return="ignore"/>
     <CustomAction Id="ClearPathMarker" BinaryRef="bin_setup_actions" DllEntry="ClearPathMarker" Execute="deferred" Return="ignore" Impersonate="no"/>
-    <CustomAction Id="ClearFilterMarker" BinaryRef="bin_setup_actions" DllEntry="ClearFilterMarker" Execute="deferred" Return="ignore" Impersonate="no"/>
     <CustomAction Id="SetRemoveInstallDirectoriesData" Property="RemoveInstallDirectories" Value="[INSTALLFOLDER]"/>
     <CustomAction Id="RemoveInstallDirectories" BinaryRef="bin_setup_actions" DllEntry="RemoveInstallDirectories" Execute="deferred" Return="ignore" Impersonate="no"/>
     <CustomAction Id="SetRemoveProgramDataData" Property="RemoveProgramData" Value="[REMOVE_PROGRAMDATA]"/>
@@ -79,7 +75,6 @@
       <Custom Action="SetVdsExecuteRepair" Before="CostFinalize" Condition="Installed AND REINSTALL"/>
       <Custom Action="UninstallExistingInstall" After="InstallInitialize" Condition="VDS_EXPLICIT_UNINSTALL = &quot;1&quot; OR VDS_RERUN_INSTALL = &quot;1&quot; OR (REMOVE &lt;&gt; &quot;ALL&quot; AND NOT Installed)"/>
       <Custom Action="ClearPathMarker" After="InstallServices" Condition="(NOT Installed OR VDS_REPAIR = &quot;1&quot;) AND INSTALL_PATH &lt;&gt; &quot;1&quot;"/>
-      <Custom Action="ClearFilterMarker" After="ClearPathMarker" Condition="(NOT Installed OR VDS_REPAIR = &quot;1&quot;) AND INSTALL_VDS_FILTER &lt;&gt; &quot;1&quot;"/>
       <Custom Action="UpdateDisplayVersion" After="InstallFinalize" Condition="REMOVE &lt;&gt; &quot;ALL&quot;"/>
       <Custom Action="SetRemoveInstallDirectoriesData" After="RemoveFiles" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
       <Custom Action="RemoveInstallDirectories" After="SetRemoveInstallDirectoriesData" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
@@ -97,7 +92,6 @@
       <ProgressText Action="InstallFiles" Message="Installing vDS userspace tools"/>
       <ProgressText Action="InstallServices" Message="Registering the vDS Windows service"/>
       <ProgressText Action="ClearPathMarker" Message="Updating vDS PATH registration"/>
-      <ProgressText Action="ClearFilterMarker" Message="Updating vDS driver selection"/>
       <ProgressText Action="RemoveInstallDirectories" Message="Removing vDS userspace files"/>
       <ProgressText Action="RemoveProgramData" Message="Removing vDS ProgramData files"/>
       <ProgressText Action="RemoveVdsRegistry" Message="Removing vDS registry settings"/>
@@ -161,9 +155,8 @@
         <Control Id="Title" Type="Text" X="15" Y="6" Width="340" Height="18" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Welcome to the vDS Setup Wizard"/>
         <Control Id="Description" Type="Text" X="25" Y="26" Width="330" Height="24" Transparent="yes" NoPrefix="yes" Text="Please review this warning before installing the Windows drivers."/>
         <Control Id="TopLine" Type="Line" X="0" Y="50" Width="370" Height="0"/>
-        <Control Id="WarningText1" Type="Text" X="25" Y="70" Width="320" Height="18" NoPrefix="yes" Text="{\WixUI_Font_Warning}The vDS Windows drivers are experimental."/>
-        <Control Id="WarningText2" Type="Text" X="25" Y="95" Width="320" Height="18" NoPrefix="yes" Text="{\WixUI_Font_Warning}Installing or running them can cause unexpected"/>
-        <Control Id="WarningText3" Type="Text" X="25" Y="120" Width="320" Height="18" NoPrefix="yes" Text="{\WixUI_Font_Warning}system crashes or make Windows fail to boot."/>
+        <Control Id="WarningText1" Type="Text" X="25" Y="70" Width="320" Height="18" NoPrefix="yes" Text="{\WixUI_Font_Warning}Experimental Windows drivers"/>
+        <Control Id="WarningText2" Type="Text" X="25" Y="100" Width="320" Height="44" NoPrefix="yes" Text="Installing or running the vDS Windows drivers can cause unexpected system crashes or make Windows fail to boot."/>
         <Control Id="WarningDetail" Type="Text" X="25" Y="154" Width="320" Height="36" NoPrefix="yes" Text="Continue only if you understand that this driver package can make the system unstable."/>
         <Control Id="WarningAcknowledgedCheckBox" Type="CheckBox" X="25" Y="205" Width="320" Height="18" CheckBoxValue="1" Property="WARNINGACKNOWLEDGED" Text="I understand this warning"/>
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0"/>
@@ -194,9 +187,9 @@
         <Control Id="AddToPath" Type="CheckBox" X="58" Y="116" Width="160" Height="18" CheckBoxValue="1" Property="INSTALL_PATH" Text="Add install directory to PATH"/>
         <Control Id="KernelDriverLabel" Type="Text" X="40" Y="140" Width="175" Height="14" NoPrefix="yes" Text="Kernel driver"/>
         <Control Id="VdsUsbDriver" Type="CheckBox" X="58" Y="158" Width="160" Height="18" CheckBoxValue="1" Property="INSTALL_VDS_USB" Disabled="yes" Text="vds_usb.sys"/>
-        <Control Id="VdsFilterDriver" Type="CheckBox" X="58" Y="180" Width="160" Height="18" CheckBoxValue="1" Property="INSTALL_VDS_FILTER" Text="vds_filter.sys"/>
+        <Control Id="VdsFilterDriver" Type="CheckBox" X="58" Y="180" Width="160" Height="18" CheckBoxValue="1" Property="INSTALL_VDS_FILTER" Disabled="yes" Text="vds_filter.sys"/>
         <Control Id="UserspaceDetails" Type="Text" X="244" Y="84" Width="104" Height="62" NoPrefix="yes" Text="Installs vdsd.exe, vdsctl.exe, the runtime DLL, and the vdsd Windows service."/>
-        <Control Id="DriverDetails" Type="Text" X="244" Y="154" Width="104" Height="48" NoPrefix="yes" Text="Installs the selected Windows kernel driver packages."/>
+        <Control Id="DriverDetails" Type="Text" X="244" Y="154" Width="104" Height="48" NoPrefix="yes" Text="Installs the required Windows kernel driver packages."/>
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0"/>
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="Back">
           <Publish Event="NewDialog" Value="WarningDlg"/>
