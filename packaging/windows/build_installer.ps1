@@ -82,8 +82,8 @@ function Resolve-VdsToolsDir {
   }
 
   $Candidates = @(
-  (Join-Path $RepoRoot "build\Release"),
-  (Join-Path $RepoRoot "build")
+    (Join-Path $RepoRoot "build\Release"),
+    (Join-Path $RepoRoot "build")
   )
   foreach ($Candidate in $Candidates) {
     if (Test-VdsToolsDir -Path $Candidate) {
@@ -105,13 +105,13 @@ function Test-VdsDriverPackageRoot {
   }
 
   $RequiredFiles = @(
-  "vds_usb\package\vds_usb.inf",
-  "vds_usb\package\vds_usb.sys",
-  "vds_usb\package\vds_usb.cat",
-  "vds_usb\vds_usb.reg",
-  "vds_filter\package\vds_filter.inf",
-  "vds_filter\package\vds_filter.sys",
-  "vds_filter\package\vds_filter.cat"
+    "vds_usb\package\vds_usb.inf",
+    "vds_usb\package\vds_usb.sys",
+    "vds_usb\package\vds_usb.cat",
+    "vds_usb\vds_usb.reg",
+    "vds_filter\package\vds_filter.inf",
+    "vds_filter\package\vds_filter.sys",
+    "vds_filter\package\vds_filter.cat"
   )
   foreach ($FileName in $RequiredFiles) {
     if (!(Test-Path -LiteralPath (Join-Path $Path $FileName) -PathType Leaf)) {
@@ -189,9 +189,9 @@ function New-LicenseRtf {
   $LicenseText = [System.IO.File]::ReadAllText($LicensePath)
   $LicenseRtf = ConvertTo-RtfEscapedText -Text $LicenseText
   [System.IO.File]::WriteAllText(
-  $OutputPath,
-  $LicenseRtf,
-  [System.Text.Encoding]::ASCII)
+    $OutputPath,
+    $LicenseRtf,
+    [System.Text.Encoding]::ASCII)
 }
 
 function ConvertTo-CxxByteArray {
@@ -218,26 +218,26 @@ function New-UninstallPayloadHeader {
   )
 
   $Payloads = @(
-  [pscustomobject]@{
-    Symbol = "kPayloadStopServicePs1"
-    RelativePath = "stop_service.ps1"
-    SourcePath = Join-Path $RepoRoot "stop_service.ps1"
-  },
-  [pscustomobject]@{
-    Symbol = "kPayloadUninstallServicePs1"
-    RelativePath = "uninstall_service.ps1"
-    SourcePath = Join-Path $RepoRoot "uninstall_service.ps1"
-  },
-  [pscustomobject]@{
-    Symbol = "kPayloadUninstallEnvPs1"
-    RelativePath = "uninstall_env.ps1"
-    SourcePath = Join-Path $RepoRoot "uninstall_env.ps1"
-  },
-  [pscustomobject]@{
-    Symbol = "kPayloadWindrvUninstallPs1"
-    RelativePath = "windrv\\uninstall.ps1"
-    SourcePath = Join-Path $RepoRoot "windrv\uninstall.ps1"
-  }
+    [pscustomobject]@{
+      Symbol = "kPayloadStopServicePs1"
+      RelativePath = "stop_service.ps1"
+      SourcePath = Join-Path $RepoRoot "stop_service.ps1"
+    },
+    [pscustomobject]@{
+      Symbol = "kPayloadUninstallServicePs1"
+      RelativePath = "uninstall_service.ps1"
+      SourcePath = Join-Path $RepoRoot "uninstall_service.ps1"
+    },
+    [pscustomobject]@{
+      Symbol = "kPayloadUninstallEnvPs1"
+      RelativePath = "uninstall_env.ps1"
+      SourcePath = Join-Path $RepoRoot "uninstall_env.ps1"
+    },
+    [pscustomobject]@{
+      Symbol = "kPayloadWindrvUninstallPs1"
+      RelativePath = "windrv\\uninstall.ps1"
+      SourcePath = Join-Path $RepoRoot "windrv\uninstall.ps1"
+    }
   )
 
   $Builder = [System.Text.StringBuilder]::new()
@@ -264,15 +264,15 @@ function New-UninstallPayloadHeader {
   [void]$Builder.AppendLine("inline constexpr VdsUninstallPayload kVdsUninstallPayloads[] = {")
   foreach ($Payload in $Payloads) {
     [void]$Builder.AppendLine(
-    "  {L`"$($Payload.RelativePath)`", $($Payload.Symbol), sizeof($($Payload.Symbol))},"
+      "  {L`"$($Payload.RelativePath)`", $($Payload.Symbol), sizeof($($Payload.Symbol))},"
     )
   }
   [void]$Builder.AppendLine("};")
 
   [System.IO.File]::WriteAllText(
-  $OutputPath,
-  $Builder.ToString(),
-  [System.Text.Encoding]::ASCII)
+    $OutputPath,
+    $Builder.ToString(),
+    [System.Text.Encoding]::ASCII)
 }
 
 function New-SetupPayloadHeader {
@@ -290,21 +290,21 @@ function New-SetupPayloadHeader {
   )
 
   $Payloads = @(
-  [pscustomobject]@{
-    Symbol = "kPayloadMainMsi"
-    FileName = "vDS-setup.msi"
-    SourcePath = $MainMsiPath
-  },
-  [pscustomobject]@{
-    Symbol = "kPayloadUsbMsi"
-    FileName = "vDS-usb-setup.msi"
-    SourcePath = $UsbMsiPath
-  },
-  [pscustomobject]@{
-    Symbol = "kPayloadFilterMsi"
-    FileName = "vDS-filter-setup.msi"
-    SourcePath = $FilterMsiPath
-  }
+    [pscustomobject]@{
+      Symbol = "kPayloadMainMsi"
+      FileName = "vDS-setup.msi"
+      SourcePath = $MainMsiPath
+    },
+    [pscustomobject]@{
+      Symbol = "kPayloadUsbMsi"
+      FileName = "vDS-usb-setup.msi"
+      SourcePath = $UsbMsiPath
+    },
+    [pscustomobject]@{
+      Symbol = "kPayloadFilterMsi"
+      FileName = "vDS-filter-setup.msi"
+      SourcePath = $FilterMsiPath
+    }
   )
 
   $Builder = [System.Text.StringBuilder]::new()
@@ -334,15 +334,15 @@ function New-SetupPayloadHeader {
   [void]$Builder.AppendLine("inline constexpr VdsSetupPayload kVdsSetupPayloads[] = {")
   foreach ($Payload in $Payloads) {
     [void]$Builder.AppendLine(
-    "  {L`"$($Payload.FileName)`", $($Payload.Symbol), sizeof($($Payload.Symbol))},"
+      "  {L`"$($Payload.FileName)`", $($Payload.Symbol), sizeof($($Payload.Symbol))},"
     )
   }
   [void]$Builder.AppendLine("};")
 
   [System.IO.File]::WriteAllText(
-  $OutputPath,
-  $Builder.ToString(),
-  [System.Text.Encoding]::ASCII)
+    $OutputPath,
+    $Builder.ToString(),
+    [System.Text.Encoding]::ASCII)
 }
 
 function New-SetupLauncherManifest {
@@ -352,35 +352,35 @@ function New-SetupLauncherManifest {
   )
 
   $ManifestLines = @(
-  '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-  '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">',
-  '  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="vDS.Setup" type="win32"/>',
-  '  <description>vDS Setup</description>',
-  '  <dependency>',
-  '    <dependentAssembly>',
-  '      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>',
-  '    </dependentAssembly>',
-  '  </dependency>',
-  '  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">',
-  '    <security>',
-  '      <requestedPrivileges>',
-  '        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>',
-  '      </requestedPrivileges>',
-  '    </security>',
-  '  </trustInfo>',
-  '  <application xmlns="urn:schemas-microsoft-com:asm.v3">',
-  '    <windowsSettings>',
-  '      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>',
-  '      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>',
-  '    </windowsSettings>',
-  '  </application>',
-  '</assembly>'
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">',
+    '  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="vDS.Setup" type="win32"/>',
+    '  <description>vDS Setup</description>',
+    '  <dependency>',
+    '    <dependentAssembly>',
+    '      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>',
+    '    </dependentAssembly>',
+    '  </dependency>',
+    '  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">',
+    '    <security>',
+    '      <requestedPrivileges>',
+    '        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>',
+    '      </requestedPrivileges>',
+    '    </security>',
+    '  </trustInfo>',
+    '  <application xmlns="urn:schemas-microsoft-com:asm.v3">',
+    '    <windowsSettings>',
+    '      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>',
+    '      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>',
+    '    </windowsSettings>',
+    '  </application>',
+    '</assembly>'
   )
 
   [System.IO.File]::WriteAllText(
-  $OutputPath,
-  (($ManifestLines -join "`r`n") + "`r`n"),
-  [System.Text.Encoding]::UTF8)
+    $OutputPath,
+    (($ManifestLines -join "`r`n") + "`r`n"),
+    [System.Text.Encoding]::UTF8)
 }
 
 function Invoke-NativeCompiler {
@@ -413,8 +413,8 @@ function Resolve-VsDevCmd {
     $VsWhere = $VsWhereCommand.Source
   } else {
     $VsWhereCandidates = @(
-    (Join-Path "${env:ProgramFiles(x86)}" "Microsoft Visual Studio\Installer\vswhere.exe"),
-    (Join-Path "$env:ProgramFiles" "Microsoft Visual Studio\Installer\vswhere.exe")
+      (Join-Path "${env:ProgramFiles(x86)}" "Microsoft Visual Studio\Installer\vswhere.exe"),
+      (Join-Path "$env:ProgramFiles" "Microsoft Visual Studio\Installer\vswhere.exe")
     )
     $VsWhere = $VsWhereCandidates |
       Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
@@ -462,34 +462,34 @@ function Build-NativeLauncher {
   )
 
   $Args = @(
-  "/nologo",
-  "/EHsc",
-  "/std:c++17",
-  "/W4",
-  "/DUNICODE",
-  "/D_UNICODE",
-  "/DWINVER=0x0A00",
-  "/D_WIN32_WINNT=0x0A00"
+    "/nologo",
+    "/EHsc",
+    "/std:c++17",
+    "/W4",
+    "/DUNICODE",
+    "/D_UNICODE",
+    "/DWINVER=0x0A00",
+    "/D_WIN32_WINNT=0x0A00"
   )
   if (![string]::IsNullOrWhiteSpace($IncludeDir)) {
     $Args += "/I$IncludeDir"
   }
 
   $Args += @(
-  "/Fe:$OutputPath",
-  $SourcePath,
-  "/link",
-  "Advapi32.lib",
-  "Shell32.lib",
-  "User32.lib"
+    "/Fe:$OutputPath",
+    $SourcePath,
+    "/link",
+    "Advapi32.lib",
+    "Shell32.lib",
+    "User32.lib"
   )
   foreach ($Library in $LinkLibraries) {
     $Args += $Library
   }
   if (![string]::IsNullOrWhiteSpace($ManifestPath)) {
     $Args += @(
-    "/MANIFEST:EMBED",
-    "/MANIFESTINPUT:$ManifestPath"
+      "/MANIFEST:EMBED",
+      "/MANIFESTINPUT:$ManifestPath"
     )
   }
 
@@ -505,19 +505,19 @@ function Build-NativeDll {
   )
 
   $Args = @(
-  "/nologo",
-  "/EHsc",
-  "/std:c++17",
-  "/W4",
-  "/DUNICODE",
-  "/D_UNICODE",
-  "/LD",
-  "/Fe:$OutputPath",
-  $SourcePath,
-  "/link",
-  "Msi.lib",
-  "Advapi32.lib",
-  "User32.lib"
+    "/nologo",
+    "/EHsc",
+    "/std:c++17",
+    "/W4",
+    "/DUNICODE",
+    "/D_UNICODE",
+    "/LD",
+    "/Fe:$OutputPath",
+    $SourcePath,
+    "/link",
+    "Msi.lib",
+    "Advapi32.lib",
+    "User32.lib"
   )
 
   Invoke-NativeCompiler -Arguments $Args -FailureMessage "native DLL build failed"
@@ -597,40 +597,40 @@ Build-NativeDll `
 
 Invoke-WixBuild `
   -Arguments @(
-(Join-Path $WixDir "DriverUsb.wxs"),
-"-arch", $Arch,
-"-d", "VdsVersion=$ResolvedVersion",
-"-d", "DriverPackageRoot=$ResolvedDriverPackageRoot",
-"-d", "WindrvDir=$(Join-Path $RepoRoot "windrv")",
-"-d", "DriverScriptRunner=$DriverScriptRunnerPath",
-"-d", "RootDeviceInstaller=$RootDeviceInstallerPath",
-"-out", $UsbMsiPath
+  (Join-Path $WixDir "DriverUsb.wxs"),
+  "-arch", $Arch,
+  "-d", "VdsVersion=$ResolvedVersion",
+  "-d", "DriverPackageRoot=$ResolvedDriverPackageRoot",
+  "-d", "WindrvDir=$(Join-Path $RepoRoot "windrv")",
+  "-d", "DriverScriptRunner=$DriverScriptRunnerPath",
+  "-d", "RootDeviceInstaller=$RootDeviceInstallerPath",
+  "-out", $UsbMsiPath
 ) `
   -FailureMessage "wix USB driver MSI build failed"
 
 Invoke-WixBuild `
   -Arguments @(
-(Join-Path $WixDir "DriverFilter.wxs"),
-"-arch", $Arch,
-"-d", "VdsVersion=$ResolvedVersion",
-"-d", "DriverPackageRoot=$ResolvedDriverPackageRoot",
-"-d", "WindrvDir=$(Join-Path $RepoRoot "windrv")",
-"-d", "DriverScriptRunner=$DriverScriptRunnerPath",
-"-out", $FilterMsiPath
+  (Join-Path $WixDir "DriverFilter.wxs"),
+  "-arch", $Arch,
+  "-d", "VdsVersion=$ResolvedVersion",
+  "-d", "DriverPackageRoot=$ResolvedDriverPackageRoot",
+  "-d", "WindrvDir=$(Join-Path $RepoRoot "windrv")",
+  "-d", "DriverScriptRunner=$DriverScriptRunnerPath",
+  "-out", $FilterMsiPath
 ) `
   -FailureMessage "wix filter driver MSI build failed"
 
 Invoke-WixBuild `
   -Arguments @(
-(Join-Path $WixDir "Product.wxs"),
-"-arch", $Arch,
-"-d", "VdsVersion=$ResolvedVersion",
-"-d", "VdsDisplayVersion=$ResolvedDisplayVersion",
-"-d", "LicenseRtf=$LicenseRtf",
-"-d", "ToolsDir=$ResolvedToolsDir",
-"-d", "SetupActions=$SetupActionsPath",
-"-d", "UninstallRunner=$UninstallRunnerPath",
-"-out", $MainMsiPath
+  (Join-Path $WixDir "Product.wxs"),
+  "-arch", $Arch,
+  "-d", "VdsVersion=$ResolvedVersion",
+  "-d", "VdsDisplayVersion=$ResolvedDisplayVersion",
+  "-d", "LicenseRtf=$LicenseRtf",
+  "-d", "ToolsDir=$ResolvedToolsDir",
+  "-d", "SetupActions=$SetupActionsPath",
+  "-d", "UninstallRunner=$UninstallRunnerPath",
+  "-out", $MainMsiPath
 ) `
   -FailureMessage "wix main MSI build failed"
 

@@ -61,7 +61,6 @@
     <Binary Id="bin_setup_actions" SourceFile="$(var.SetupActions)"/>
     <CustomAction Id="CheckTestSigning" BinaryRef="bin_setup_actions" DllEntry="CheckTestSigning" Execute="immediate" Return="check"/>
     <CustomAction Id="EnableTestSigningAndReboot" BinaryRef="bin_setup_actions" DllEntry="EnableTestSigningAndReboot" Execute="immediate" Return="check"/>
-    <CustomAction Id="PromptRebootAfterUninstall" BinaryRef="bin_setup_actions" DllEntry="PromptRebootAfterUninstall" Execute="immediate" Return="ignore"/>
     <CustomAction Id="UpdateDisplayVersion" BinaryRef="bin_setup_actions" DllEntry="UpdateDisplayVersion" Execute="immediate" Return="ignore"/>
     <CustomAction Id="ClearPathMarker" BinaryRef="bin_setup_actions" DllEntry="ClearPathMarker" Execute="deferred" Return="ignore" Impersonate="no"/>
     <CustomAction Id="SetRemoveInstallDirectoriesData" Property="RemoveInstallDirectories" Value="[INSTALLFOLDER]"/>
@@ -81,7 +80,6 @@
       <Custom Action="SetRemoveProgramDataData" After="RemoveInstallDirectories" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
       <Custom Action="RemoveProgramData" After="SetRemoveProgramDataData" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
       <Custom Action="RemoveVdsRegistry" After="RemoveProgramData" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
-      <Custom Action="PromptRebootAfterUninstall" After="InstallFinalize" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
     </InstallExecuteSequence>
     <UI>
       <TextStyle Id="WixUI_Font_Normal" FaceName="Segoe UI" Size="9"/>

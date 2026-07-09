@@ -212,6 +212,97 @@ std::wstring read_previous_install_dir() {
   return value.data();
 }
 
+std::wstring registry_string(HKEY key, const wchar_t *name) {
+  DWORD type = 0;
+  DWORD byte_count = 0;
+  if (RegQueryValueExW(key, name, nullptr, &type, nullptr, &byte_count) !=
+          ERROR_SUCCESS ||
+      (type != REG_SZ && type != REG_EXPAND_SZ)) {
+    return {};
+  }
+
+  std::wstring value(byte_count / sizeof(wchar_t), L'\0');
+  if (value.empty()) {
+    return {};
+  }
+  if (RegQueryValueExW(key, name, nullptr, nullptr,
+                       reinterpret_cast<BYTE *>(value.data()),
+                       &byte_count) != ERROR_SUCCESS) {
+    return {};
+  }
+  while (!value.empty() && value.back() == L'\0') {
+    value.pop_back();
+  }
+  return value;
+}
+
+bool is_vds_windows_installer_entry(HKEY uninstall_key) {
+  const std::wstring display_name =
+      registry_string(uninstall_key, L"DisplayName");
+  if (display_name == L"vDS USB Driver" ||
+      display_name == L"vDS Filter Driver") {
+    return true;
+  }
+
+  return display_name == L"vDS" &&
+         registry_string(uninstall_key, L"Publisher") == L"Jihong Min";
+}
+
+void delete_windows_installer_entries(REGSAM registry_view) {
+  HKEY uninstall_root = nullptr;
+  if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                    L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                    0,
+                    KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | KEY_SET_VALUE |
+                        DELETE | registry_view,
+                    &uninstall_root) != ERROR_SUCCESS) {
+    return;
+  }
+
+  DWORD index = 0;
+  while (true) {
+    wchar_t subkey_name[256]{};
+    DWORD subkey_name_length =
+        static_cast<DWORD>(sizeof(subkey_name) / sizeof(subkey_name[0]));
+    const LSTATUS enum_status =
+        RegEnumKeyExW(uninstall_root, index, subkey_name, &subkey_name_length,
+                      nullptr, nullptr, nullptr, nullptr);
+    if (enum_status == ERROR_NO_MORE_ITEMS) {
+      break;
+    }
+    if (enum_status != ERROR_SUCCESS) {
+      ++index;
+      continue;
+    }
+
+    bool remove_entry = false;
+    HKEY uninstall_key = nullptr;
+    if (RegOpenKeyExW(uninstall_root, subkey_name, 0, KEY_QUERY_VALUE,
+                      &uninstall_key) == ERROR_SUCCESS) {
+      remove_entry = is_vds_windows_installer_entry(uninstall_key);
+      RegCloseKey(uninstall_key);
+    }
+
+    if (remove_entry) {
+      std::wstring message = L"remove stale vDS Windows Installer entry: ";
+      message += subkey_name;
+      append_installer_log(message);
+      RegDeleteTreeW(uninstall_root, subkey_name);
+      continue;
+    }
+
+    ++index;
+  }
+
+  RegCloseKey(uninstall_root);
+}
+
+void delete_windows_installer_entries() {
+  delete_windows_installer_entries(KEY_WOW64_64KEY);
+  delete_windows_installer_entries(KEY_WOW64_32KEY);
+  delete_windows_installer_entries(0);
+}
+
 void append_process_output(std::wstring_view prefix, std::string_view output) {
   if (output.empty()) {
     std::wstring message(prefix);
@@ -360,6 +451,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     status = run_powershell_script(root / L"windrv\\uninstall.ps1",
                                    {L"-Target", L"all"});
     (void)status;
+
+    delete_windows_installer_entries();
 
     std::filesystem::remove_all(root);
     append_installer_log(L"existing vDS uninstall runner finished");

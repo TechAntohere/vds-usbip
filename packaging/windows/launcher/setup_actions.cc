@@ -621,14 +621,15 @@ std::wstring registry_string(HKEY key, const wchar_t *name) {
 }
 
 bool is_vds_windows_installer_entry(HKEY uninstall_key) {
-  if (registry_string(uninstall_key, L"Publisher") != L"Jihong Min") {
-    return false;
-  }
-
   const std::wstring display_name =
       registry_string(uninstall_key, L"DisplayName");
-  return display_name == L"vDS" || display_name == L"vDS USB Driver" ||
-         display_name == L"vDS Filter Driver";
+  if (display_name == L"vDS USB Driver" ||
+      display_name == L"vDS Filter Driver") {
+    return true;
+  }
+
+  return display_name == L"vDS" &&
+         registry_string(uninstall_key, L"Publisher") == L"Jihong Min";
 }
 
 void delete_windows_installer_entries(REGSAM registry_view) {
@@ -756,21 +757,6 @@ EnableTestSigningAndReboot(MSIHANDLE install) {
     delete_resume_cache();
     return ERROR_INSTALL_FAILURE;
   }
-}
-
-extern "C" __declspec(dllexport) UINT __stdcall
-PromptRebootAfterUninstall(MSIHANDLE) {
-  const int choice = MessageBoxW(
-      nullptr,
-      L"vDS has been removed from this computer.\n\n"
-      L"A Windows reboot is recommended before reinstalling vDS or using "
-      L"Bluetooth controller devices normally.\n\n"
-      L"Reboot now?",
-      L"vDS Setup", MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2);
-  if (choice == IDYES) {
-    reboot_now();
-  }
-  return ERROR_SUCCESS;
 }
 
 extern "C" __declspec(dllexport) UINT __stdcall

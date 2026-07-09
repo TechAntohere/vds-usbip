@@ -79,8 +79,8 @@ function Get-MSBuildPath {
     $VsWhere = $VsWhereCommand.Source
   } else {
     $VsWhereCandidates = @(
-    (Join-Path "${env:ProgramFiles(x86)}" "Microsoft Visual Studio\Installer\vswhere.exe"),
-    (Join-Path "$env:ProgramFiles" "Microsoft Visual Studio\Installer\vswhere.exe")
+      (Join-Path "${env:ProgramFiles(x86)}" "Microsoft Visual Studio\Installer\vswhere.exe"),
+      (Join-Path "$env:ProgramFiles" "Microsoft Visual Studio\Installer\vswhere.exe")
     )
     $VsWhere = $VsWhereCandidates |
       Where-Object { Test-Path -LiteralPath $_ } |
@@ -175,7 +175,7 @@ function Resolve-WindowsUdePaths {
     $UdeLibDir = Join-Path $UdeLibRoot $UdeVersion
     $UdeLib = Join-Path $UdeLibDir "udecxstub.lib"
     if ((Test-Path -LiteralPath $UdeHeader) -and
-    (Test-Path -LiteralPath $UdeLib)) {
+      (Test-Path -LiteralPath $UdeLib)) {
       return [pscustomobject]@{
         IncludeDir = $Candidate.FullName
         LibDir = $UdeLibDir
@@ -243,8 +243,8 @@ function Resolve-WindowsDriverKitVersion {
     if (!(Test-WindowsKitPatterns `
       -BasePath $VersionedBuildRoot `
       -RelativePatterns @(
-    "bin\Microsoft.DriverKit.Build.Tasks.*.dll",
-    "bin\Microsoft.DriverKit.Build.Tasks.PackageVerifier.*.dll"
+      "bin\Microsoft.DriverKit.Build.Tasks.*.dll",
+      "bin\Microsoft.DriverKit.Build.Tasks.PackageVerifier.*.dll"
     ))) {
       continue
     }
@@ -252,10 +252,10 @@ function Resolve-WindowsDriverKitVersion {
     if (!(Test-WindowsKitPaths `
       -BasePath $VersionedIncludeRoot `
       -RelativePaths @(
-    "km\ntddk.h",
-    "km\ntifs.h",
-    "shared\ntdef.h",
-    "um\windows.h"
+      "km\ntddk.h",
+      "km\ntifs.h",
+      "shared\ntdef.h",
+      "um\windows.h"
     ))) {
       continue
     }
@@ -263,8 +263,8 @@ function Resolve-WindowsDriverKitVersion {
     if (!(Test-WindowsKitPaths `
       -BasePath $VersionedLibRoot `
       -RelativePaths @(
-    "km\$Platform",
-    "um\$Platform"
+      "km\$Platform",
+      "um\$Platform"
     ))) {
       continue
     }
@@ -303,15 +303,15 @@ function Resolve-WindowsDriverKitPaths {
     if (!(Test-WindowsKitPaths `
       -BasePath $KmdfIncludeRoot `
       -RelativePaths @(
-    "$KmdfVersion\wdf.h"
+      "$KmdfVersion\wdf.h"
     ))) {
       throw "KMDF header was not found for KMDF $KmdfVersion"
     }
     if (!(Test-WindowsKitPaths `
       -BasePath $KmdfLibRoot `
       -RelativePaths @(
-    "$Platform\$KmdfVersion\WdfLdr.lib",
-    "$Platform\$KmdfVersion\WdfDriverEntry.lib"
+      "$Platform\$KmdfVersion\WdfLdr.lib",
+      "$Platform\$KmdfVersion\WdfDriverEntry.lib"
     ))) {
       throw "KMDF libraries were not found for KMDF $KmdfVersion"
     }
@@ -346,9 +346,9 @@ function Resolve-WindowsKitTool {
 
   $BinRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
   $PreferredPaths = @(
-  (Join-Path $BinRoot "$KitVersion\$Platform\$ToolName"),
-  (Join-Path $BinRoot "$KitVersion\x64\$ToolName"),
-  (Join-Path $BinRoot "$KitVersion\x86\$ToolName")
+    (Join-Path $BinRoot "$KitVersion\$Platform\$ToolName"),
+    (Join-Path $BinRoot "$KitVersion\x64\$ToolName"),
+    (Join-Path $BinRoot "$KitVersion\x86\$ToolName")
   )
   foreach ($PreferredPath in $PreferredPaths) {
     if (Test-Path -LiteralPath $PreferredPath) {
@@ -427,16 +427,16 @@ function Build-TargetPackage {
     -ErrorAction SilentlyContinue
 
   $MSBuildArgs = @(
-  $Spec.ProjectPath
-  "/m"
-  "/t:Clean,Build"
-  "/p:Configuration=$Configuration"
-  "/p:Platform=$Platform"
-  "/p:WindowsTargetPlatformVersion=$WindowsDriverKitVersion"
-  "/p:VdsWindowsKernelKitVersion=$WindowsDriverKitVersion"
-  "/p:SignMode=Off"
-  "/p:EnableInf2cat=false"
-  "/p:SkipPackageVerification=true"
+    $Spec.ProjectPath
+    "/m"
+    "/t:Clean,Build"
+    "/p:Configuration=$Configuration"
+    "/p:Platform=$Platform"
+    "/p:WindowsTargetPlatformVersion=$WindowsDriverKitVersion"
+    "/p:VdsWindowsKernelKitVersion=$WindowsDriverKitVersion"
+    "/p:SignMode=Off"
+    "/p:EnableInf2cat=false"
+    "/p:SkipPackageVerification=true"
   )
   if ($Spec.RequiresKmdf) {
     $MSBuildArgs += "/p:VdsWindowsKmdfIncludeDir=$WindowsKmdfIncludeDir"

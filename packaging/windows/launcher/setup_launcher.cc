@@ -649,11 +649,28 @@ void prompt_reboot() {
   const int choice = MessageBoxW(
       nullptr,
       L"vDS setup has finished installing the selected components.\n\n"
-      L"A Windows reboot is recommended before using vDS.\n\n"
+      L"A Windows reboot is required before using vDS.\n\n"
       L"Reboot now?",
       L"vDS Setup", MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2);
   if (choice == IDYES) {
     reboot_now();
+  }
+}
+
+void prompt_reboot_after_uninstall() {
+  const int choice = MessageBoxW(
+      nullptr,
+      L"vDS has been removed from this computer.\n\n"
+      L"A Windows reboot is required before reinstalling vDS or using "
+      L"Bluetooth controller devices normally.\n\n"
+      L"Reboot now?",
+      L"vDS Setup",
+      MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2 | MB_SETFOREGROUND);
+  if (choice == IDYES) {
+    append_installer_log(L"user accepted reboot after uninstall");
+    reboot_now();
+  } else {
+    append_installer_log(L"user declined reboot after uninstall");
   }
 }
 
@@ -723,6 +740,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
       std::filesystem::remove_all(work_dir);
       remove_setup_cache_after_exit();
       append_installer_log(L"vDS setup uninstall finished");
+      prompt_reboot_after_uninstall();
       return 0;
     }
 

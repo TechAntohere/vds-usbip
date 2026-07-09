@@ -29,12 +29,12 @@ function Test-VdsUsbRootDevice {
   )
 
   if ($Device.InstanceId -eq "ROOT\DEVGEN\VDSUSB0" -or
-  $Device.FriendlyName -eq "vDS USB Root Hub") {
+    $Device.FriendlyName -eq "vDS USB Root Hub") {
     return $true
   }
 
   if ($Device.InstanceId -notlike "ROOT\DEVGEN\*" -and
-  $Device.InstanceId -notlike "ROOT\USB\*") {
+    $Device.InstanceId -notlike "ROOT\USB\*") {
     return $false
   }
 
@@ -137,7 +137,7 @@ function Reload-VdsFilter {
       Write-Warning "pnputil restart-device failed with exit code $RestartExitCode"
       $global:LASTEXITCODE = 0
       Write-Warning "Removing stale Bluetooth HID device $($_.InstanceId) so it can re-enumerate with the current vds_filter package."
-      pnputil /remove-device $_.InstanceId | Out-Host
+      pnputil /remove-device $_.InstanceId /subtree /force | Out-Host
       if ($LASTEXITCODE -eq 3010) {
         Write-Warning "pnputil requested a reboot while removing stale Bluetooth HID device $($_.InstanceId)."
         $global:LASTEXITCODE = 0

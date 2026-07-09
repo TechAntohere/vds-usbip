@@ -45,24 +45,24 @@ function Write-VdsException {
 
 function Write-RebootPendingState {
   $Checks = @(
-  [pscustomobject]@{
-    Name = "Component Based Servicing"
-    Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
-  },
-  [pscustomobject]@{
-    Name = "Windows Update"
-    Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
-  },
-  [pscustomobject]@{
-    Name = "UpdateExeVolatile"
-    Path = "HKLM:\SOFTWARE\Microsoft\Updates"
-    Value = "UpdateExeVolatile"
-  },
-  [pscustomobject]@{
-    Name = "PendingFileRenameOperations"
-    Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
-    Value = "PendingFileRenameOperations"
-  }
+    [pscustomobject]@{
+      Name = "Component Based Servicing"
+      Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
+    },
+    [pscustomobject]@{
+      Name = "Windows Update"
+      Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+    },
+    [pscustomobject]@{
+      Name = "UpdateExeVolatile"
+      Path = "HKLM:\SOFTWARE\Microsoft\Updates"
+      Value = "UpdateExeVolatile"
+    },
+    [pscustomobject]@{
+      Name = "PendingFileRenameOperations"
+      Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
+      Value = "PendingFileRenameOperations"
+    }
   )
 
   foreach ($Check in $Checks) {
@@ -196,7 +196,7 @@ function Remove-PnpDriverByOriginalName {
     $_.Driver -and
     $_.OriginalFileName -and
     (Split-Path $_.OriginalFileName -Leaf).Equals(
-    $OriginalName, [System.StringComparison]::OrdinalIgnoreCase)
+      $OriginalName, [System.StringComparison]::OrdinalIgnoreCase)
   } |
     ForEach-Object {
     Write-Output "Removing driver package $($_.Driver) ($OriginalName)"
@@ -231,8 +231,8 @@ function Remove-PnpDriverByOriginalName {
       continue
     }
     if ($Line -match "Original Name\s*:\s*(\S+)" -and
-    $Matches[1].Equals($OriginalName, [System.StringComparison]::OrdinalIgnoreCase) -and
-    $PublishedName) {
+      $Matches[1].Equals($OriginalName, [System.StringComparison]::OrdinalIgnoreCase) -and
+      $PublishedName) {
       Write-Output "Removing driver package $PublishedName ($OriginalName)"
       $PnpUtilArgs = @("/delete-driver", $PublishedName)
       if ($UninstallDevices) {
@@ -326,12 +326,12 @@ function Test-VdsUsbRootDevice {
   )
 
   if ($Device.InstanceId -eq "ROOT\DEVGEN\VDSUSB0" -or
-  $Device.FriendlyName -eq "vDS USB Root Hub") {
+    $Device.FriendlyName -eq "vDS USB Root Hub") {
     return $true
   }
 
   if ($Device.InstanceId -notlike "ROOT\DEVGEN\*" -and
-  $Device.InstanceId -notlike "ROOT\USB\*") {
+    $Device.InstanceId -notlike "ROOT\USB\*") {
     return $false
   }
 
@@ -357,8 +357,54 @@ function Remove-VdsUsbRootDevices {
   }
   foreach ($Device in $RootDevices) {
     Write-Output "Removing vDS USB root device $($Device.InstanceId)"
-    Write-VdsStep "running pnputil /remove-device $($Device.InstanceId)"
-    pnputil /remove-device $Device.InstanceId | Out-Host
+    $PnpUtilArgs = @("/remove-device", $Device.InstanceId, "/subtree", "/force")
+    Write-VdsStep "running pnputil $($PnpUtilArgs -join ' ')"
+    pnputil @PnpUtilArgs | Out-Host
+    Write-VdsStep "pnputil remove-device exit code: $LASTEXITCODE"
+    if ($LASTEXITCODE -eq 3010) {
+      Write-Warning "pnputil requested a reboot while removing $($Device.InstanceId)."
+      $global:LASTEXITCODE = 0
+    } elseif ($LASTEXITCODE -ne 0) {
+      Write-Warning "pnputil remove-device failed with exit code $LASTEXITCODE"
+      $global:LASTEXITCODE = 0
+    }
+  }
+}
+
+function Test-VdsFilterDevice {
+  param(
+    [Parameter(Mandatory = $true)]
+    $Device
+  )
+
+  if ($Device.FriendlyName -ne "vDS Filter") {
+    return $false
+  }
+
+  if ($Device.InstanceId -like "USB\VID_054C&PID_0CE6&MI_03\*" -or
+    $Device.InstanceId -like "USB\VID_054C&PID_0DF2&MI_03\*" -or
+    $Device.InstanceId -like "HID\VID_054C&PID_0CE6&MI_03\*" -or
+    $Device.InstanceId -like "HID\VID_054C&PID_0DF2&MI_03\*" -or
+    $Device.InstanceId -like "HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\*" -or
+    $Device.InstanceId -like "HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0DF2\*" -or
+    $Device.InstanceId -like "BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\*" -or
+    $Device.InstanceId -like "BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0DF2\*") {
+    return $true
+  }
+
+  return $false
+}
+
+function Remove-VdsFilterDevices {
+  $FilterDevices = Get-PnpDevice -ErrorAction SilentlyContinue |
+    Where-Object {
+    Test-VdsFilterDevice $_
+  }
+  foreach ($Device in $FilterDevices) {
+    Write-Output "Removing vDS filter device $($Device.InstanceId)"
+    $PnpUtilArgs = @("/remove-device", $Device.InstanceId, "/subtree", "/force")
+    Write-VdsStep "running pnputil $($PnpUtilArgs -join ' ')"
+    pnputil @PnpUtilArgs | Out-Host
     Write-VdsStep "pnputil remove-device exit code: $LASTEXITCODE"
     if ($LASTEXITCODE -eq 3010) {
       Write-Warning "pnputil requested a reboot while removing $($Device.InstanceId)."
@@ -387,19 +433,19 @@ function Import-VdsUsbRegistrySettings {
   }
 
   $JoystickOemEntries = @(
-  [pscustomobject]@{
-    DeviceKey = "VID_054C&PID_0CE6"
-    DeviceName = "DualSense Wireless Controller"
-  },
-  [pscustomobject]@{
-    DeviceKey = "VID_054C&PID_0DF2"
-    DeviceName = "DualSense Edge Wireless Controller"
-  }
+    [pscustomobject]@{
+      DeviceKey = "VID_054C&PID_0CE6"
+      DeviceName = "DualSense Wireless Controller"
+    },
+    [pscustomobject]@{
+      DeviceKey = "VID_054C&PID_0DF2"
+      DeviceName = "DualSense Edge Wireless Controller"
+    }
   )
   foreach ($JoystickOemEntry in $JoystickOemEntries) {
     $JoystickOemPaths = @(
-    "HKLM:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\$($JoystickOemEntry.DeviceKey)",
-    "HKCU:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\$($JoystickOemEntry.DeviceKey)"
+      "HKLM:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\$($JoystickOemEntry.DeviceKey)",
+      "HKCU:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\$($JoystickOemEntry.DeviceKey)"
     )
     foreach ($JoystickOemPath in $JoystickOemPaths) {
       New-Item -Path $JoystickOemPath -Force | Out-Null
@@ -411,41 +457,7 @@ function Import-VdsUsbRegistrySettings {
   }
 }
 
-function Resolve-DriverStoreServiceBinary {
-  param(
-    [Parameter(Mandatory = $true)]
-    $Spec
-  )
-
-  $Repository = Join-Path $env:SystemRoot "System32\DriverStore\FileRepository"
-  $Candidates = Get-ChildItem `
-    -Path $Repository `
-    -Directory `
-    -Filter "$($Spec.InfName)_*" `
-    -ErrorAction SilentlyContinue |
-    ForEach-Object {
-    Join-Path $_.FullName $Spec.DriverFile
-  } |
-    Where-Object {
-    Test-Path $_
-  } |
-    Sort-Object {
-    (Get-Item $_).LastWriteTimeUtc
-  } -Descending
-
-  if (!$Candidates) {
-    return ""
-  }
-
-  $FullPath = [System.IO.Path]::GetFullPath($Candidates[0])
-  $SystemRoot = [System.IO.Path]::GetFullPath($env:SystemRoot).TrimEnd("\")
-  if ($FullPath.StartsWith($SystemRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-    return "\SystemRoot" + $FullPath.Substring($SystemRoot.Length)
-  }
-  return $FullPath
-}
-
-function Ensure-VdsFilterServiceLoaded {
+function Confirm-VdsFilterServiceRegistration {
   param(
     [Parameter(Mandatory = $true)]
     $Spec
@@ -455,57 +467,12 @@ function Ensure-VdsFilterServiceLoaded {
     return
   }
 
-  & sc.exe query $Spec.ServiceName >$null 2>$null
+  Write-VdsStep "checking PnP driver service registration for $($Spec.ServiceName)"
+  & sc.exe query $Spec.ServiceName | Out-Host
+  Write-VdsStep "sc.exe query $($Spec.ServiceName) exit code: $LASTEXITCODE"
   if ($LASTEXITCODE -ne 0) {
+    Write-Warning "$($Spec.ServiceName) service is not registered yet. This is normal when no matching HID/Bluetooth device was installed during setup; Windows will create and load it from the staged INF when a matching device enumerates."
     $global:LASTEXITCODE = 0
-    $ServiceBinary = Resolve-DriverStoreServiceBinary -Spec $Spec
-    if ([string]::IsNullOrWhiteSpace($ServiceBinary)) {
-      throw "failed to locate $($Spec.DriverFile) in DriverStore"
-    }
-
-    Write-Output "Creating driver service $($Spec.ServiceName)"
-    Write-VdsStep "running sc.exe create $($Spec.ServiceName)"
-    & sc.exe create $Spec.ServiceName `
-      "type=" "kernel" `
-      "start=" "demand" `
-      "binPath=" $ServiceBinary `
-      "DisplayName=" $Spec.DisplayName | Out-Host
-    Write-VdsStep "sc.exe create $($Spec.ServiceName) exit code: $LASTEXITCODE"
-    if ($LASTEXITCODE -eq 1072) {
-      Write-Warning "driver service $($Spec.ServiceName) is marked for deletion; reboot is required before it can be recreated."
-      $global:LASTEXITCODE = 0
-      return
-    }
-    if ($LASTEXITCODE -ne 0) {
-      throw "sc create $($Spec.ServiceName) failed with exit code $LASTEXITCODE"
-    }
-  } else {
-    $global:LASTEXITCODE = 0
-  }
-
-  Write-Output "Configuring driver service $($Spec.ServiceName)"
-  Write-VdsStep "running sc.exe config $($Spec.ServiceName)"
-  & sc.exe config $Spec.ServiceName "start=" "demand" | Out-Host
-  Write-VdsStep "sc.exe config $($Spec.ServiceName) exit code: $LASTEXITCODE"
-  if ($LASTEXITCODE -eq 1072) {
-    Write-Warning "driver service $($Spec.ServiceName) is marked for deletion; reboot is required before it can be configured."
-    $global:LASTEXITCODE = 0
-    return
-  } elseif ($LASTEXITCODE -ne 0) {
-    throw "sc config $($Spec.ServiceName) failed with exit code $LASTEXITCODE"
-  }
-
-  Write-Output "Starting driver service $($Spec.ServiceName)"
-  Write-VdsStep "running sc.exe start $($Spec.ServiceName)"
-  & sc.exe start $Spec.ServiceName | Out-Host
-  Write-VdsStep "sc.exe start $($Spec.ServiceName) exit code: $LASTEXITCODE"
-  if ($LASTEXITCODE -eq 1056) {
-    $global:LASTEXITCODE = 0
-  } elseif ($LASTEXITCODE -eq 1072) {
-    Write-Warning "driver service $($Spec.ServiceName) is marked for deletion; reboot is required before it can be started."
-    $global:LASTEXITCODE = 0
-  } elseif ($LASTEXITCODE -ne 0) {
-    throw "sc start $($Spec.ServiceName) failed with exit code $LASTEXITCODE"
   }
 }
 
@@ -529,7 +496,7 @@ function Invoke-VdsDriverReload {
   }
 
   if ($Spec.Name -eq "vds_filter") {
-    Write-Warning "reload.ps1 is not present; continuing with vds_filter service activation."
+    Write-Warning "reload.ps1 is not present; continuing after staging the vds_filter driver package."
     return
   }
 
@@ -574,7 +541,7 @@ function Install-TargetPackage {
   }
 
   Invoke-VdsDriverReload -Spec $Spec
-  Ensure-VdsFilterServiceLoaded -Spec $Spec
+  Confirm-VdsFilterServiceRegistration -Spec $Spec
 }
 
 try {
@@ -592,6 +559,9 @@ try {
     Write-VdsStep "removing previous driver packages and devices before install"
     if (($SelectedSpecs | Where-Object { $_.Name -eq "vds_usb" })) {
       Remove-VdsUsbRootDevices
+    }
+    if (($SelectedSpecs | Where-Object { $_.Name -eq "vds_filter" })) {
+      Remove-VdsFilterDevices
     }
     foreach ($Spec in $SelectedSpecs) {
       Remove-PnpDriverByOriginalName -OriginalName $Spec.InfName -UninstallDevices $true

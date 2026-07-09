@@ -127,8 +127,8 @@ function Get-VdsVersionTagInfoFromGit {
 
   try {
     $InsideWorkTree = Invoke-VdsGit -RepoRoot $RepoRoot -Arguments @(
-    "rev-parse",
-    "--is-inside-work-tree"
+      "rev-parse",
+      "--is-inside-work-tree"
     )
   } catch {
     return $null
@@ -138,10 +138,10 @@ function Get-VdsVersionTagInfoFromGit {
   }
 
   $Tags = Invoke-VdsGit -RepoRoot $RepoRoot -Arguments @(
-  "tag",
-  "--merged",
-  "HEAD",
-  "--list"
+    "tag",
+    "--merged",
+    "HEAD",
+    "--list"
   )
 
   $BestTag = $null
@@ -153,19 +153,19 @@ function Get-VdsVersionTagInfoFromGit {
     }
 
     $CommitLines = Invoke-VdsGit -RepoRoot $RepoRoot -Arguments @(
-    "rev-list",
-    "-n",
-    "1",
-    $Tag
+      "rev-list",
+      "-n",
+      "1",
+      $Tag
     )
     if ($CommitLines.Count -eq 0) {
       continue
     }
 
     $DistanceLines = Invoke-VdsGit -RepoRoot $RepoRoot -Arguments @(
-    "rev-list",
-    "--count",
-    "$($CommitLines[0])..HEAD"
+      "rev-list",
+      "--count",
+      "$($CommitLines[0])..HEAD"
     )
     if ($DistanceLines.Count -eq 0) {
       continue
@@ -180,7 +180,7 @@ function Get-VdsVersionTagInfoFromGit {
     if ($BestDistance -lt 0 -or $Distance -lt $BestDistance) {
       $BetterTag = $true
     } elseif ($Distance -eq $BestDistance -and
-    (Compare-VdsSemverTag -Left $Tag -Right $BestTag) -gt 0) {
+      (Compare-VdsSemverTag -Left $Tag -Right $BestTag) -gt 0) {
       $BetterTag = $true
     }
 
@@ -221,9 +221,9 @@ function Get-VdsGitVersionFromGit {
     }
 
     $ShaLines = Invoke-VdsGit -RepoRoot $RepoRoot -Arguments @(
-    "rev-parse",
-    "--short=7",
-    "HEAD"
+      "rev-parse",
+      "--short=7",
+      "HEAD"
     )
     if ($ShaLines.Count -eq 0) {
       return $null
@@ -354,28 +354,28 @@ function New-VdsStagedInf {
   $Text = [System.IO.File]::ReadAllText($TemplatePath)
 
   if ($Text.Contains("@VDS_DRIVER_DATE@") -or
-  $Text.Contains("@VDS_DRIVER_VERSION@")) {
+    $Text.Contains("@VDS_DRIVER_VERSION@")) {
     $Text = $Text.Replace("@VDS_DRIVER_DATE@", $ResolvedDate)
     $Text = $Text.Replace("@VDS_DRIVER_VERSION@", $ResolvedVersion)
   } elseif ($Text -match "(?m)^DriverVer\s*=") {
     $Text = [regex]::Replace(
-    $Text,
-    "(?m)^DriverVer\s*=.*$",
-    "DriverVer=$ResolvedDate,$ResolvedVersion"
+      $Text,
+      "(?m)^DriverVer\s*=.*$",
+      "DriverVer=$ResolvedDate,$ResolvedVersion"
     )
   } else {
     throw "INF template does not contain DriverVer: $TemplatePath"
   }
 
   if ($Text.Contains("@VDS_DRIVER_DATE@") -or
-  $Text.Contains("@VDS_DRIVER_VERSION@")) {
+    $Text.Contains("@VDS_DRIVER_VERSION@")) {
     throw "INF template has unresolved DriverVer placeholders: $TemplatePath"
   }
 
   [System.IO.File]::WriteAllText(
-  $OutputPath,
-  $Text,
-  [System.Text.Encoding]::ASCII
+    $OutputPath,
+    $Text,
+    [System.Text.Encoding]::ASCII
   )
 }
 

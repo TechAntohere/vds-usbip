@@ -67,11 +67,11 @@ constexpr std::size_t kAudioPrimeChunks = 24;
 constexpr std::size_t kAudioFreshQueueChunks = 48;
 constexpr std::size_t kAudioLowWatermarkChunks = 0;
 constexpr std::size_t kAudioHighWatermarkChunks = 44;
-constexpr std::size_t kWindowsSpeakerInputFrames = vds::kSpeakerInputFrames;
+constexpr std::size_t kWindowsPcmWindowFrames = vds::kPcmWindowFrames;
 constexpr int kWindowsHapticsSampleMin = -128;
 constexpr int kWindowsHapticsSampleMax = 127;
 constexpr auto kAudioOutputBaseInterval = std::chrono::microseconds(
-    (static_cast<std::int64_t>(kWindowsSpeakerInputFrames) * 1000000 +
+    (static_cast<std::int64_t>(kWindowsPcmWindowFrames) * 1000000 +
      VDS_AUDIO_SAMPLE_RATE / 2) /
     VDS_AUDIO_SAMPLE_RATE);
 constexpr auto kAudioJitterBufferMaxDelay = std::chrono::milliseconds(300);
@@ -278,10 +278,10 @@ private:
 };
 
 vds::AudioChunk make_silent_audio_chunk() {
-  std::array<std::uint8_t, kWindowsSpeakerInputFrames * VDS_AUDIO_CHANNELS *
+  std::array<std::uint8_t, kWindowsPcmWindowFrames * VDS_AUDIO_CHANNELS *
                                sizeof(std::int16_t)>
       pcm{};
-  vds::PcmAudioExtractor extractor(kWindowsSpeakerInputFrames);
+  vds::PcmAudioExtractor extractor(kWindowsPcmWindowFrames);
   std::vector<vds::AudioChunk> chunks = extractor.push_usb_audio(pcm);
   if (chunks.size() != 1) {
     throw std::runtime_error("failed to build silent audio keepalive chunk");
@@ -311,8 +311,8 @@ audio_output_interval_for_pending(std::size_t pending_chunks,
 struct BridgeState {
   std::mutex mutex;
   vds::DsOutputState output_state;
-  vds::PcmAudioExtractor extractor{kWindowsSpeakerInputFrames};
-  vds::PcmAudioExtractor waveout_extractor{kWindowsSpeakerInputFrames};
+  vds::PcmAudioExtractor extractor{kWindowsPcmWindowFrames};
+  vds::PcmAudioExtractor waveout_extractor{kWindowsPcmWindowFrames};
   vds::MicAudioDecoder mic_decoder;
   vds::HapticsPacketBuilder haptics_builder;
   vds::AudioChunk silent_audio_chunk = make_silent_audio_chunk();
@@ -913,7 +913,7 @@ void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
         state.pending_audio_chunks.clear();
         state.next_haptics_send_time = {};
         if (active) {
-          state.extractor = vds::PcmAudioExtractor{kWindowsSpeakerInputFrames};
+          state.extractor = vds::PcmAudioExtractor{kWindowsPcmWindowFrames};
         }
         if (!active) {
           state.audio_queue_empty_since = {};
@@ -1089,7 +1089,7 @@ void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
             state.speaker_waveout_active = speaker_waveout;
             state.speaker_waveout_phase = 0;
             state.waveout_extractor =
-                vds::PcmAudioExtractor{kWindowsSpeakerInputFrames};
+                vds::PcmAudioExtractor{kWindowsPcmWindowFrames};
             state.output_state.set_audio_out_stream_active(
                 speaker_waveout, state.headset_plugged);
             state.audio_out_stream_active = speaker_waveout;
@@ -1205,7 +1205,7 @@ void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
       state.audio_underflow_reported = false;
       state.pending_audio_chunks.clear();
       state.next_haptics_send_time = {};
-      state.extractor = vds::PcmAudioExtractor{kWindowsSpeakerInputFrames};
+      state.extractor = vds::PcmAudioExtractor{kWindowsPcmWindowFrames};
       audio_route_activated = true;
     }
     chunks = state.extractor.push_usb_audio(frame.payload);
@@ -1580,10 +1580,10 @@ void enqueue_speaker_waveout_chunk(BridgeState &state) {
     return;
   }
 
-  std::array<std::uint8_t, kWindowsSpeakerInputFrames * VDS_AUDIO_CHANNELS *
+  std::array<std::uint8_t, kWindowsPcmWindowFrames * VDS_AUDIO_CHANNELS *
                                sizeof(std::int16_t)>
       pcm{};
-  for (std::size_t frame = 0; frame < kWindowsSpeakerInputFrames; ++frame) {
+  for (std::size_t frame = 0; frame < kWindowsPcmWindowFrames; ++frame) {
     const double angle = kSpeakerWaveoutTwoPi *
                          static_cast<double>(state.speaker_waveout_phase) /
                          static_cast<double>(kSpeakerWaveoutPeriodFrames);

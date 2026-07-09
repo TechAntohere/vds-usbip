@@ -1773,10 +1773,10 @@ void enqueue_speaker_waveout_chunk(VirtualPort &port, std::uint32_t trace_flags,
     return;
   }
 
-  std::array<std::uint8_t, vds::kSpeakerInputFrames * VDS_AUDIO_CHANNELS *
-                               sizeof(std::int16_t)>
+  std::array<std::uint8_t,
+             vds::kPcmWindowFrames * VDS_AUDIO_CHANNELS * sizeof(std::int16_t)>
       pcm{};
-  for (std::size_t frame = 0; frame < vds::kSpeakerInputFrames; ++frame) {
+  for (std::size_t frame = 0; frame < vds::kPcmWindowFrames; ++frame) {
     const double angle = kSpeakerWaveoutTwoPi *
                          static_cast<double>(port.speaker_waveout_phase) /
                          static_cast<double>(kSpeakerWaveoutPeriodFrames);

@@ -22,7 +22,7 @@ constexpr std::size_t kHapticsSampleSize = VDS_HAPTICS_SAMPLE_SIZE;
 constexpr std::size_t kUsbInputReportSize = VDS_USB_INPUT_REPORT_SIZE;
 constexpr std::size_t kDsStateSize = 63;
 constexpr std::size_t kSpeakerChannels = 2;
-constexpr std::size_t kSpeakerInputFrames = 512;
+constexpr std::size_t kPcmWindowFrames = 512;
 constexpr std::size_t kSpeakerOpusFrames = 480;
 constexpr std::size_t kSpeakerOpusSize = 200;
 constexpr std::size_t kMicOpusFrames = 480;
@@ -35,8 +35,7 @@ using BtReport = std::array<std::uint8_t, kBtHapticsReportSize>;
 using BtInitReport = std::array<std::uint8_t, kBtInitReportSize>;
 using BtStateReport = std::array<std::uint8_t, kBtStateReportSize>;
 using HapticsChunk = std::array<std::int8_t, kHapticsSampleSize>;
-using SpeakerInput =
-    std::array<std::int16_t, kSpeakerInputFrames * kSpeakerChannels>;
+using PcmWindow = std::array<std::int16_t, kPcmWindowFrames * kSpeakerChannels>;
 using SpeakerChunk = std::array<std::uint8_t, kSpeakerOpusSize>;
 using DsState = std::array<std::uint8_t, kDsStateSize>;
 using UsbInputReport = std::array<std::uint8_t, kUsbInputReportSize>;
@@ -135,8 +134,7 @@ private:
 
 class PcmAudioExtractor {
 public:
-  explicit PcmAudioExtractor(
-      std::size_t speaker_input_frames = kSpeakerInputFrames);
+  explicit PcmAudioExtractor(std::size_t pcm_window_frames = kPcmWindowFrames);
   ~PcmAudioExtractor();
 
   PcmAudioExtractor(PcmAudioExtractor &&) noexcept;
@@ -154,11 +152,11 @@ private:
   std::unique_ptr<SpeakerEncoder> speaker_encoder_;
   std::array<std::uint8_t, VDS_AUDIO_CHANNELS * sizeof(std::int16_t)>
       pending_frame_{};
-  SpeakerInput speaker_input_{};
-  SpeakerInput haptics_input_{};
-  std::size_t speaker_input_frames_ = kSpeakerInputFrames;
+  PcmWindow speaker_pcm_{};
+  PcmWindow haptics_pcm_{};
+  std::size_t pcm_window_frames_ = kPcmWindowFrames;
   std::size_t pending_frame_pos_ = 0;
-  std::size_t speaker_frame_pos_ = 0;
+  std::size_t pcm_window_frame_pos_ = 0;
   bool chunk_has_signal_ = false;
   bool chunk_has_haptics_signal_ = false;
 };

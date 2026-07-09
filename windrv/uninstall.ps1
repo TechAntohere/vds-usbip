@@ -185,11 +185,13 @@ function Test-VdsFilterDevice {
   }
 
   if ($Device.InstanceId -like "USB\VID_054C&PID_0CE6&MI_03\*" -or
-      $Device.InstanceId -like "USB\VID_054C&PID_0DF2&MI_03\*" -or
-      $Device.InstanceId -like "HID\VID_054C&PID_0CE6&MI_03\*" -or
-      $Device.InstanceId -like "HID\VID_054C&PID_0DF2&MI_03\*" -or
-      $Device.InstanceId -like "HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\*" -or
-      $Device.InstanceId -like "HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0DF2\*") {
+    $Device.InstanceId -like "USB\VID_054C&PID_0DF2&MI_03\*" -or
+    $Device.InstanceId -like "HID\VID_054C&PID_0CE6&MI_03\*" -or
+    $Device.InstanceId -like "HID\VID_054C&PID_0DF2&MI_03\*" -or
+    $Device.InstanceId -like "HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\*" -or
+    $Device.InstanceId -like "HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0DF2\*" -or
+    $Device.InstanceId -like "BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\*" -or
+    $Device.InstanceId -like "BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0DF2\*") {
     return $true
   }
 
@@ -302,12 +304,12 @@ function Test-VdsUsbRootDevice {
   )
 
   if ($Device.InstanceId -eq "ROOT\DEVGEN\VDSUSB0" -or
-  $Device.FriendlyName -eq "vDS USB Root Hub") {
+    $Device.FriendlyName -eq "vDS USB Root Hub") {
     return $true
   }
 
   if ($Device.InstanceId -notlike "ROOT\DEVGEN\*" -and
-  $Device.InstanceId -notlike "ROOT\USB\*") {
+    $Device.InstanceId -notlike "ROOT\USB\*") {
     return $false
   }
 
@@ -334,8 +336,9 @@ function Remove-VdsUsbRootDevices {
 
   foreach ($Device in $Devices) {
     Write-Output "Removing vDS USB root device $($Device.InstanceId)"
-    Write-VdsStep "running pnputil /remove-device $($Device.InstanceId)"
-    pnputil /remove-device $Device.InstanceId | Out-Host
+    $PnpUtilArgs = @("/remove-device", $Device.InstanceId, "/subtree", "/force")
+    Write-VdsStep "running pnputil $($PnpUtilArgs -join ' ')"
+    pnputil @PnpUtilArgs | Out-Host
     Write-VdsStep "pnputil remove-device exit code: $LASTEXITCODE"
     if ($LASTEXITCODE -eq 3010) {
       Write-Warning "pnputil requested a reboot while removing $($Device.InstanceId)."
@@ -355,8 +358,9 @@ function Remove-VdsFilterDevices {
 
   foreach ($Device in $Devices) {
     Write-Output "Removing vDS filter device $($Device.InstanceId)"
-    Write-VdsStep "running pnputil /remove-device $($Device.InstanceId)"
-    pnputil /remove-device $Device.InstanceId | Out-Host
+    $PnpUtilArgs = @("/remove-device", $Device.InstanceId, "/subtree", "/force")
+    Write-VdsStep "running pnputil $($PnpUtilArgs -join ' ')"
+    pnputil @PnpUtilArgs | Out-Host
     Write-VdsStep "pnputil remove-device exit code: $LASTEXITCODE"
     if ($LASTEXITCODE -eq 3010) {
       Write-Warning "pnputil requested a reboot while removing $($Device.InstanceId)."
