@@ -80,7 +80,7 @@ std::filesystem::path current_executable_path() {
   }
 }
 
-std::filesystem::path installer_log_path() {
+std::filesystem::path program_data_path() {
   std::vector<wchar_t> program_data(32768);
   const DWORD length =
       GetEnvironmentVariableW(L"ProgramData", program_data.data(),
@@ -89,7 +89,11 @@ std::filesystem::path installer_log_path() {
     throw std::runtime_error("ProgramData is not available");
   }
 
-  std::filesystem::path path(program_data.data());
+  return std::filesystem::path(program_data.data());
+}
+
+std::filesystem::path installer_log_path() {
+  std::filesystem::path path = program_data_path();
   path /= L"vDS";
   std::filesystem::create_directories(path);
   path /= L"installer.log";
@@ -606,11 +610,15 @@ int run_driver_msi(const std::filesystem::path &msi) {
   return run_process(std::move(command_line), SW_SHOWNORMAL);
 }
 
-void reboot_now() {
+void reboot_now(bool write_log = true) {
   std::wstring command_line =
       quote_command_argument(system_executable(L"shutdown.exe").wstring());
   command_line += L" /r /t 0";
-  run_process(std::move(command_line), SW_HIDE);
+  if (write_log) {
+    run_process(std::move(command_line), SW_HIDE);
+  } else {
+    launch_process(std::move(command_line), SW_HIDE);
+  }
 }
 
 void remove_setup_cache_after_exit() {
@@ -651,13 +659,15 @@ void prompt_reboot() {
       L"vDS setup has finished installing the selected components.\n\n"
       L"A Windows reboot is required before using vDS.\n\n"
       L"Reboot now?",
-      L"vDS Setup", MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2);
+      L"vDS Setup",
+      MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2 | MB_SETFOREGROUND |
+          MB_TOPMOST);
   if (choice == IDYES) {
     reboot_now();
   }
 }
 
-void prompt_reboot_after_uninstall() {
+bool prompt_reboot_after_uninstall() {
   const int choice = MessageBoxW(
       nullptr,
       L"vDS has been removed from this computer.\n\n"
@@ -665,12 +675,14 @@ void prompt_reboot_after_uninstall() {
       L"Bluetooth controller devices normally.\n\n"
       L"Reboot now?",
       L"vDS Setup",
-      MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2 | MB_SETFOREGROUND);
+      MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2 | MB_SETFOREGROUND |
+          MB_TOPMOST);
   if (choice == IDYES) {
     append_installer_log(L"user accepted reboot after uninstall");
-    reboot_now();
+    return true;
   } else {
     append_installer_log(L"user declined reboot after uninstall");
+    return false;
   }
 }
 
@@ -705,6 +717,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
   std::filesystem::path work_dir;
   try {
+    const std::filesystem::path program_data_removal_marker =
+        program_data_path() / L"vDS.remove-program-data";
+    if (uninstall) {
+      std::error_code error;
+      std::filesystem::remove(program_data_removal_marker, error);
+      if (error) {
+        throw std::system_error(error,
+                                "failed to clear ProgramData removal marker");
+      }
+    }
+
     reset_installer_log();
     {
       std::wstring message = L"vDS setup version: ";
@@ -737,10 +760,43 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
 
     if (uninstall) {
+      std::error_code marker_error;
+      const bool remove_program_data =
+          std::filesystem::exists(program_data_removal_marker, marker_error);
+      if (marker_error) {
+        throw std::system_error(marker_error,
+                                "failed to read ProgramData removal marker");
+      }
+
       std::filesystem::remove_all(work_dir);
       remove_setup_cache_after_exit();
       append_installer_log(L"vDS setup uninstall finished");
-      prompt_reboot_after_uninstall();
+      const bool reboot_requested = prompt_reboot_after_uninstall();
+
+      bool program_data_removed = false;
+      if (remove_program_data) {
+        append_installer_log(L"removing vDS ProgramData after MSI exit");
+        std::error_code error;
+        std::filesystem::remove(program_data_removal_marker, error);
+        if (!error) {
+          std::filesystem::remove_all(program_data_path() / L"vDS", error);
+        }
+        if (error) {
+          std::wstring message = L"failed to remove vDS ProgramData: ";
+          message += wide_from_ascii(error.message());
+          append_installer_log(message);
+          MessageBoxW(nullptr,
+                      L"vDS was uninstalled, but C:\\ProgramData\\vDS could "
+                      L"not be removed.",
+                      L"vDS Setup", MB_OK | MB_ICONWARNING);
+        } else {
+          program_data_removed = true;
+        }
+      }
+
+      if (reboot_requested) {
+        reboot_now(!program_data_removed);
+      }
       return 0;
     }
 

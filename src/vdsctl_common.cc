@@ -98,10 +98,14 @@ int run_vdsctl_app(int argc, char **argv, std::string_view version,
                    std::string_view build_year,
                    const VdsctlPlatform &platform) {
   try {
-    if (argc < 2 || std::string_view(argv[1]) == "-h" ||
+    if (argc < 2) {
+      throw std::runtime_error("command is required");
+    }
+
+    if (std::string_view(argv[1]) == "-h" ||
         std::string_view(argv[1]) == "--help") {
       std::cerr << vdsctl_usage(version, build_year);
-      return argc < 2 ? 1 : 0;
+      return 0;
     }
 
     switch (parse_vdsctl_command(argv[1])) {

@@ -79,10 +79,12 @@ the driver projects.
 > ```
 >
 > The driver build script creates a local test code-signing certificate, trusts
-> it in the Local Machine Root and TrustedPublisher stores, and signs the driver
-> package. The driver install script installs the already built package with
-> `pnputil`. A reboot may still be required if Windows reports that an old
-> driver service is pending deletion or a device restart cannot complete.
+> it in the Local Machine Root and TrustedPublisher stores, signs the driver
+> package, and exports the public certificate with the package. The driver
+> install script trusts that packaged certificate before installing the driver
+> with `pnputil`; uninstall removes the corresponding trust entries. A reboot
+> may still be required if Windows reports that an old driver service is pending
+> deletion or a device restart cannot complete.
 
 Windows uses one package with these driver roles:
 

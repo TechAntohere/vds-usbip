@@ -384,31 +384,46 @@ function Ensure-TestCertificate {
     [string]$Subject
   )
 
+  $Now = Get-Date
   $Cert = Get-ChildItem Cert:\LocalMachine\My |
-    Where-Object { $_.Subject -eq $Subject } |
+    Where-Object {
+    $_.Subject -eq $Subject -and
+    $_.HasPrivateKey -and
+    $_.NotBefore -le $Now.AddHours(-12) -and
+    $_.NotAfter -gt $Now
+  } |
+    Sort-Object NotAfter -Descending |
     Select-Object -First 1
-  if ($Cert) {
-    return
+  if (!$Cert) {
+    $Cert = New-SelfSignedCertificate `
+      -Type CodeSigningCert `
+      -Subject $Subject `
+      -CertStoreLocation Cert:\LocalMachine\My `
+      -KeyUsage DigitalSignature `
+      -KeyAlgorithm RSA `
+      -KeyLength 2048 `
+      -HashAlgorithm SHA256 `
+      -NotBefore $Now.AddDays(-1) `
+      -NotAfter $Now.AddYears(1)
   }
 
-  $Cert = New-SelfSignedCertificate `
-    -Type CodeSigningCert `
-    -Subject $Subject `
-    -CertStoreLocation Cert:\LocalMachine\My `
-    -KeyUsage DigitalSignature `
-    -KeyAlgorithm RSA `
-    -KeyLength 2048 `
-    -HashAlgorithm SHA256
+  foreach ($StoreName in @("Root", "TrustedPublisher")) {
+    $Store = New-Object System.Security.Cryptography.X509Certificates.X509Store($StoreName, "LocalMachine")
+    try {
+      $Store.Open("ReadWrite")
+      $Existing = $Store.Certificates.Find(
+        [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+        $Cert.Thumbprint,
+        $false)
+      if ($Existing.Count -eq 0) {
+        $Store.Add($Cert)
+      }
+    } finally {
+      $Store.Close()
+    }
+  }
 
-  $RootStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root", "LocalMachine")
-  $RootStore.Open("ReadWrite")
-  $RootStore.Add($Cert)
-  $RootStore.Close()
-
-  $PublisherStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("TrustedPublisher", "LocalMachine")
-  $PublisherStore.Open("ReadWrite")
-  $PublisherStore.Add($Cert)
-  $PublisherStore.Close()
+  return $Cert
 }
 
 function Build-TargetPackage {
@@ -420,7 +435,9 @@ function Build-TargetPackage {
     [Parameter(Mandatory = $true)]
     [string]$SignToolPath,
     [Parameter(Mandatory = $true)]
-    [string]$Inf2CatPath
+    [string]$Inf2CatPath,
+    [Parameter(Mandatory = $true)]
+    $Certificate
   )
 
   Remove-Item -Recurse -Force (Join-Path $Spec.ProjectDir "build") `
@@ -464,10 +481,14 @@ function Build-TargetPackage {
     -OutputPath (Join-Path $Spec.PackageDir $Spec.InfName) `
     -DriverDate $ResolvedDriverDate `
     -DriverVersion $ResolvedDriverVersion
+  Export-Certificate `
+    -Cert $Certificate `
+    -FilePath (Join-Path $Spec.PackageDir "vds_test_driver.cer") `
+    -Force | Out-Null
 
   Push-Location $Spec.PackageDir
   try {
-    & $SignToolPath sign /fd SHA256 /sm /s My /n "vDS Test Driver Certificate" $Spec.SysName
+    & $SignToolPath sign /fd SHA256 /sm /s My /sha1 $Certificate.Thumbprint $Spec.SysName
     if ($LASTEXITCODE -ne 0) {
       throw "signtool failed with exit code $LASTEXITCODE"
     }
@@ -478,7 +499,7 @@ function Build-TargetPackage {
     }
 
     $CatName = [System.IO.Path]::ChangeExtension($Spec.InfName, ".cat")
-    & $SignToolPath sign /fd SHA256 /sm /s My /n "vDS Test Driver Certificate" $CatName
+    & $SignToolPath sign /fd SHA256 /sm /s My /sha1 $Certificate.Thumbprint $CatName
     if ($LASTEXITCODE -ne 0) {
       throw "signtool failed with exit code $LASTEXITCODE"
     }
@@ -534,12 +555,13 @@ if ($NeedsUde) {
 }
 Write-Output "Using signtool=$SignTool"
 Write-Output "Using inf2cat=$Inf2Cat"
-Ensure-TestCertificate -Subject $CertificateSubject
+$TestCertificate = Ensure-TestCertificate -Subject $CertificateSubject
 
 foreach ($Spec in $SelectedSpecs) {
   Build-TargetPackage `
     -Spec $Spec `
     -MSBuildPath $MSBuild `
     -SignToolPath $SignTool `
-    -Inf2CatPath $Inf2Cat
+    -Inf2CatPath $Inf2Cat `
+    -Certificate $TestCertificate
 }

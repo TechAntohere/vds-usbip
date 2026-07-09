@@ -65,8 +65,8 @@
     <CustomAction Id="ClearPathMarker" BinaryRef="bin_setup_actions" DllEntry="ClearPathMarker" Execute="deferred" Return="ignore" Impersonate="no"/>
     <CustomAction Id="SetRemoveInstallDirectoriesData" Property="RemoveInstallDirectories" Value="[INSTALLFOLDER]"/>
     <CustomAction Id="RemoveInstallDirectories" BinaryRef="bin_setup_actions" DllEntry="RemoveInstallDirectories" Execute="deferred" Return="ignore" Impersonate="no"/>
-    <CustomAction Id="SetRemoveProgramDataData" Property="RemoveProgramData" Value="[REMOVE_PROGRAMDATA]"/>
-    <CustomAction Id="RemoveProgramData" BinaryRef="bin_setup_actions" DllEntry="RemoveProgramData" Execute="deferred" Return="ignore" Impersonate="no"/>
+    <CustomAction Id="SetRequestProgramDataRemovalData" Property="RequestProgramDataRemoval" Value="[REMOVE_PROGRAMDATA]"/>
+    <CustomAction Id="RequestProgramDataRemoval" BinaryRef="bin_setup_actions" DllEntry="RequestProgramDataRemoval" Execute="deferred" Return="check" Impersonate="no"/>
     <CustomAction Id="RemoveVdsRegistry" BinaryRef="bin_setup_actions" DllEntry="RemoveVdsRegistry" Execute="deferred" Return="ignore" Impersonate="no"/>
     <Binary Id="bin_uninstall_runner" SourceFile="$(var.UninstallRunner)"/>
     <CustomAction Id="UninstallExistingInstall" BinaryRef="bin_uninstall_runner" ExeCommand="[ProductCode]" Execute="deferred" Return="ignore" Impersonate="no"/>
@@ -77,9 +77,9 @@
       <Custom Action="UpdateDisplayVersion" After="InstallFinalize" Condition="REMOVE &lt;&gt; &quot;ALL&quot;"/>
       <Custom Action="SetRemoveInstallDirectoriesData" After="RemoveFiles" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
       <Custom Action="RemoveInstallDirectories" After="SetRemoveInstallDirectoriesData" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
-      <Custom Action="SetRemoveProgramDataData" After="RemoveInstallDirectories" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
-      <Custom Action="RemoveProgramData" After="SetRemoveProgramDataData" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
-      <Custom Action="RemoveVdsRegistry" After="RemoveProgramData" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
+      <Custom Action="SetRequestProgramDataRemovalData" After="RemoveInstallDirectories" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
+      <Custom Action="RequestProgramDataRemoval" After="SetRequestProgramDataRemovalData" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
+      <Custom Action="RemoveVdsRegistry" After="RequestProgramDataRemoval" Condition="REMOVE = &quot;ALL&quot; AND VDS_EXPLICIT_UNINSTALL = &quot;1&quot;"/>
     </InstallExecuteSequence>
     <UI>
       <TextStyle Id="WixUI_Font_Normal" FaceName="Segoe UI" Size="9"/>
@@ -91,7 +91,7 @@
       <ProgressText Action="InstallServices" Message="Registering the vDS Windows service"/>
       <ProgressText Action="ClearPathMarker" Message="Updating vDS PATH registration"/>
       <ProgressText Action="RemoveInstallDirectories" Message="Removing vDS userspace files"/>
-      <ProgressText Action="RemoveProgramData" Message="Removing vDS ProgramData files"/>
+      <ProgressText Action="RequestProgramDataRemoval" Message="Preparing vDS ProgramData cleanup"/>
       <ProgressText Action="RemoveVdsRegistry" Message="Removing vDS registry settings"/>
       <Dialog Id="LicenseDlg" Width="370" Height="270" Title="Welcome to the vDS Setup Wizard">
         <Control Id="Title" Type="Text" X="15" Y="6" Width="340" Height="18" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Welcome to the vDS Setup Wizard"/>

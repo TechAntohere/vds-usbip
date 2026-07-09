@@ -22,6 +22,7 @@
                   <File Id="fil_filter_inf" Source="$(var.DriverPackageRoot)\vds_filter\package\vds_filter.inf" KeyPath="yes"/>
                   <File Id="fil_filter_sys" Source="$(var.DriverPackageRoot)\vds_filter\package\vds_filter.sys"/>
                   <File Id="fil_filter_cat" Source="$(var.DriverPackageRoot)\vds_filter\package\vds_filter.cat"/>
+                  <File Id="fil_filter_certificate" Source="$(var.DriverPackageRoot)\vds_filter\package\vds_test_driver.cer"/>
                 </Component>
               </Directory>
             </Directory>

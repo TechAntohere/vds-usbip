@@ -7,6 +7,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$WindrvDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
 function Write-VdsStep {
   param(
     [Parameter(Mandatory = $true)]
@@ -40,12 +42,15 @@ function Write-VdsException {
 }
 
 function New-TargetSpecs {
+  $FilterDir = Join-Path $WindrvDir "vds_filter"
+
   return [ordered]@{
     vds_filter = [pscustomobject]@{
       Name = "vds_filter"
       InfName = "vds_filter.inf"
       ServiceName = "vds_filter"
       DriverFile = "vds_filter.sys"
+      CertificateFile = Join-Path $FilterDir "package\vds_test_driver.cer"
     }
     vds_usb = [pscustomobject]@{
       Name = "vds_usb"
@@ -174,37 +179,6 @@ function Get-VdsUsbRootDevices {
   }
 }
 
-function Test-VdsFilterDevice {
-  param(
-    [Parameter(Mandatory = $true)]
-    $Device
-  )
-
-  if ($Device.FriendlyName -ne "vDS Filter") {
-    return $false
-  }
-
-  if ($Device.InstanceId -like "USB\VID_054C&PID_0CE6&MI_03\*" -or
-    $Device.InstanceId -like "USB\VID_054C&PID_0DF2&MI_03\*" -or
-    $Device.InstanceId -like "HID\VID_054C&PID_0CE6&MI_03\*" -or
-    $Device.InstanceId -like "HID\VID_054C&PID_0DF2&MI_03\*" -or
-    $Device.InstanceId -like "HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\*" -or
-    $Device.InstanceId -like "HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0DF2\*" -or
-    $Device.InstanceId -like "BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\*" -or
-    $Device.InstanceId -like "BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0DF2\*") {
-    return $true
-  }
-
-  return $false
-}
-
-function Get-VdsFilterDevices {
-  return Get-PnpDevice -ErrorAction SilentlyContinue |
-    Where-Object {
-    Test-VdsFilterDevice $_
-  }
-}
-
 function Remove-ServiceKey {
   param(
     [Parameter(Mandatory = $true)]
@@ -297,6 +271,31 @@ function Remove-DriverImageFile {
   }
 }
 
+function Remove-VdsTestCertificate {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$CertificateFile
+  )
+
+  if (!(Test-Path -LiteralPath $CertificateFile -PathType Leaf)) {
+    Write-VdsStep "packaged test certificate is unavailable; skipping certificate cleanup"
+    return
+  }
+
+  $Certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+    $CertificateFile)
+  Write-VdsStep "removing vDS test driver certificate trust thumbprint=$($Certificate.Thumbprint)"
+  foreach ($StoreName in @("Root", "TrustedPublisher")) {
+    $StorePath = "Cert:\LocalMachine\$StoreName"
+    Get-ChildItem $StorePath |
+      Where-Object {
+      $_.Subject -eq "CN=vDS Test Driver Certificate"
+    } |
+      Remove-Item -Force
+    Write-VdsStep "vDS test certificates removed from LocalMachine\$StoreName"
+  }
+}
+
 function Test-VdsUsbRootDevice {
   param(
     [Parameter(Mandatory = $true)]
@@ -350,28 +349,6 @@ function Remove-VdsUsbRootDevices {
   }
 }
 
-function Remove-VdsFilterDevices {
-  param(
-    [Parameter(Mandatory = $true)]
-    $Devices
-  )
-
-  foreach ($Device in $Devices) {
-    Write-Output "Removing vDS filter device $($Device.InstanceId)"
-    $PnpUtilArgs = @("/remove-device", $Device.InstanceId, "/subtree", "/force")
-    Write-VdsStep "running pnputil $($PnpUtilArgs -join ' ')"
-    pnputil @PnpUtilArgs | Out-Host
-    Write-VdsStep "pnputil remove-device exit code: $LASTEXITCODE"
-    if ($LASTEXITCODE -eq 3010) {
-      Write-Warning "pnputil requested a reboot while removing $($Device.InstanceId)."
-      $global:LASTEXITCODE = 0
-    } elseif ($LASTEXITCODE -ne 0) {
-      Write-Warning "pnputil remove-device failed with exit code $LASTEXITCODE"
-      $global:LASTEXITCODE = 0
-    }
-  }
-}
-
 try {
   Write-VdsStep "driver uninstall started: target=$Target"
   Write-VdsStep "PowerShell version: $($PSVersionTable.PSVersion); 64-bit process: $([Environment]::Is64BitProcess); 64-bit OS: $([Environment]::Is64BitOperatingSystem)"
@@ -381,15 +358,10 @@ try {
   Write-VdsStep "selected driver targets: $(@($SelectedSpecs | ForEach-Object { $_.Name }) -join ', ')"
   $DriverPackages = New-DriverPackageMap -OriginalNames @($SelectedSpecs | ForEach-Object { $_.InfName })
   $UsbRootDevices = @()
-  $FilterDevices = @()
 
   if (($SelectedSpecs | Where-Object { $_.Name -eq "vds_usb" })) {
     $UsbRootDevices = @(Get-VdsUsbRootDevices)
     Write-VdsStep "vDS USB root devices found: $($UsbRootDevices.Count)"
-  }
-  if (($SelectedSpecs | Where-Object { $_.Name -eq "vds_filter" })) {
-    $FilterDevices = @(Get-VdsFilterDevices)
-    Write-VdsStep "vDS filter devices found: $($FilterDevices.Count)"
   }
 
   $InstalledSpecs = @()
@@ -397,10 +369,9 @@ try {
     $PublishedNames = @($DriverPackages[$Spec.InfName])
     $HasService = Test-DriverServicePresent -Name $Spec.ServiceName
     $HasUsbRootDevice = $Spec.Name -eq "vds_usb" -and $UsbRootDevices.Count -gt 0
-    $HasFilterDevice = $Spec.Name -eq "vds_filter" -and $FilterDevices.Count -gt 0
     $HasDriverImage = Test-DriverImageFilePresent -FileName $Spec.DriverFile
-    Write-VdsStep "target $($Spec.Name): packages=$($PublishedNames.Count) service=$HasService usbRoot=$HasUsbRootDevice filterDevice=$HasFilterDevice image=$HasDriverImage"
-    if ($PublishedNames.Count -eq 0 -and !$HasService -and !$HasUsbRootDevice -and !$HasFilterDevice -and !$HasDriverImage) {
+    Write-VdsStep "target $($Spec.Name): packages=$($PublishedNames.Count) service=$HasService usbRoot=$HasUsbRootDevice image=$HasDriverImage"
+    if ($PublishedNames.Count -eq 0 -and !$HasService -and !$HasUsbRootDevice -and !$HasDriverImage) {
       Write-Output "Skipping $($Spec.Name); it is not installed."
       continue
     }
@@ -419,10 +390,9 @@ try {
   if (($InstalledSpecs | Where-Object { $_.Spec.Name -eq "vds_usb" }) -and $UsbRootDevices.Count -gt 0) {
     Remove-VdsUsbRootDevices -Devices $UsbRootDevices
   }
-  if (($InstalledSpecs | Where-Object { $_.Spec.Name -eq "vds_filter" }) -and $FilterDevices.Count -gt 0) {
-    Remove-VdsFilterDevices -Devices $FilterDevices
-  }
 
+  # Let PnP rebind physical HID devices; removing their devnodes can discard
+  # the Bluetooth device association that owns them.
   foreach ($InstalledSpec in $InstalledSpecs) {
     Remove-PnpDriverByOriginalName `
       -OriginalName $InstalledSpec.Spec.InfName `
@@ -434,6 +404,14 @@ try {
     Stop-DriverServiceIfPresent -Name $Spec.ServiceName
     Remove-ServiceKey -Name $Spec.ServiceName
     Remove-DriverImageFile -FileName $Spec.DriverFile
+  }
+
+  $InstalledFilter = $InstalledSpecs |
+    Where-Object { $_.Spec.Name -eq "vds_filter" } |
+    Select-Object -First 1
+  if ($InstalledFilter) {
+    Remove-VdsTestCertificate `
+      -CertificateFile $InstalledFilter.Spec.CertificateFile
   }
 
   Write-Output "vDS Windows driver package removed."

@@ -162,6 +162,7 @@ function New-TargetSpecs {
       InfName = "vds_filter.inf"
       ServiceName = "vds_filter"
       DriverFile = "vds_filter.sys"
+      CertificateFile = Join-Path $FilterDir "package\vds_test_driver.cer"
       PackageDir = Join-Path $FilterDir "package"
       RegistrySettings = ""
       AllowPnPExit259 = $true
@@ -371,51 +372,6 @@ function Remove-VdsUsbRootDevices {
   }
 }
 
-function Test-VdsFilterDevice {
-  param(
-    [Parameter(Mandatory = $true)]
-    $Device
-  )
-
-  if ($Device.FriendlyName -ne "vDS Filter") {
-    return $false
-  }
-
-  if ($Device.InstanceId -like "USB\VID_054C&PID_0CE6&MI_03\*" -or
-    $Device.InstanceId -like "USB\VID_054C&PID_0DF2&MI_03\*" -or
-    $Device.InstanceId -like "HID\VID_054C&PID_0CE6&MI_03\*" -or
-    $Device.InstanceId -like "HID\VID_054C&PID_0DF2&MI_03\*" -or
-    $Device.InstanceId -like "HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\*" -or
-    $Device.InstanceId -like "HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0DF2\*" -or
-    $Device.InstanceId -like "BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\*" -or
-    $Device.InstanceId -like "BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0DF2\*") {
-    return $true
-  }
-
-  return $false
-}
-
-function Remove-VdsFilterDevices {
-  $FilterDevices = Get-PnpDevice -ErrorAction SilentlyContinue |
-    Where-Object {
-    Test-VdsFilterDevice $_
-  }
-  foreach ($Device in $FilterDevices) {
-    Write-Output "Removing vDS filter device $($Device.InstanceId)"
-    $PnpUtilArgs = @("/remove-device", $Device.InstanceId, "/subtree", "/force")
-    Write-VdsStep "running pnputil $($PnpUtilArgs -join ' ')"
-    pnputil @PnpUtilArgs | Out-Host
-    Write-VdsStep "pnputil remove-device exit code: $LASTEXITCODE"
-    if ($LASTEXITCODE -eq 3010) {
-      Write-Warning "pnputil requested a reboot while removing $($Device.InstanceId)."
-      $global:LASTEXITCODE = 0
-    } elseif ($LASTEXITCODE -ne 0) {
-      Write-Warning "pnputil remove-device failed with exit code $LASTEXITCODE"
-      $global:LASTEXITCODE = 0
-    }
-  }
-}
-
 function Import-VdsUsbRegistrySettings {
   param(
     [Parameter(Mandatory = $true)]
@@ -457,6 +413,91 @@ function Import-VdsUsbRegistrySettings {
   }
 }
 
+function Install-VdsTestCertificate {
+  param(
+    [Parameter(Mandatory = $true)]
+    $Spec
+  )
+
+  if ($Spec.Name -ne "vds_filter") {
+    return
+  }
+  if (!(Test-Path -LiteralPath $Spec.CertificateFile -PathType Leaf)) {
+    throw "vDS test driver certificate not found: $($Spec.CertificateFile)"
+  }
+
+  $Certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+    $Spec.CertificateFile)
+  if ($Certificate.Subject -ne "CN=vDS Test Driver Certificate") {
+    throw "unexpected vDS test driver certificate subject: $($Certificate.Subject)"
+  }
+
+  $CatalogPath = Join-Path `
+    $Spec.PackageDir `
+    ([System.IO.Path]::ChangeExtension($Spec.InfName, ".cat"))
+  $CatalogSignature = Get-AuthenticodeSignature $CatalogPath
+  if (!$CatalogSignature.SignerCertificate) {
+    throw "vDS filter catalog signer certificate was not found: $CatalogPath"
+  }
+  if (!$CatalogSignature.SignerCertificate.Thumbprint.Equals(
+      $Certificate.Thumbprint,
+      [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "vDS filter catalog signer does not match the packaged certificate"
+  }
+
+  Write-VdsStep "trusting vDS test driver certificate thumbprint=$($Certificate.Thumbprint)"
+  foreach ($StoreName in @("Root", "TrustedPublisher")) {
+    $StorePath = "Cert:\LocalMachine\$StoreName"
+    $StoreCertificates = @(Get-ChildItem $StorePath |
+      Where-Object {
+      $_.Subject -eq "CN=vDS Test Driver Certificate"
+    })
+    foreach ($StoreCertificate in $StoreCertificates) {
+      if ($StoreCertificate.Thumbprint.Equals(
+          $Certificate.Thumbprint,
+          [System.StringComparison]::OrdinalIgnoreCase)) {
+        continue
+      }
+      Write-VdsStep "removing superseded vDS certificate from LocalMachine\$StoreName thumbprint=$($StoreCertificate.Thumbprint)"
+      Remove-Item -LiteralPath $StoreCertificate.PSPath -Force
+    }
+
+    $Existing = $StoreCertificates |
+      Where-Object {
+      $_.Thumbprint.Equals(
+        $Certificate.Thumbprint,
+        [System.StringComparison]::OrdinalIgnoreCase)
+    } |
+      Select-Object -First 1
+    if ($Existing) {
+      Write-VdsStep "certificate already present in LocalMachine\$StoreName"
+      continue
+    }
+
+    Import-Certificate `
+      -FilePath $Spec.CertificateFile `
+      -CertStoreLocation $StorePath | Out-Null
+    Write-VdsStep "certificate imported into LocalMachine\$StoreName"
+  }
+}
+
+function Test-VdsFilterTargetDevice {
+  param(
+    [Parameter(Mandatory = $true)]
+    $Device
+  )
+
+  $BtHidServiceGuid = "00001124-0000-1000-8000-00805F9B34FB"
+  return $Device.InstanceId -like "BTHENUM\{$BtHidServiceGuid}_VID&0002054C_PID&0CE6*" -or
+  $Device.InstanceId -like "BTHENUM\{$BtHidServiceGuid}_VID&0002054C_PID&0DF2*" -or
+  $Device.InstanceId -like "HID\{$BtHidServiceGuid}_VID&0002054C_PID&0CE6*" -or
+  $Device.InstanceId -like "HID\{$BtHidServiceGuid}_VID&0002054C_PID&0DF2*" -or
+  $Device.InstanceId -like "USB\VID_054C&PID_0CE6&MI_03*" -or
+  $Device.InstanceId -like "USB\VID_054C&PID_0DF2&MI_03*" -or
+  $Device.InstanceId -like "HID\VID_054C&PID_0CE6&MI_03*" -or
+  $Device.InstanceId -like "HID\VID_054C&PID_0DF2&MI_03*"
+}
+
 function Confirm-VdsFilterServiceRegistration {
   param(
     [Parameter(Mandatory = $true)]
@@ -471,8 +512,16 @@ function Confirm-VdsFilterServiceRegistration {
   & sc.exe query $Spec.ServiceName | Out-Host
   Write-VdsStep "sc.exe query $($Spec.ServiceName) exit code: $LASTEXITCODE"
   if ($LASTEXITCODE -ne 0) {
-    Write-Warning "$($Spec.ServiceName) service is not registered yet. This is normal when no matching HID/Bluetooth device was installed during setup; Windows will create and load it from the staged INF when a matching device enumerates."
     $global:LASTEXITCODE = 0
+    $FilterTargets = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+      Where-Object {
+      Test-VdsFilterTargetDevice $_
+    })
+    if ($FilterTargets.Count -ne 0) {
+      $TargetIds = @($FilterTargets | ForEach-Object { $_.InstanceId }) -join ", "
+      throw "$($Spec.ServiceName) service was not registered for matching devices: $TargetIds"
+    }
+    Write-Warning "$($Spec.ServiceName) service is not registered because no matching HID/Bluetooth device is present; Windows will load it when a supported controller enumerates."
   }
 }
 
@@ -513,6 +562,8 @@ function Install-TargetPackage {
   if (!(Test-Path $InfPath)) {
     throw "packaged INF not found: $InfPath"
   }
+
+  Install-VdsTestCertificate -Spec $Spec
 
   Write-VdsStep "installing $($Spec.Name): package=$($Spec.PackageDir) inf=$InfPath"
   Push-Location $Spec.PackageDir
@@ -556,13 +607,12 @@ try {
   Write-MatchingDriverPackages -OriginalNames @($SelectedSpecs | ForEach-Object { $_.InfName })
 
   if ($RemovePrevious) {
-    Write-VdsStep "removing previous driver packages and devices before install"
+    Write-VdsStep "removing previous driver packages and vDS-owned devices before install"
     if (($SelectedSpecs | Where-Object { $_.Name -eq "vds_usb" })) {
       Remove-VdsUsbRootDevices
     }
-    if (($SelectedSpecs | Where-Object { $_.Name -eq "vds_filter" })) {
-      Remove-VdsFilterDevices
-    }
+    # Let PnP rebind physical HID devices; removing their devnodes can discard
+    # the Bluetooth device association that owns them.
     foreach ($Spec in $SelectedSpecs) {
       Remove-PnpDriverByOriginalName -OriginalName $Spec.InfName -UninstallDevices $true
     }

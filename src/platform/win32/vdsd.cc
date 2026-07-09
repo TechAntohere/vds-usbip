@@ -499,7 +499,7 @@ find_connected_bluetooth_device(const std::string &address,
 std::vector<vds::ControllerTarget> list_windows_controller_targets() {
   std::vector<vds::ControllerTarget> targets;
   for (const auto &device : list_filter_bluetooth_devices()) {
-    if (!device.report_target || !device.profile_valid) {
+    if (!device.profile_valid || device.address.empty()) {
       continue;
     }
     targets.push_back(vds::ControllerTarget{

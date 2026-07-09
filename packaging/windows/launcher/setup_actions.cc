@@ -772,15 +772,37 @@ extern "C" __declspec(dllexport) UINT __stdcall ClearPathMarker(MSIHANDLE) {
 }
 
 extern "C" __declspec(dllexport) UINT __stdcall
-RemoveProgramData(MSIHANDLE install) {
+RequestProgramDataRemoval(MSIHANDLE install) {
   if (msi_property(install, L"CustomActionData") != L"1") {
     return ERROR_SUCCESS;
   }
 
   try {
-    std::error_code ignored;
-    std::filesystem::remove_all(program_data_path() / L"vDS", ignored);
+    const std::filesystem::path marker =
+        program_data_path() / L"vDS.remove-program-data";
+    std::ofstream stream(marker, std::ios::binary | std::ios::trunc);
+    if (!stream) {
+      append_installer_log(
+          L"failed to create ProgramData removal request marker");
+      return ERROR_INSTALL_FAILURE;
+    }
+    stream << "remove\n";
+    stream.close();
+    if (!stream) {
+      append_installer_log(
+          L"failed to write ProgramData removal request marker");
+      return ERROR_INSTALL_FAILURE;
+    }
+    append_installer_log(
+        L"ProgramData removal requested after Windows Installer exits");
+  } catch (const std::exception &error) {
+    std::wstring message = L"failed to request ProgramData removal: ";
+    message += wide_from_log_bytes(error.what());
+    append_installer_log(message);
+    return ERROR_INSTALL_FAILURE;
   } catch (...) {
+    append_installer_log(L"failed to request ProgramData removal");
+    return ERROR_INSTALL_FAILURE;
   }
   return ERROR_SUCCESS;
 }

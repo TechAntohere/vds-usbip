@@ -111,7 +111,8 @@ function Test-VdsDriverPackageRoot {
     "vds_usb\vds_usb.reg",
     "vds_filter\package\vds_filter.inf",
     "vds_filter\package\vds_filter.sys",
-    "vds_filter\package\vds_filter.cat"
+    "vds_filter\package\vds_filter.cat",
+    "vds_filter\package\vds_test_driver.cer"
   )
   foreach ($FileName in $RequiredFiles) {
     if (!(Test-Path -LiteralPath (Join-Path $Path $FileName) -PathType Leaf)) {
