@@ -21,6 +21,7 @@
 #include <linux/platform_device.h>
 #include <linux/poll.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/usb.h>
 #include <linux/usb/ch11.h>
@@ -948,12 +949,14 @@ static void vds_set_connection(struct vds_hcd_dev *dev, bool connected)
 static long vds_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct vds_hcd_dev *dev = vds_from_file(file);
+	struct vds_driver_info driver_info;
 	struct vds_profile_config profile;
 	struct vds_status status;
 	unsigned long flags;
 	int ret;
 
-	if (cmd != VDS_IOC_GET_STATUS && vds_is_stopping(dev))
+	if (cmd != VDS_IOC_GET_STATUS && cmd != VDS_IOC_GET_DRIVER_INFO &&
+	    vds_is_stopping(dev))
 		return -ESHUTDOWN;
 
 	switch (cmd) {
@@ -966,6 +969,16 @@ static long vds_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		status.frames_from_user = dev->frames_from_user;
 		spin_unlock_irqrestore(&dev->lock, flags);
 		if (copy_to_user((void __user *)arg, &status, sizeof(status)))
+			return -EFAULT;
+		return 0;
+	case VDS_IOC_GET_DRIVER_INFO:
+		memset(&driver_info, 0, sizeof(driver_info));
+		driver_info.version = VDS_DRIVER_INFO_VERSION;
+		driver_info.size = sizeof(driver_info);
+		strscpy(driver_info.driver_version, VDS_VERSION,
+			sizeof(driver_info.driver_version));
+		if (copy_to_user((void __user *)arg, &driver_info,
+				 sizeof(driver_info)))
 			return -EFAULT;
 		return 0;
 	case VDS_IOC_SET_PROFILE:

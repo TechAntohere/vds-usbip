@@ -961,6 +961,14 @@ bool filter_provider_available() {
   return static_cast<bool>(open_filter_control_handle());
 }
 
+std::string filter_driver_version() {
+  UniqueHandle handle = open_filter_control_handle();
+  if (!handle) {
+    throw std::runtime_error("vds_filter control device is unavailable");
+  }
+  return query_vds_driver_version(handle.get());
+}
+
 HidBluetoothDeviceSnapshot list_filter_bluetooth_device_snapshot() {
   HidBluetoothDeviceSnapshot snapshot;
   UniqueHandle handle = open_filter_control_handle();

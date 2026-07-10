@@ -12,28 +12,38 @@ _is_udev_running() {
 	command -v udevadm >/dev/null 2>&1 && [ -S /run/udev/control ]
 }
 
+_unload_vds_hcd_module() {
+	if [ -d "/sys/module/$_dkms_name" ]; then
+		modprobe -r "$_dkms_name"
+	fi
+}
+
 _dkms_remove_all_versions() {
 	local ignore_errors=${1:-}
 	local line
+	local module
+	local module_version
 	local version
 
 	while IFS= read -r line; do
-		case "$line" in
-		"$_dkms_name/"*)
-			version=${line#"$_dkms_name"/}
-			version=${version%%,*}
-			version=${version%%:*}
-			if [ -n "$version" ]; then
-				if ! dkms remove -m "$_dkms_name" -v "$version" --all; then
+		module_version=${line%%,*}
+		module_version=${module_version%%:*}
+		module=${module_version%%/*}
+		version=${module_version#*/}
+		case "$module" in
+		"$_dkms_name" | "$_dkms_name"-*)
+			if [ -n "$version" ] && [ "$version" != "$module_version" ]; then
+				if ! dkms remove -m "$module" -v "$version" --all; then
 					[ "$ignore_errors" = "--ignore-errors" ] || return 1
 				fi
 			fi
 			;;
 		esac
-	done < <(dkms status -m "$_dkms_name" 2>/dev/null || true)
+	done < <(dkms status 2>/dev/null || true)
 }
 
 _dkms_install_current() {
+	_unload_vds_hcd_module || return 1
 	_dkms_remove_all_versions
 	dkms add -m "$_dkms_name" -v "$_dkms_version"
 	dkms build -m "$_dkms_name" -v "$_dkms_version"
@@ -49,7 +59,7 @@ _reload_udev_rules() {
 
 _install_vdsd_service() {
 	if [ -x "$_install_service" ]; then
-		"$_install_service" --start || true
+		"$_install_service" --enable --start
 	fi
 }
 
@@ -167,6 +177,7 @@ post_install() {
 
 pre_upgrade() {
 	_stop_vdsd_service
+	_unload_vds_hcd_module || return 1
 	_dkms_remove_all_versions --ignore-errors
 }
 
@@ -182,6 +193,7 @@ pre_remove() {
 	if [ -x "$_uninstall_service" ]; then
 		"$_uninstall_service" --stop --disable || true
 	fi
+	_unload_vds_hcd_module || return 1
 	_dkms_remove_all_versions --ignore-errors
 }
 

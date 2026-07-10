@@ -4,16 +4,23 @@ set -e
 DKMS_NAME="vds_hcd"
 UNINSTALL_SERVICE="/usr/share/vds/uninstall-service.sh"
 
+unload_vds_hcd_module() {
+	if [ -d "/sys/module/$DKMS_NAME" ]; then
+		modprobe -r "$DKMS_NAME"
+	fi
+}
+
 remove_all_dkms_versions() {
-	dkms status -m "$DKMS_NAME" 2>/dev/null |
+	dkms status 2>/dev/null |
 	while IFS= read -r line; do
-		case "$line" in
-		"$DKMS_NAME/"*)
-			version=${line#"$DKMS_NAME"/}
-			version=${version%%,*}
-			version=${version%%:*}
-			if [ -n "$version" ]; then
-				dkms remove -m "$DKMS_NAME" -v "$version" --all || true
+		module_version=${line%%,*}
+		module_version=${module_version%%:*}
+		module=${module_version%%/*}
+		version=${module_version#*/}
+		case "$module" in
+		"$DKMS_NAME" | "$DKMS_NAME"-*)
+			if [ -n "$version" ] && [ "$version" != "$module_version" ]; then
+				dkms remove -m "$module" -v "$version" --all || true
 			fi
 			;;
 		esac
@@ -35,6 +42,7 @@ esac
 
 case "$1" in
 remove | upgrade | deconfigure)
+	unload_vds_hcd_module
 	remove_all_dkms_versions
 	;;
 esac

@@ -82,6 +82,7 @@ private:
 std::optional<HidBluetoothDevice>
 find_filter_bluetooth_device(const std::string &address);
 bool filter_provider_available();
+std::string filter_driver_version();
 HidBluetoothDeviceSnapshot list_filter_bluetooth_device_snapshot();
 std::vector<HidBluetoothDevice> list_filter_bluetooth_devices();
 std::string describe_bluetooth_lookup(const std::string &address);

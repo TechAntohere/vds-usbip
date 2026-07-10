@@ -55,6 +55,8 @@ static const ULONG vds_endpoint_release_delay_ms = 0;
 static const ULONG vds_iso_out_delay_max_us = 20000;
 static const ULONG vds_iso_out_delay_slack_compensation_us = 300;
 
+C_ASSERT(sizeof(VDS_VERSION) <= VDS_DRIVER_VERSION_MAX);
+
 typedef struct _VDS_CONFIGURE_RECORD {
   ULONG sequence;
   ULONG configure_type;
@@ -3001,6 +3003,24 @@ static VOID VdsCompletePortInfo(PVDS_CONTROL_DEVICE_CONTEXT control_context,
   WdfRequestCompleteWithInformation(request, STATUS_SUCCESS, sizeof(*info));
 }
 
+static VOID VdsCompleteDriverInfo(WDFREQUEST request) {
+  struct vds_driver_info *info;
+  NTSTATUS status;
+
+  status = WdfRequestRetrieveOutputBuffer(request, sizeof(*info),
+                                          (PVOID *)&info, NULL);
+  if (!NT_SUCCESS(status)) {
+    WdfRequestComplete(request, status);
+    return;
+  }
+
+  RtlZeroMemory(info, sizeof(*info));
+  info->version = VDS_DRIVER_INFO_VERSION;
+  info->size = sizeof(*info);
+  RtlCopyMemory(info->driver_version, VDS_VERSION, sizeof(VDS_VERSION));
+  WdfRequestCompleteWithInformation(request, STATUS_SUCCESS, sizeof(*info));
+}
+
 static VOID VdsBindPort(PVDS_CONTROL_DEVICE_CONTEXT control_context,
                         WDFREQUEST request) {
   PVDS_DEVICE_CONTEXT device_context;
@@ -3241,6 +3261,11 @@ static VOID VdsEvtControlDeviceControl(WDFQUEUE queue, WDFREQUEST request,
                                        ULONG io_control_code) {
   UNREFERENCED_PARAMETER(output_buffer_length);
   UNREFERENCED_PARAMETER(input_buffer_length);
+
+  if (io_control_code == VDS_IOCTL_GET_DRIVER_INFO) {
+    VdsCompleteDriverInfo(request);
+    return;
+  }
 
   if (io_control_code == VDS_IOCTL_GET_AUDIO_STATS) {
     PVDS_CONTROL_DEVICE_CONTEXT control_context;

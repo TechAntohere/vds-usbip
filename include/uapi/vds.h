@@ -72,6 +72,8 @@ enum vds_usb_interface_type {
 };
 
 enum {
+	VDS_DRIVER_INFO_VERSION = 1,
+	VDS_DRIVER_VERSION_MAX = 64,
 	VDS_PORT_INFO_VERSION = 2,
 	VDS_PORT_BIND_VERSION = 1,
 	VDS_FILTER_DEVICE_LIST_VERSION = 1,
@@ -104,6 +106,12 @@ struct vds_status {
 	__u32 profile;
 	__u64 frames_to_user;
 	__u64 frames_from_user;
+};
+
+struct vds_driver_info {
+	__u32 version;
+	__u32 size;
+	char driver_version[VDS_DRIVER_VERSION_MAX];
 };
 
 struct vds_profile_config {
@@ -158,6 +166,9 @@ struct vds_filter_device_change {
 	(((device_type) << 16) | ((access) << 14) | ((function) << 2) | \
 	 (method))
 
+#define VDS_IOCTL_GET_DRIVER_INFO                            \
+	VDS_WIN_CTL_CODE(VDS_WIN_FILE_DEVICE_UNKNOWN, 0x800, \
+			 VDS_WIN_METHOD_BUFFERED, VDS_WIN_FILE_READ_DATA)
 #define VDS_IOCTL_GET_PORT_INFO                              \
 	VDS_WIN_CTL_CODE(VDS_WIN_FILE_DEVICE_UNKNOWN, 0x802, \
 			 VDS_WIN_METHOD_BUFFERED, VDS_WIN_FILE_READ_DATA)
@@ -181,6 +192,8 @@ struct vds_filter_device_change {
 #define VDS_IOC_SET_PROFILE _IOW(VDS_IOC_MAGIC, 0x02, struct vds_profile_config)
 #define VDS_IOC_CONNECT _IO(VDS_IOC_MAGIC, 0x03)
 #define VDS_IOC_DISCONNECT _IO(VDS_IOC_MAGIC, 0x04)
+#define VDS_IOC_GET_DRIVER_INFO \
+	_IOR(VDS_IOC_MAGIC, 0x05, struct vds_driver_info)
 #endif
 
 #endif /* _UAPI_VDS_H */

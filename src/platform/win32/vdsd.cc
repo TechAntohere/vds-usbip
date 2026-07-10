@@ -124,6 +124,7 @@ using vds::bt_input_to_usb_input;
 using vds::hidp_output_packet;
 using vds::win::BluetoothTransport;
 using vds::win::describe_bluetooth_lookup;
+using vds::win::filter_driver_version;
 using vds::win::filter_provider_available;
 using vds::win::FilterBluetoothDeviceChangeWait;
 using vds::win::Frame;
@@ -132,6 +133,7 @@ using vds::win::HidBluetoothDeviceSnapshot;
 using vds::win::list_filter_bluetooth_device_snapshot;
 using vds::win::list_filter_bluetooth_devices;
 using vds::win::make_filter_bluetooth_transport;
+using vds::win::query_vds_driver_version;
 using vds::win::UniqueHandle;
 using vds::win::win32_error_message;
 
@@ -535,6 +537,18 @@ std::optional<vds_port_info> query_virtual_port_info(unsigned port) {
     return std::nullopt;
   }
   return info;
+}
+
+std::string query_virtual_port_driver_version(unsigned port) {
+  const std::string path = vds::port_path_for_index(port);
+  UniqueHandle handle(CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                  kDeviceShareMode, nullptr, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (!handle) {
+    throw std::runtime_error("failed to open " + path + ": " +
+                             win32_error_message(GetLastError()));
+  }
+  return query_vds_driver_version(handle.get());
 }
 
 bool virtual_port_is_enabled(unsigned port) {
@@ -2666,7 +2680,9 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
   bool provider_retry_required = false;
   bool config_load_logged = false;
   bool filter_provider_warned = false;
+  bool filter_driver_version_logged = false;
   bool virtual_port_provider_warned = false;
+  bool virtual_port_driver_version_logged = false;
   logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
              "Windows bridge supervisor started pipe=" + options.pipe);
 
@@ -2745,32 +2761,68 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
         const bool virtual_port_provider_is_available = !enabled_ports.empty();
         if (!virtual_port_provider_is_available) {
           provider_retry_required = true;
+          virtual_port_driver_version_logged = false;
           if (!virtual_port_provider_warned) {
             logger.log(vds::LogScope::Port, vds::LogLevel::Error,
                        std::string(kVirtualPortProviderUnavailableReason) +
                            " detail=" + kWindowsVirtualPortProviderUnavailable);
             virtual_port_provider_warned = true;
           }
-        } else if (virtual_port_provider_warned) {
-          logger.log(vds::LogScope::Port, vds::LogLevel::Info,
-                     "virtual port provider recovered");
-          virtual_port_provider_warned = false;
+        } else {
+          if (virtual_port_provider_warned) {
+            logger.log(vds::LogScope::Port, vds::LogLevel::Info,
+                       "virtual port provider recovered");
+            virtual_port_provider_warned = false;
+          }
+          if (!virtual_port_driver_version_logged) {
+            const std::string path =
+                vds::port_path_for_index(enabled_ports.front());
+            try {
+              logger.log(
+                  vds::LogScope::Port, vds::LogLevel::Info,
+                  "driver connected name=vds_usb version=" +
+                      query_virtual_port_driver_version(enabled_ports.front()) +
+                      " path=" + path);
+            } catch (const std::exception &error) {
+              logger.log(vds::LogScope::Port, vds::LogLevel::Warn,
+                         "driver version unavailable name=vds_usb path=" +
+                             path + " detail=" + error.what());
+            }
+            virtual_port_driver_version_logged = true;
+          }
         }
 
         const bool filter_provider_is_available = filter_provider_available();
         HidBluetoothDeviceSnapshot filter_snapshot;
         if (!filter_provider_is_available) {
           provider_retry_required = true;
+          filter_driver_version_logged = false;
           if (!filter_provider_warned) {
             logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Error,
                        "filter provider unavailable detail=" +
                            std::string(kWindowsFilterProviderUnavailable));
             filter_provider_warned = true;
           }
-        } else if (filter_provider_warned) {
-          logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Info,
-                     "filter provider recovered");
-          filter_provider_warned = false;
+        } else {
+          if (filter_provider_warned) {
+            logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Info,
+                       "filter provider recovered");
+            filter_provider_warned = false;
+          }
+          if (!filter_driver_version_logged) {
+            try {
+              logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Info,
+                         "driver connected name=vds_filter version=" +
+                             filter_driver_version() +
+                             R"( path=\\.\vds_filter)");
+            } catch (const std::exception &error) {
+              logger.log(
+                  vds::LogScope::Bluetooth, vds::LogLevel::Warn,
+                  R"(driver version unavailable name=vds_filter path=\\.\vds_filter detail=)" +
+                      std::string(error.what()));
+            }
+            filter_driver_version_logged = true;
+          }
         }
         if (filter_provider_is_available) {
           filter_snapshot = list_filter_bluetooth_device_snapshot();

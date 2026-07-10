@@ -9,16 +9,23 @@ is_udev_running() {
 	command -v udevadm >/dev/null 2>&1 && [ -S /run/udev/control ]
 }
 
+unload_vds_hcd_module() {
+	if [ -d "/sys/module/$DKMS_NAME" ]; then
+		modprobe -r "$DKMS_NAME"
+	fi
+}
+
 remove_all_dkms_versions() {
-	dkms status -m "$DKMS_NAME" 2>/dev/null |
+	dkms status 2>/dev/null |
 	while IFS= read -r line; do
-		case "$line" in
-		"$DKMS_NAME/"*)
-			version=${line#"$DKMS_NAME"/}
-			version=${version%%,*}
-			version=${version%%:*}
-			if [ -n "$version" ]; then
-				dkms remove -m "$DKMS_NAME" -v "$version" --all
+		module_version=${line%%,*}
+		module_version=${module_version%%:*}
+		module=${module_version%%/*}
+		version=${module_version#*/}
+		case "$module" in
+		"$DKMS_NAME" | "$DKMS_NAME"-*)
+			if [ -n "$version" ] && [ "$version" != "$module_version" ]; then
+				dkms remove -m "$module" -v "$version" --all
 			fi
 			;;
 		esac
@@ -119,6 +126,7 @@ NOTICE
 
 case "$1" in
 configure)
+	unload_vds_hcd_module
 	remove_all_dkms_versions
 	dkms add -m "$DKMS_NAME" -v "$DKMS_VERSION"
 	dkms build -m "$DKMS_NAME" -v "$DKMS_VERSION"
@@ -129,7 +137,7 @@ configure)
 		udevadm trigger --subsystem-match=input || true
 	fi
 	if [ -x "$INSTALL_SERVICE" ]; then
-		"$INSTALL_SERVICE" --start || true
+		"$INSTALL_SERVICE" --enable --start
 	fi
 	print_bluetooth_pairing_notice
 	print_audio_setup_notice

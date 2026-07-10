@@ -20,6 +20,11 @@ $DriverVer = Resolve-VdsDriverVer `
 $ResolvedDriverDate = $DriverVer.Date
 $ResolvedDriverVersion = $DriverVer.Version
 Write-Output "Using DriverVer=$ResolvedDriverDate,$ResolvedDriverVersion"
+$ResolvedBuildVersion = Get-VdsGitVersionFromGit -RepoRoot $RepoRoot
+if ([string]::IsNullOrWhiteSpace($ResolvedBuildVersion)) {
+  $ResolvedBuildVersion = $ResolvedDriverVersion
+}
+Write-Output "Using driver build version=$ResolvedBuildVersion"
 
 $CertificateSubject = "CN=vDS Test Driver Certificate"
 $Configuration = "Debug"
@@ -451,6 +456,7 @@ function Build-TargetPackage {
     "/p:Platform=$Platform"
     "/p:WindowsTargetPlatformVersion=$WindowsDriverKitVersion"
     "/p:VdsWindowsKernelKitVersion=$WindowsDriverKitVersion"
+    "/p:VdsVersionString=$ResolvedBuildVersion"
     "/p:SignMode=Off"
     "/p:EnableInf2cat=false"
     "/p:SkipPackageVerification=true"

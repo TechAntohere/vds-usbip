@@ -1439,7 +1439,28 @@ void sync_virtual_ports(std::vector<VirtualPort> &ports,
     }
 
     vds::UniqueFd fd(open_required(device, O_RDWR | O_NONBLOCK | O_CLOEXEC));
-    logger.log(vds::LogScope::Port, vds::LogLevel::Info, "opened " + device);
+    vds_driver_info driver_info{};
+    std::string driver_message = "driver connected name=vds_hcd path=" + device;
+    vds::LogLevel driver_log_level = vds::LogLevel::Info;
+    if (::ioctl(fd.get(), VDS_IOC_GET_DRIVER_INFO, &driver_info) < 0) {
+      driver_log_level = vds::LogLevel::Warn;
+      driver_message =
+          "driver version unavailable name=vds_hcd path=" + device +
+          " detail=" + std::strerror(errno);
+    } else if (driver_info.version != VDS_DRIVER_INFO_VERSION ||
+               driver_info.size != sizeof(driver_info) ||
+               driver_info.driver_version[0] == '\0' ||
+               driver_info.driver_version[VDS_DRIVER_VERSION_MAX - 1] != '\0') {
+      driver_log_level = vds::LogLevel::Warn;
+      driver_message =
+          "driver version unavailable name=vds_hcd path=" + device +
+          " detail=invalid driver version reply";
+    } else {
+      driver_message = "driver connected name=vds_hcd version=" +
+                       std::string(driver_info.driver_version) +
+                       " path=" + device;
+    }
+    logger.log(vds::LogScope::Port, driver_log_level, driver_message);
     updated.push_back(VirtualPort{
         .path = device,
         .fd = std::move(fd),

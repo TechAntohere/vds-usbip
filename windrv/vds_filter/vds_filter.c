@@ -59,6 +59,8 @@ static PDEVICE_OBJECT vds_control_device;
 static ULONG vds_device_generation;
 static volatile LONG vds_next_filter_instance;
 
+C_ASSERT(sizeof(VDS_VERSION) <= VDS_DRIVER_VERSION_MAX);
+
 typedef struct _VDS_FILTER_WAIT_CONTEXT {
   ULONG generation;
 } VDS_FILTER_WAIT_CONTEXT, *PVDS_FILTER_WAIT_CONTEXT;
@@ -695,6 +697,7 @@ static NTSTATUS VdsDispatchDeviceControl(PDEVICE_OBJECT device_object,
                                          PIRP irp) {
   PVDS_FILTER_EXTENSION extension;
   PIO_STACK_LOCATION stack;
+  struct vds_driver_info *driver_info;
   struct vds_filter_device_change *change;
   struct vds_filter_device_list *output;
   VDS_FILTER_WAIT_CONTEXT wait_context;
@@ -725,6 +728,21 @@ static NTSTATUS VdsDispatchDeviceControl(PDEVICE_OBJECT device_object,
 
   stack = IoGetCurrentIrpStackLocation(irp);
   switch (stack->Parameters.DeviceIoControl.IoControlCode) {
+  case VDS_IOCTL_GET_DRIVER_INFO:
+    output_length = stack->Parameters.DeviceIoControl.OutputBufferLength;
+    if (output_length < sizeof(*driver_info))
+      return VdsCompleteIrp(irp, STATUS_BUFFER_TOO_SMALL);
+
+    driver_info = (struct vds_driver_info *)irp->AssociatedIrp.SystemBuffer;
+    RtlZeroMemory(driver_info, sizeof(*driver_info));
+    driver_info->version = VDS_DRIVER_INFO_VERSION;
+    driver_info->size = sizeof(*driver_info);
+    RtlCopyMemory(driver_info->driver_version, VDS_VERSION,
+                  sizeof(VDS_VERSION));
+    irp->IoStatus.Status = STATUS_SUCCESS;
+    irp->IoStatus.Information = sizeof(*driver_info);
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
   case VDS_FILTER_IOCTL_GET_DEVICES:
     break;
   case VDS_FILTER_IOCTL_WAIT_DEVICE_CHANGE:

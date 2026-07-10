@@ -84,7 +84,6 @@ constexpr std::uint8_t kOutputAudioControlNonPathMask = 0xcf;
 constexpr std::uint8_t kOutputPathHeadphones = 0x00;
 constexpr std::uint8_t kOutputPathSpeaker = 0x30;
 constexpr std::uint8_t kOutputPathMask = 0x30;
-constexpr std::uint8_t kOutputSpeakerPreampGain = 0x02;
 constexpr std::uint8_t kOutputPowerSaveMicMute = 0x10;
 constexpr std::uint8_t kBtAudioSectionsEnable = 0xff;
 constexpr std::uint8_t kBtAudioSectionsDisableMic = 0xfe;
@@ -653,7 +652,7 @@ bool DsOutputState::apply_usb_output_report(
     state_[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
     state_[kOutputAudioControlOffset] =
         audio_control_with_output_path(audio_control_, kOutputPathSpeaker);
-    state_[kOutputAudioControl2Offset] = kOutputSpeakerPreampGain;
+    state_[kOutputAudioControl2Offset] = audio_control2_;
   }
   if (decoded.allow_mute_light) {
     copy_state_bytes(state_, update,
@@ -722,7 +721,7 @@ void DsOutputState::set_audio_out_stream_active(bool active,
       state_[kOutputFlag0Offset] |= kOutputFlag0SpeakerVolumeEnable;
       state_[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
       state_[kOutputSpeakerVolumeOffset] = speaker_volume_;
-      state_[kOutputAudioControl2Offset] = kOutputSpeakerPreampGain;
+      state_[kOutputAudioControl2Offset] = audio_control2_;
       audio_output_path_ = kOutputPathSpeaker;
       state_[kOutputAudioControlOffset] =
           audio_control_with_output_path(audio_control_, audio_output_path_);
