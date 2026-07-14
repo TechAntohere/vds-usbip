@@ -1,9 +1,19 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com>
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+
+// winsock2.h must precede windows.h in this translation unit now that
+// vdsd.cc pulls in vds_usbip.hh (USB/IP transport, uses winsock2), or
+// windows.h drags in the legacy winsock.h first and every socket symbol
+// ends up redefined with conflicting linkage (MSVC C2375).
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #include <algorithm>
 #include <array>
@@ -38,6 +48,7 @@
 #include "vds_bt.hh"
 #include "vds_build_info.hh"
 #include "vds_common.hh"
+#include "vds_usbip.hh"
 #include "vds_config.hh"
 #include "vds_io.hh"
 #include "vds_log.hh"
@@ -132,6 +143,7 @@ using vds::win::HidBluetoothDevice;
 using vds::win::HidBluetoothDeviceSnapshot;
 using vds::win::list_filter_bluetooth_device_snapshot;
 using vds::win::list_filter_bluetooth_devices;
+using vds::win::list_hid_bluetooth_devices;
 using vds::win::make_filter_bluetooth_transport;
 using vds::win::query_vds_driver_version;
 using vds::win::UniqueHandle;
@@ -458,6 +470,13 @@ find_connected_bluetooth_device(const std::string &address,
         device.access_restricted) {
       return device;
     }
+    // Plain-HID discovery (no vds_filter.sys) never sets filter_backed or
+    // access_restricted -- it can't enforce exclusive access without a
+    // driver -- but report_target=true still means we found a live,
+    // matching DualSense HID interface, which is enough to bridge.
+    if (!device.filter_backed && device.report_target) {
+      return device;
+    }
     if (failure_reason != nullptr) {
       if (!device.bluetooth_connected) {
         *failure_reason =
@@ -487,12 +506,15 @@ std::optional<HidBluetoothDevice>
 find_connected_bluetooth_device(const std::string &address,
                                 std::string *failure_reason = nullptr) {
   try {
-    return find_connected_bluetooth_device(
-        address, list_filter_bluetooth_device_snapshot().devices,
-        failure_reason);
+    // vds_filter.sys is optional: fall back to plain-HID discovery when
+    // it is not loaded, consistent with list_windows_controller_targets().
+    const std::vector<HidBluetoothDevice> devices =
+        filter_provider_available() ? list_filter_bluetooth_devices()
+                                    : list_hid_bluetooth_devices();
+    return find_connected_bluetooth_device(address, devices, failure_reason);
   } catch (const std::exception &error) {
     if (failure_reason != nullptr) {
-      *failure_reason = std::string("vds_filter query failed: ") + error.what();
+      *failure_reason = std::string("Bluetooth device lookup failed: ") + error.what();
     }
     return std::nullopt;
   }
@@ -500,7 +522,13 @@ find_connected_bluetooth_device(const std::string &address,
 
 std::vector<vds::ControllerTarget> list_windows_controller_targets() {
   std::vector<vds::ControllerTarget> targets;
-  for (const auto &device : list_filter_bluetooth_devices()) {
+  // vds_filter.sys is optional now: fall back to plain-HID discovery when
+  // it isn't loaded, so a controller can be found/configured without any
+  // custom kernel driver at all.
+  const std::vector<HidBluetoothDevice> discovered =
+      filter_provider_available() ? list_filter_bluetooth_devices()
+                                  : list_hid_bluetooth_devices();
+  for (const auto &device : discovered) {
     if (!device.profile_valid || device.address.empty()) {
       continue;
     }
@@ -510,8 +538,15 @@ std::vector<vds::ControllerTarget> list_windows_controller_targets() {
         .profile = device.profile == VDS_PROFILE_DSE
                        ? vds::ControllerProfile::Dse
                        : vds::ControllerProfile::Ds5,
-        .online = device.filter_backed && device.report_target &&
-                  device.access_restricted,
+        // BUG FIX: was gated on filter_backed && report_target &&
+        // access_restricted -- filter_backed is always false and
+        // access_restricted is always false (explicitly unimplemented,
+        // see comment above list_hid_bluetooth_devices) on the plain-HID
+        // discovery path we actually use, so online was permanently false
+        // even while the controller was genuinely connected. Both
+        // discovery paths correctly populate bluetooth_connected from the
+        // real BluetoothGetDeviceInfo result, so use that instead.
+        .online = device.bluetooth_connected,
     });
   }
   return targets;
@@ -551,7 +586,19 @@ std::string query_virtual_port_driver_version(unsigned port) {
   return query_vds_driver_version(handle.get());
 }
 
+// Forward declaration: defined near run_bridge_session below. Needed here
+// because the port-enumeration functions immediately below must bypass the
+// vds_usb.sys-based enabled/bound checks entirely when running in USB/IP
+// mode -- there is no driver-tracked port state to query in that mode, the
+// USB/IP VirtualPort objects manage their own lifetime per bridge session.
+bool usbip_transport_enabled();
+
 bool virtual_port_is_enabled(unsigned port) {
+  if (usbip_transport_enabled()) {
+    // No driver-backed "enabled" concept in USB/IP mode -- every port slot
+    // is considered available for the daemon to use.
+    return port < vds::kMaxPortCount;
+  }
   const auto info = query_virtual_port_info(port);
   if (!info) {
     return false;
@@ -575,6 +622,14 @@ bool virtual_port_provider_available() {
 }
 
 bool virtual_port_is_available(unsigned port) {
+  if (usbip_transport_enabled()) {
+    // First-pass limitation: USB/IP mode does not yet track per-port
+    // "bound" state the way vds_usb.sys does, so this cannot detect a port
+    // already in use by another live bridge session. Fine for the
+    // single-controller bring-up test; needs real tracking (e.g. a static
+    // set guarded by a mutex) before multi-controller use.
+    return port < vds::kMaxPortCount;
+  }
   const auto info = query_virtual_port_info(port);
   if (!info) {
     return false;
@@ -870,6 +925,7 @@ void request_bridge_restart(HANDLE virtual_device,
 void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
                           BridgeState &state, const Frame &frame,
                           vds::Logger &logger, std::mutex &bluetooth_mutex,
+                          std::mutex &virtual_write_mutex,
                           std::atomic_bool &bridge_restart_requested) {
   if (frame.header.type == VDS_FRAME_USB_INTERFACE) {
     if (frame.payload.size() != sizeof(vds_usb_interface_event)) {
@@ -1010,9 +1066,12 @@ void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
     }
     const std::uint8_t report_id = frame.payload[0];
     if (const auto cached = cached_feature_report(state, report_id)) {
-      vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_FEATURE_REPLY,
-                                   *cached, "virtual",
-                                   handle_io_cancellation());
+      {
+        std::lock_guard write_guard(virtual_write_mutex);
+        vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_FEATURE_REPLY,
+                                     *cached, "virtual",
+                                     handle_io_cancellation());
+      }
       logger.log(vds::LogScope::Usb, vds::LogLevel::Info,
                  "feature get report_id=" + std::to_string(report_id) +
                      " cache=hit bluetooth_forward=no");
@@ -1027,9 +1086,12 @@ void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
       }
       if (report) {
         cache_feature_report(state, *report);
-        vds::win::write_handle_frame(virtual_device,
-                                     VDS_FRAME_USB_FEATURE_REPLY, *report,
-                                     "virtual", handle_io_cancellation());
+        {
+          std::lock_guard write_guard(virtual_write_mutex);
+          vds::win::write_handle_frame(virtual_device,
+                                       VDS_FRAME_USB_FEATURE_REPLY, *report,
+                                       "virtual", handle_io_cancellation());
+        }
       }
       logger.log(
           vds::LogScope::Usb, vds::LogLevel::Info,
@@ -1359,7 +1421,8 @@ void handle_bluetooth_frame(HANDLE virtual_device,
                             BluetoothTransport &bluetooth, BridgeState &state,
                             const Frame &frame, vds::Logger &logger,
                             std::uint32_t trace_flags,
-                            std::mutex &bluetooth_mutex) {
+                            std::mutex &bluetooth_mutex,
+                            std::mutex &virtual_write_mutex) {
   if (frame.header.type == VDS_FRAME_BT_INTERRUPT_PACKET) {
     if (vds::bt_input_payload_type(frame.payload) ==
         vds::BtInputPayloadType::Audio) {
@@ -1412,8 +1475,11 @@ void handle_bluetooth_frame(HANDLE virtual_device,
           }
         }
 
-        vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_AUDIO_IN,
-                                     *pcm, "virtual", handle_io_cancellation());
+        {
+          std::lock_guard write_guard(virtual_write_mutex);
+          vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_AUDIO_IN,
+                                       *pcm, "virtual", handle_io_cancellation());
+        }
         std::uint64_t forwarded = 0;
         {
           std::lock_guard guard(state.mutex);
@@ -1432,9 +1498,12 @@ void handle_bluetooth_frame(HANDLE virtual_device,
 
     const auto report = bt_input_to_usb_input(frame.payload);
     if (report) {
-      vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_HID_IN,
-                                   *report, "virtual",
-                                   handle_io_cancellation());
+      {
+        std::lock_guard write_guard(virtual_write_mutex);
+        vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_HID_IN,
+                                     *report, "virtual",
+                                     handle_io_cancellation());
+      }
       const std::uint8_t headset_status = report->at(kUsbInputHeadsetOffset);
       const bool headset_plugged =
           (headset_status & kUsbInputHeadphonesPluggedMask) != 0;
@@ -1558,6 +1627,7 @@ void handle_bluetooth_frame(HANDLE virtual_device,
                  " prefix=" + hex_bytes(frame.payload, 8, ':', false));
   const auto report = bt_feature_to_usb_feature_reply(frame.payload);
   if (report) {
+    std::lock_guard write_guard(virtual_write_mutex);
     vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_FEATURE_REPLY,
                                  *report, "virtual", handle_io_cancellation());
     if (!report->empty()) {
@@ -2133,12 +2203,14 @@ void virtual_to_bluetooth_loop(HANDLE virtual_device,
                                BluetoothTransport &bluetooth,
                                BridgeState &state, vds::Logger &logger,
                                std::mutex &bluetooth_mutex,
+                               std::mutex &virtual_write_mutex,
                                std::atomic_bool &bridge_restart_requested) {
   while (!g_stop_requested.load() && !bridge_restart_requested.load()) {
     handle_virtual_frame(virtual_device, bluetooth, state,
                          vds::win::read_handle_frame(virtual_device, "virtual",
                                                      handle_io_cancellation()),
-                         logger, bluetooth_mutex, bridge_restart_requested);
+                         logger, bluetooth_mutex, virtual_write_mutex,
+                         bridge_restart_requested);
   }
 }
 
@@ -2147,16 +2219,26 @@ void bluetooth_to_virtual_loop(BluetoothTransport &bluetooth,
                                vds::Logger &logger,
                                std::atomic_bool &bridge_restart_requested,
                                const std::atomic_uint32_t *trace_flags,
-                               std::mutex &bluetooth_mutex) {
+                               std::mutex &bluetooth_mutex,
+                               std::mutex &virtual_write_mutex) {
   while (!g_stop_requested.load() && !bridge_restart_requested.load()) {
     handle_bluetooth_frame(
         virtual_device, bluetooth, state, bluetooth.read_frame(), logger,
-        trace_flags == nullptr ? 0 : trace_flags->load(), bluetooth_mutex);
+        trace_flags == nullptr ? 0 : trace_flags->load(), bluetooth_mutex,
+        virtual_write_mutex);
   }
+}
+
+bool usbip_transport_enabled() {
+  char buffer[8]{};
+  const DWORD length =
+      GetEnvironmentVariableA("VDS_TRANSPORT", buffer, sizeof(buffer));
+  return length > 0 && std::string_view(buffer, length) == "usbip";
 }
 
 void run_bridge_session(const std::string &device_address,
                         const std::string &virtual_device,
+                        unsigned port_index,
                         const vds::ControllerConfig *selected_config,
                         vds::Logger &logger,
                         std::atomic_bool *session_stop_requested = nullptr,
@@ -2172,10 +2254,27 @@ void run_bridge_session(const std::string &device_address,
                  " device_address=" + device_address);
   std::unique_ptr<BluetoothTransport> bluetooth =
       make_filter_bluetooth_transport(device_address);
-  VirtualPortBindingGuard virtual_port_binding(virtual_device, profile, logger);
+
+  std::unique_ptr<VirtualPortBindingGuard> virtual_port_binding;
+  std::unique_ptr<vds::win::usbip::VirtualPort> usbip_virtual_port;
+  std::string device_handle_path = virtual_device;
+
+  if (usbip_transport_enabled()) {
+    usbip_virtual_port =
+        vds::win::usbip::open_usbip_virtual_port(profile, port_index);
+    device_handle_path = usbip_virtual_port->pipe_path();
+    logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
+               "Windows bridge using USB/IP transport pipe=" +
+                   device_handle_path);
+  } else {
+    virtual_port_binding = std::make_unique<VirtualPortBindingGuard>(
+        virtual_device, profile, logger);
+  }
+
   BridgeState state;
+  std::mutex virtual_write_mutex; // serializes writes to virtual_device across to_bluetooth/to_virtual threads
   std::mutex bluetooth_mutex;
-  UniqueHandle virtual_device_handle = open_device(virtual_device);
+  UniqueHandle virtual_device_handle = open_device(device_handle_path);
   std::atomic_bool bridge_restart_requested = false;
   std::thread stop_monitor;
 
@@ -2216,7 +2315,7 @@ void run_bridge_session(const std::string &device_address,
   std::thread to_bluetooth([&] {
     try {
       virtual_to_bluetooth_loop(virtual_device_handle.get(), *bluetooth, state,
-                                logger, bluetooth_mutex,
+                                logger, bluetooth_mutex, virtual_write_mutex,
                                 bridge_restart_requested);
     } catch (const std::exception &error) {
       if (!g_stop_requested) {
@@ -2233,7 +2332,7 @@ void run_bridge_session(const std::string &device_address,
     try {
       bluetooth_to_virtual_loop(*bluetooth, virtual_device_handle.get(), state,
                                 logger, bridge_restart_requested, trace_flags,
-                                bluetooth_mutex);
+                                bluetooth_mutex, virtual_write_mutex);
     } catch (const std::exception &error) {
       if (!g_stop_requested) {
         logger.log(vds::LogScope::Daemon, vds::LogLevel::Error,
@@ -2635,8 +2734,8 @@ void run_configured_bridge_worker(vds::ControllerConfig config,
     }
     const std::string virtual_device =
         vds::port_path_for_index(config.ports[0]);
-    run_bridge_session(device_address, virtual_device, &config, logger,
-                       &stop_requested, &trace_flags);
+    run_bridge_session(device_address, virtual_device, config.ports[0],
+                       &config, logger, &stop_requested, &trace_flags);
     if (!g_stop_requested && !stop_requested.load()) {
       last_error = "bridge session ended";
       logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
@@ -2830,6 +2929,20 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
           if (filter_generation == 0) {
             provider_retry_required = true;
           }
+        } else {
+          // No vds_filter.sys: fall back to plain-HID discovery so
+          // attached controllers can still be found/bridged with zero
+          // custom kernel drivers. Known limitation: no exclusive-access
+          // enforcement (see HidBluetoothDevice::access_restricted docs).
+          try {
+            filter_snapshot.devices = list_hid_bluetooth_devices();
+            filter_snapshot.generation = 1;
+          } catch (const std::exception &error) {
+            logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Warn,
+                       "plain-HID discovery failed detail=" +
+                           std::string(error.what()));
+            filter_snapshot.devices.clear();
+          }
         }
 
         for (const auto &worker : workers) {
@@ -2892,17 +3005,9 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
           }
           vds::forget_vdsd_warning_state(port_binding_warned_states,
                                          config.address);
-          if (!filter_provider_is_available) {
-            if (vds::remember_vdsd_warning_state(
-                    discovery_warned_states, config.address,
-                    "filter provider unavailable")) {
-              logger.log(
-                  vds::LogScope::Daemon, vds::LogLevel::Warn,
-                  "controller filter unavailable address=" + config.address +
-                      " reason=filter provider unavailable");
-            }
-            continue;
-          }
+          // Note: filter_snapshot.devices is already populated above from
+          // either vds_filter.sys or the plain-HID fallback, so discovery
+          // below works the same either way -- no separate gate needed.
           std::string discovery_error;
           const auto connected_device = find_connected_bluetooth_device(
               config.address, filter_snapshot.devices, &discovery_error);

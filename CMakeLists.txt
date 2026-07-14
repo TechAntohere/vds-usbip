@@ -102,6 +102,16 @@ if(WIN32)
   target_link_libraries(vds_bt PUBLIC vds_protocol vds_common vds_io hid
                                       setupapi bthprops)
 
+  # USB/IP userspace transport (replaces vds_usb.sys/vds_filter.sys for
+  # bring-up/testing; toggled at runtime via VDS_TRANSPORT=usbip). Untested
+  # against MSVC as of this commit -- first thing to check if this target
+  # fails to build.
+  add_library(vds_usbip OBJECT src/platform/win32/vds_usbip.cc)
+  target_include_directories(
+    vds_usbip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                     ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(vds_usbip PUBLIC vds_protocol vds_win32 ws2_32)
+
   add_executable(vdsd src/platform/win32/vdsd.cc)
   add_dependencies(vdsd vds_build_info_header)
   target_include_directories(vdsd PRIVATE ${VDS_GENERATED_DIR})
@@ -115,6 +125,7 @@ if(WIN32)
             vds_log
             vds_io
             vds_win32
+            vds_usbip
             vdsd_common
             winmm)
 

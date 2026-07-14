@@ -85,6 +85,9 @@ bool filter_provider_available();
 std::string filter_driver_version();
 HidBluetoothDeviceSnapshot list_filter_bluetooth_device_snapshot();
 std::vector<HidBluetoothDevice> list_filter_bluetooth_devices();
+// Plain-HID discovery, no vds_filter.sys dependency. See definition for
+// current limitations (no exclusive-access tracking yet).
+std::vector<HidBluetoothDevice> list_hid_bluetooth_devices();
 std::string describe_bluetooth_lookup(const std::string &address);
 std::unique_ptr<BluetoothTransport>
 make_filter_bluetooth_transport(const std::string &address);

@@ -1,0 +1,1 @@
+cmd /c '"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" && cd /d C:\Users\Antonio\Documents\vds\build && cmake --build . --config Release --target vdsd vdsctl 2>&1'

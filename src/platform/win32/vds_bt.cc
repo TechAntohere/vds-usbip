@@ -26,6 +26,7 @@
 #include <windows.h>
 
 #include <bluetoothapis.h>
+#include <cfgmgr32.h>
 #include <hidsdi.h>
 #include <setupapi.h>
 
@@ -188,6 +189,26 @@ bool is_compact_bluetooth_address(std::string_view address) {
   return address.size() == 12 &&
          std::all_of(address.begin(), address.end(),
                      [](unsigned char ch) { return std::isxdigit(ch) != 0; });
+}
+
+// Converts a 12-hex-digit compact address (e.g. "a0fa9c39053e") into the
+// canonical colon-separated form ("a0:fa:9c:39:05:3e") expected by
+// vds::normalize_bluetooth_address and the rest of the config/control-pipe
+// layer. Returns the input unchanged if it isn't a valid compact address.
+std::string colon_bluetooth_address(std::string_view compact) {
+  if (!is_compact_bluetooth_address(compact)) {
+    return std::string(compact);
+  }
+  std::string result;
+  result.reserve(17);
+  for (std::size_t i = 0; i < compact.size(); i += 2) {
+    if (i != 0) {
+      result.push_back(':');
+    }
+    result.push_back(compact[i]);
+    result.push_back(compact[i + 1]);
+  }
+  return result;
 }
 
 bool is_colon_bluetooth_address(std::string_view address) {
@@ -923,6 +944,72 @@ std::string find_hid_bluetooth_device_path(const std::string &address) {
   return *first_match;
 }
 
+// Extracts the remote Bluetooth address embedded in a Windows BTHENUM-style
+// HID device interface path (e.g.
+// "...#7&1a2b3c4d&0&aabbccddeeff#{...}"). The address appears as a bare
+// 12-hex-digit run immediately after the last "&0&" segment -- this is the
+// same substring `hid_device_path_matches` already searches for when given
+// an address filter, just run in reverse (extract instead of match).
+// First-pass: derived from observed Windows device-path conventions, not
+// yet confirmed against every BT stack/dongle combination.
+std::optional<std::string>
+extract_bluetooth_address_from_hid_path(const std::string &path) {
+  const std::string lower_path = lowercase_ascii(path);
+  constexpr std::string_view marker = "&0&";
+  const auto marker_pos = lower_path.rfind(marker);
+  if (marker_pos == std::string::npos) {
+    return std::nullopt;
+  }
+  const auto address_pos = marker_pos + marker.size();
+  if (address_pos + 12 > lower_path.size()) {
+    return std::nullopt;
+  }
+  const std::string candidate = lower_path.substr(address_pos, 12);
+  if (!is_compact_bluetooth_address(candidate)) {
+    return std::nullopt;
+  }
+  return candidate;
+}
+
+// Fallback for BT stacks (observed on current Windows builds) where the
+// HID interface path does not embed the remote address at all -- instead
+// it appears in an ancestor BTHENUM device instance ID, in the form
+// "...&C&<12hex>_..." (case-insensitive). We walk up the device tree via
+// CM_Get_Parent looking for that pattern. Bounded to a handful of levels
+// since the chain from a HID collection to its BTHENUM node is short and
+// fixed (HID -> BTHENUM service node -> BTHENUM device -> BTH radio ...).
+std::optional<std::string>
+extract_bluetooth_address_from_devinst(DEVINST devinst) {
+  DEVINST current = devinst;
+  for (int depth = 0; depth < 6; ++depth) {
+    char id_buffer[MAX_DEVICE_ID_LEN]{};
+    if (CM_Get_Device_IDA(current, id_buffer, MAX_DEVICE_ID_LEN, 0) ==
+        CR_SUCCESS) {
+      const std::string id_lower = lowercase_ascii(id_buffer);
+      constexpr std::string_view marker = "&c&";
+      auto pos = id_lower.find(marker);
+      while (pos != std::string::npos) {
+        const auto candidate_pos = pos + marker.size();
+        if (candidate_pos + 12 <= id_lower.size()) {
+          const std::string candidate = id_lower.substr(candidate_pos, 12);
+          if (is_compact_bluetooth_address(candidate)) {
+            return candidate;
+          }
+        }
+        pos = id_lower.find(marker, pos + marker.size());
+      }
+    }
+
+    DEVINST parent{};
+    if (CM_Get_Parent(&parent, current, 0) != CR_SUCCESS) {
+      break;
+    }
+    current = parent;
+  }
+  return std::nullopt;
+}
+
+
 UniqueHandle open_filter_control_handle(DWORD desired_access = GENERIC_READ,
                                         DWORD flags = FILE_ATTRIBUTE_NORMAL) {
   UniqueHandle handle(CreateFileA(kVdsFilterControlPath, desired_access,
@@ -943,18 +1030,170 @@ UniqueHandle open_filter_control_handle(DWORD desired_access = GENERIC_READ,
 
 } // namespace
 
+// Plain-HID device discovery: enumerates DualSense/DualSense Edge HID
+// interfaces directly via SetupDiGetClassDevs + HidD_GetAttributes, with no
+// dependency on vds_filter.sys. This is what lets vDS run without any
+// custom kernel driver at all -- combined with the USB/IP virtual-port
+// transport (vds_usbip.hh), it removes the test-signing requirement
+// entirely. Devices found this way cannot yet report "access_restricted"
+// (that required vds_filter's exclusive-access tracking; a HidHide-based
+// equivalent is still unwritten), so `access_restricted` is left false and
+// callers must not gate on it for this source.
+std::vector<HidBluetoothDevice> list_hid_bluetooth_devices() {
+  std::vector<HidBluetoothDevice> devices;
+
+  GUID hid_guid{};
+  HidD_GetHidGuid(&hid_guid);
+
+  UniqueDeviceInfoSet device_set(SetupDiGetClassDevsA(
+      &hid_guid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE));
+  if (!device_set) {
+    throw std::runtime_error("SetupDiGetClassDevs(HID) failed: " +
+                             win32_error_message(GetLastError()));
+  }
+
+  for (DWORD index = 0;; ++index) {
+    SP_DEVICE_INTERFACE_DATA interface_data{};
+    interface_data.cbSize = sizeof(interface_data);
+    if (!SetupDiEnumDeviceInterfaces(device_set.get(), nullptr, &hid_guid,
+                                     index, &interface_data)) {
+      const DWORD error = GetLastError();
+      if (error == ERROR_NO_MORE_ITEMS) {
+        break;
+      }
+      throw std::runtime_error("SetupDiEnumDeviceInterfaces(HID) failed: " +
+                               win32_error_message(error));
+    }
+
+    DWORD required = 0;
+    SetupDiGetDeviceInterfaceDetailA(device_set.get(), &interface_data,
+                                     nullptr, 0, &required, nullptr);
+    if (required == 0) {
+      continue;
+    }
+    std::vector<std::uint8_t> detail_buffer(required);
+    auto *detail = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_A>(
+        detail_buffer.data());
+    detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
+    SP_DEVINFO_DATA devinfo_data{};
+    devinfo_data.cbSize = sizeof(devinfo_data);
+    if (!SetupDiGetDeviceInterfaceDetailA(device_set.get(), &interface_data,
+                                          detail, required, nullptr,
+                                          &devinfo_data)) {
+      continue;
+    }
+    const std::string device_path = detail->DevicePath;
+
+    if (FILE *dbg = std::fopen("C:\\ProgramData\\vDS\\hid_discover_debug.log", "a")) {
+      std::fprintf(dbg, "candidate path=%s\n", device_path.c_str());
+      std::fclose(dbg);
+    }
+    if (!hid_device_path_matches(device_path, std::string{}, true)) {
+      if (FILE *dbg = std::fopen("C:\\ProgramData\\vDS\\hid_discover_debug.log", "a")) {
+        std::fprintf(dbg, "  -> rejected by hid_device_path_matches\n");
+        std::fclose(dbg);
+      }
+      continue;
+    }
+
+    UniqueHandle query_handle(CreateFileA(
+        device_path.c_str(), 0, kDeviceShareMode, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!query_handle) {
+      if (FILE *dbg = std::fopen("C:\\ProgramData\\vDS\\hid_discover_debug.log", "a")) {
+        std::fprintf(dbg, "  -> CreateFileA failed err=%lu\n", GetLastError());
+        std::fclose(dbg);
+      }
+      continue;
+    }
+    HIDD_ATTRIBUTES attributes{};
+    attributes.Size = sizeof(attributes);
+    if (!HidD_GetAttributes(query_handle.get(), &attributes)) {
+      if (FILE *dbg = std::fopen("C:\\ProgramData\\vDS\\hid_discover_debug.log", "a")) {
+        std::fprintf(dbg, "  -> HidD_GetAttributes failed\n");
+        std::fclose(dbg);
+      }
+      continue;
+    }
+
+    // Try the cheap path-string extraction first (some BT stacks embed the
+    // address directly in the HID interface path), then fall back to
+    // walking the device tree -- observed necessary on current BT stacks,
+    // where the address only appears on an ancestor BTHENUM node.
+    auto address = extract_bluetooth_address_from_hid_path(device_path);
+    if (!address) {
+      address = extract_bluetooth_address_from_devinst(devinfo_data.DevInst);
+    }
+    if (!address) {
+      if (FILE *dbg = std::fopen("C:\\ProgramData\\vDS\\hid_discover_debug.log", "a")) {
+        std::fprintf(dbg, "  -> address extraction failed vid=0x%04x pid=0x%04x\n", attributes.VendorID, attributes.ProductID);
+        std::fclose(dbg);
+      }
+      continue;
+    }
+    if (FILE *dbg = std::fopen("C:\\ProgramData\\vDS\\hid_discover_debug.log", "a")) {
+      std::fprintf(dbg, "  -> SUCCESS address=%s vid=0x%04x pid=0x%04x\n", address->c_str(), attributes.VendorID, attributes.ProductID);
+      std::fclose(dbg);
+    }
+    // Extraction yields a compact 12-hex address; the rest of vds (config
+    // parsing, control-pipe JSON) expects canonical colon-separated form.
+    *address = colon_bluetooth_address(*address);
+
+    const std::uint32_t profile = attributes.ProductID == VDS_DSE_PRODUCT_ID
+                                      ? VDS_PROFILE_DSE
+                                      : VDS_PROFILE_DS5;
+    const auto info = query_bluetooth_device_info(*address);
+    std::string name = info ? utf8_from_wide(info->szName) : std::string{};
+    if (name.empty()) {
+      name = default_bluetooth_device_name(profile);
+    }
+
+    devices.push_back(HidBluetoothDevice{
+        .path = *address,
+        .address = *address,
+        .name = std::move(name),
+        .profile = profile,
+        .profile_valid = true,
+        .filter_backed = false,
+        .bluetooth_connected = info && info->fConnected != FALSE,
+        .report_target = true,
+        .access_restricted = false,
+    });
+  }
+
+  return devices;
+}
+
 std::unique_ptr<BluetoothTransport>
 make_filter_bluetooth_transport(const std::string &address) {
   auto device = find_filter_bluetooth_device(address);
-  if (!device) {
-    throw std::runtime_error("no matching Windows Bluetooth transport");
-  }
-  if (device->filter_backed && device->report_target &&
+  if (device && device->filter_backed && device->report_target &&
       device->access_restricted) {
     return std::make_unique<HidBluetoothTransport>(
         find_hid_bluetooth_device_path(device->address), device->address);
   }
-  throw std::runtime_error("Windows Bluetooth transport has no usable backend");
+
+  // Fall back to the plain-HID path (no vds_filter.sys dependency) whenever
+  // the filter driver isn't installed/loaded, or didn't report this
+  // specific address as filter-backed. This is what lets vDS run with zero
+  // custom kernel drivers: find_hid_bluetooth_device_path() only needs
+  // SetupAPI + hid.dll, which are already part of Windows.
+  //
+  // Known limitation vs. the filter-backed path: no exclusive-access
+  // enforcement (equivalent to vds_filter's access_restricted), so another
+  // application reading the same BT HID interface concurrently could
+  // interfere. A HidHide-based hiding layer is the planned fix; until then,
+  // this path is correct for single-consumer testing but not yet
+  // production-hardened.
+  try {
+    return std::make_unique<HidBluetoothTransport>(
+        find_hid_bluetooth_device_path(address), address);
+  } catch (const std::exception &error) {
+    throw std::runtime_error(
+        "no matching Windows Bluetooth transport (filter unavailable, "
+        "plain-HID fallback also failed: " +
+        std::string(error.what()) + ")");
+  }
 }
 
 bool filter_provider_available() {
