@@ -23,7 +23,8 @@ vds is a **wireless bridge**: it emulates a full **USB DualSense** device that g
 |---|---|---|
 | USB/IP handshake + control transfers + descriptors | 98 | Validated vs real usbip-win2 |
 | USB speed field | 100 | 2=FULL 3=HIGH; we send HIGH |
-| HID interrupt IN/OUT | 85 | Real BT input flows (~640Hz); interactive button test still pending |
+| HID interrupt IN/OUT | 90 | **Interactive input USER-VERIFIED (2026-07-15)** via joy.cpl Test panel — buttons + both sticks respond correctly through the full USB/IP path. |
+| Double-controller (HidHide gap) | confirmed | joy.cpl lists TWO "Wireless Controller" both Status OK (virtual USB + raw BT). Visual proof HidHide is needed. User: "hid hide is needed". Deferred, not a blocker. |
 | BT discovery (plain-HID, no driver) | 95 | SetupAPI+hid.dll+CM_Get_Parent devtree walk |
 | `online` status detection | FIXED | Was `filter_backed && ...` (always false on plain-HID path); now uses `bluetooth_connected`. Landed + built. |
 | Audio Control iface (MI_00) startup | FIXED | See bug log #11-12. Speaker endpoint enumerated Status:OK for the first time. |
