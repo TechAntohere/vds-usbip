@@ -51,6 +51,15 @@
 !/packaging/windows/wix/*.wxs
 !/packaging/windows/wix/*.xml
 
+!/ui/
+!/ui/VdsTray/
+!/ui/VdsTray/*.cs
+!/ui/VdsTray/*.csproj
+!/ui/VdsTray/*.xaml
+!/ui/VdsTray/assets/
+!/ui/VdsTray/assets/*.txt
+!/ui/VdsTray/assets/*.png
+
 !/src/
 !/src/**/
 !/src/**/*.c
