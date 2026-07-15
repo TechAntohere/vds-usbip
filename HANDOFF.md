@@ -86,6 +86,10 @@ vds is a **wireless bridge**: it emulates a full **USB DualSense** device that g
 7. Tail `C:\ProgramData\vDS\usbip_cmd_debug.log` for BREAK/send-fail signatures. Read it with .NET FileStream + FileShare::ReadWrite and byte-seek (Get-Content -Tail hangs on the live-locked file). Note: cmd entries are separated by LITERAL "\n" text, not newlines — split on that.
 8. Real audio test: `C:\Users\Antonio\Documents\vds\wasapi_test_tone.exe` (auto-targets the DualSense render endpoint, writes 440Hz to all 4 channels — so it exercises speaker ch0/1 AND haptics ch2/3 at once). Success = tool completes, zero new BREAKs, TCP 3240 still Established, audio OUT URB count in the hundreds+.
 
+## Known open bugs (as of 2026-07-15 EOD)
+- **Mic mute LED**: mute toggle works but the button LED doesn't light when muted. Fix in the BT mic/state output report (mute-LED bit) when state.mic_muted flips. Compare win32 DsOutputState mute-LED handling vs Linux.
+- **Intermittent system-wide 1fps video stutter on mic toggle**: toggling mic on/off occasionally drops ALL system playback (YouTube etc.) to ~1fps. vdsd steady ~7% CPU so it's transient, not steady saturation. Suspects: timer-resolution thrash (audio_flush_loop HighResolutionSleeper AND iso pacer both timeBeginPeriod(1) — check imbalance/repeat on interface toggles), audio-graph glitch on mic alt re-enumeration, or pacer OUT+IN head-of-line blocking. Diagnose with per-thread CPU + clockres while reproducing.
+
 ## Operational rules learned 2026-07-15
 - **NEVER start the daemon inside an MCP command that could time out** — a timed-out call kills its child process tree, silently taking vdsd with it (looked like a mystery crash; Windows Event Log had no fault = external kill). Start vdsd in its own short command, test in separate short commands.
 - Test tone tool now takes args: `wasapi_test_tone.exe <seconds> <amplitude>`. **Use amplitude 0.05 at night** — user request, controller speaker is loud.
