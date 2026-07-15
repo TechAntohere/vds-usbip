@@ -8,46 +8,75 @@
 
   <Grid>
     <!-- FULL connection card -->
-    <Border x:Name="ConnectionView" CornerRadius="18" Margin="12"
-            Width="430" Height="240" Background="#FF272727"
+    <Border x:Name="ConnectionView" CornerRadius="15" Margin="12"
+            Width="520" Height="390" Background="#FF272727"
             BorderBrush="#FF3C3C3C" BorderThickness="1">
         <Border.Effect>
-            <DropShadowEffect BlurRadius="24" ShadowDepth="0" Opacity="0.55" Color="#000000"/>
+            <DropShadowEffect BlurRadius="26" ShadowDepth="0" Opacity="0.55" Color="#000000"/>
         </Border.Effect>
-        <Grid Margin="26,22,26,18">
+        <Grid Margin="30,26,30,26">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
 
-            <!-- Left: title + status + controller image -->
-            <StackPanel Grid.Column="0">
-                <TextBlock x:Name="TitleText" Text="Dualsense" Foreground="#FFE8E8E8"
-                           FontSize="28" FontWeight="Bold"/>
-                <StackPanel Orientation="Horizontal" Margin="0,2,0,0">
-                    <TextBlock x:Name="StatusText" Text="Connected" Foreground="#FF2F6BFF"
-                               FontSize="22" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                    <Ellipse Width="7" Height="7" Fill="#FF7A7A7A" Margin="10,2,10,0"
-                             VerticalAlignment="Center"/>
-                    <Border x:Name="BatteryBox" CornerRadius="6" Padding="8,1"
-                            BorderBrush="#FF3FCF4A" BorderThickness="1.5" VerticalAlignment="Center">
-                        <TextBlock x:Name="BatteryText" Text="75" Foreground="#FF3FCF4A"
-                                   FontSize="16" FontWeight="SemiBold"/>
-                    </Border>
+            <!-- Left: title, status, controller -->
+            <Grid Grid.Column="0">
+                <StackPanel VerticalAlignment="Top">
+                    <TextBlock x:Name="TitleText" Text="Dualsense" Foreground="#FFE8E8E8"
+                               FontSize="44" FontWeight="Bold"/>
+                    <StackPanel Orientation="Horizontal" Margin="2,2,0,0">
+                        <TextBlock x:Name="StatusText" Text="Connected" Foreground="#FF2F6BFF"
+                                   FontSize="24" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                        <Ellipse Width="7" Height="7" Fill="#FF7A7A7A" Margin="12,3,12,0"
+                                 VerticalAlignment="Center"/>
+                        <Border x:Name="BatteryBox" CornerRadius="6" Padding="9,1"
+                                BorderBrush="#FF3FCF4A" BorderThickness="2" VerticalAlignment="Center">
+                            <TextBlock x:Name="BatteryText" Text="75" Foreground="#FF3FCF4A"
+                                       FontSize="17" FontWeight="SemiBold"/>
+                        </Border>
+                    </StackPanel>
                 </StackPanel>
-                <Image x:Name="ControllerImage" Height="120" Margin="0,14,0,0"
+                <Image x:Name="ControllerImage" Height="190" VerticalAlignment="Bottom"
                        HorizontalAlignment="Left" Stretch="Uniform"/>
-            </StackPanel>
+            </Grid>
 
-            <!-- Right: jack / mic / polling -->
-            <StackPanel Grid.Column="1" VerticalAlignment="Bottom" Margin="0,0,2,4">
-                <TextBlock Text="HEADPHONES" Foreground="#FF6E6E6E" FontSize="10" FontWeight="SemiBold"/>
-                <TextBlock x:Name="JackText" Text="—" Foreground="#FFCFCFCF" FontSize="15" Margin="0,0,0,10"/>
-                <TextBlock Text="MICROPHONE" Foreground="#FF6E6E6E" FontSize="10" FontWeight="SemiBold"/>
-                <TextBlock x:Name="MicText" Text="—" Foreground="#FFCFCFCF" FontSize="15" Margin="0,0,0,10"/>
-                <TextBlock Text="POLLING RATE" Foreground="#FF6E6E6E" FontSize="10" FontWeight="SemiBold"/>
-                <TextBlock x:Name="HzText" Text="— Hz" Foreground="#FFCFCFCF" FontSize="15"/>
-            </StackPanel>
+            <!-- Right: info box + status circles -->
+            <Grid Grid.Column="1" Width="230">
+                <!-- Info box -->
+                <Border VerticalAlignment="Top" CornerRadius="12" BorderBrush="#FF4A4A4A"
+                        BorderThickness="1" Padding="0">
+                    <StackPanel>
+                        <Border Padding="18,14" BorderBrush="#FF4A4A4A" BorderThickness="0,0,0,1">
+                            <Grid>
+                                <TextBlock Text="Polling Rate:" Foreground="#FFDADADA" FontSize="18"/>
+                                <TextBlock x:Name="PollingValue" Text="—" Foreground="#FF9AA0A6"
+                                           FontSize="18" HorizontalAlignment="Right"/>
+                            </Grid>
+                        </Border>
+                        <Border Padding="18,14">
+                            <Grid>
+                                <TextBlock Text="Color:" Foreground="#FFDADADA" FontSize="18"/>
+                                <TextBlock x:Name="ColorValue" Text="White" Foreground="#FF9AA0A6"
+                                           FontSize="18" HorizontalAlignment="Right"/>
+                            </Grid>
+                        </Border>
+                    </StackPanel>
+                </Border>
+
+                <!-- Status circles -->
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Bottom"
+                            HorizontalAlignment="Right">
+                    <Grid x:Name="HpBox" Width="78" Height="78" Margin="0,0,18,0">
+                        <Ellipse x:Name="HpCircle" Fill="#FFEDEDED"/>
+                        <Image x:Name="HpImage" Width="40" Height="40"/>
+                    </Grid>
+                    <Grid x:Name="MicBox" Width="78" Height="78">
+                        <Ellipse x:Name="MicCircle" Fill="#FFEDEDED"/>
+                        <Image x:Name="MicImage" Width="40" Height="40"/>
+                    </Grid>
+                </StackPanel>
+            </Grid>
         </Grid>
     </Border>
 

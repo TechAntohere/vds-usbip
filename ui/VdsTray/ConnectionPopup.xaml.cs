@@ -11,7 +11,12 @@ namespace VdsTray;
 public partial class ConnectionPopup : Window
 {
     private readonly DispatcherTimer _hide = new() { Interval = TimeSpan.FromSeconds(5) };
-    private static BitmapImage? _ds5Img;
+
+    // On/off brushes for the status circles (white bg = active).
+    private static readonly SolidColorBrush OnBrush =
+        new(Color.FromRgb(0xED, 0xED, 0xED));
+    private static readonly SolidColorBrush OffBrush =
+        new(Color.FromRgb(0x3A, 0x3A, 0x3A));
 
     public ConnectionPopup()
     {
@@ -23,18 +28,21 @@ public partial class ConnectionPopup : Window
         LoadArt();
     }
 
-    private void LoadArt()
+    private static BitmapImage? Load(string file)
     {
         try
         {
-            string path = Path.Combine(AppContext.BaseDirectory, "assets", "dualsense.png");
-            if (File.Exists(path))
-            {
-                _ds5Img ??= new BitmapImage(new Uri(path));
-                ControllerImage.Source = _ds5Img;
-            }
+            string path = Path.Combine(AppContext.BaseDirectory, "assets", file);
+            return File.Exists(path) ? new BitmapImage(new Uri(path)) : null;
         }
-        catch { /* no art -> popup shows without image */ }
+        catch { return null; }
+    }
+
+    private void LoadArt()
+    {
+        ControllerImage.Source = Load("dualsense.png");
+        HpImage.Source = Load("headphones.png");
+        MicImage.Source = Load("mic.png");
     }
 
     /// <summary>Refresh the card fields from live status (does not change visibility).</summary>
@@ -61,10 +69,17 @@ public partial class ConnectionPopup : Window
             BatteryBox.Visibility = Visibility.Collapsed;
         }
 
-        JackText.Text = s.HeadphoneJack ? "Connected" : "Not connected";
-        MicText.Text = !s.MicDetected ? "Built-in"
-                       : s.MicMuted ? "Muted" : "Active";
-        HzText.Text = s.PollingHz > 0 ? $"{s.PollingHz} Hz" : "— Hz";
+        PollingValue.Text = s.PollingHz > 0 ? $"{s.PollingHz} Hz" : "—";
+        ColorValue.Text = "White"; // TODO: real color once command-protocol bridges
+
+        // Status circles: white/bright when active, dimmed otherwise.
+        // Headphones "on" = 3.5mm jack present. Mic "on" = active and not muted.
+        bool hpOn = s.HeadphoneJack;
+        bool micOn = s.MicActive && !s.MicMuted;
+        HpCircle.Fill = hpOn ? OnBrush : OffBrush;
+        HpBox.Opacity = hpOn ? 1.0 : 0.45;
+        MicCircle.Fill = micOn ? OnBrush : OffBrush;
+        MicBox.Opacity = micOn ? 1.0 : 0.45;
     }
 
     /// <summary>Show the full connection card, then fade out after 5s.</summary>
