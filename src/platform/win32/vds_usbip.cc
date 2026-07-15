@@ -82,21 +82,34 @@ bool usbip_debug_logging() {
 }
 
 // Digital boost applied to mic capture. The DualSense mic is quiet at
-// distance; a modest linear boost makes normal speech usable. Tunable via
-// VDS_MIC_GAIN (linear multiplier, e.g. 4.0 ~= +12dB). Evaluated once.
-float mic_capture_gain() {
-  static const float gain = [] {
-    char buf[16]{};
-    const DWORD n = GetEnvironmentVariableA("VDS_MIC_GAIN", buf, sizeof(buf));
-    if (n > 0 && n < sizeof(buf)) {
-      const float v = static_cast<float>(std::atof(buf));
-      if (v > 0.0f && v <= 64.0f) return v;
-    }
-    return 50.0f; // DualSense mic is extremely quiet; heavy boost needed
-                  // (user-tuned on real hardware). Override with VDS_MIC_GAIN.
-  }();
-  return gain;
+// distance; a linear boost makes normal speech usable. Initial value from
+// VDS_MIC_GAIN (linear multiplier), then live-settable at runtime by the UI
+// via set_mic_capture_gain() (tray menu -> vdsctl set mic-gain -> here).
+std::atomic<float> g_mic_gain{[] {
+  char buf[16]{};
+  const DWORD n = GetEnvironmentVariableA("VDS_MIC_GAIN", buf, sizeof(buf));
+  if (n > 0 && n < sizeof(buf)) {
+    const float v = static_cast<float>(std::atof(buf));
+    if (v > 0.0f && v <= 64.0f) return v;
+  }
+  return 50.0f; // DualSense mic is extremely quiet; heavy boost needed.
+}()};
+
+float mic_capture_gain() { return g_mic_gain.load(); }
+
+} // close anonymous namespace
+
+// Public runtime mic-gain control for the UI (we are inside vds::win::usbip;
+// g_mic_gain from the anonymous namespace above is still visible here).
+// Clamped to the same 0<g<=64 range as the env; takes effect next mic frame.
+void set_mic_capture_gain(float gain) {
+  if (gain < 0.0f) gain = 0.0f;
+  if (gain > 64.0f) gain = 64.0f;
+  g_mic_gain.store(gain);
 }
+float current_mic_capture_gain() { return g_mic_gain.load(); }
+
+namespace { // reopen anonymous namespace for the remaining helpers
 
 // Apply a linear gain to interleaved 16-bit little-endian PCM in place,
 // clamping to int16 range.

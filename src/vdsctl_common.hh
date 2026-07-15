@@ -17,6 +17,7 @@ enum class VdsctlCommand {
   ListTargets,
   Trace,
   Status,
+  Set,
 };
 
 struct VdsctlTraceCommand {

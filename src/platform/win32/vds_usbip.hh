@@ -91,4 +91,9 @@ private:
 std::unique_ptr<VirtualPort> open_usbip_virtual_port(std::uint32_t profile,
                                                      unsigned port_index);
 
+// Runtime mic capture gain (linear, 0<g<=64). Set live from the UI; applied
+// on the next mic frame. Initial value comes from VDS_MIC_GAIN.
+void set_mic_capture_gain(float gain);
+float current_mic_capture_gain();
+
 } // namespace vds::win::usbip

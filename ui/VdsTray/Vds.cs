@@ -28,6 +28,7 @@ public sealed record ControllerStatus
     public bool MicActive { get; init; }
     public bool SpeakerActive { get; init; }
     public int PollingHz { get; init; }
+    public int MicGain { get; init; } = -1;
     public bool HasInput { get; init; }
 
     public bool Charging => ChargeStatus == 1;
@@ -104,6 +105,7 @@ internal static class Vds
                 MicActive = GetBool("mic_active"),
                 SpeakerActive = GetBool("speaker_active"),
                 PollingHz = GetInt("polling_hz"),
+                MicGain = GetInt("mic_gain", -1),
                 HasInput = GetBool("has_input"),
             };
         }
@@ -141,4 +143,7 @@ internal static class Vds
         if (port.Contains("127.0.0.1:3240")) return;
         Run(Paths.Usbip, $"attach -r 127.0.0.1 -b {Paths.BusId}", timeoutMs: 8000);
     }
+
+    /// <summary>Set the runtime mic gain (linear multiplier) via vdsctl.</summary>
+    public static void SetMicGain(int gain) => Run(Paths.Vdsctl, $"set mic-gain {gain}");
 }

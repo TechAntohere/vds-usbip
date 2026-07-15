@@ -2824,6 +2824,9 @@ std::string build_status_json(
     line += ",";
     line += vds::jsonl_bool_field("speaker_active", s.speaker_active.load());
     line += ",\"polling_hz\":" + std::to_string(s.polling_hz.load());
+    line += ",\"mic_gain\":" +
+            std::to_string(
+                static_cast<int>(vds::win::usbip::current_mic_capture_gain() + 0.5f));
     line += ",";
     line += vds::jsonl_bool_field("has_input", s.has_input.load());
     line += "}\n";
@@ -2840,16 +2843,27 @@ std::string handle_supervisor_control_command(
     const std::vector<std::unique_ptr<BridgeWorker>> &workers,
     const std::string &db_path, std::uint32_t &trace_flags,
     bool &reload_requested, vds::Logger &logger) {
-  // Intercept the Windows-only "status" command before the shared handler
-  // (which has no WorkerStatus). Best-effort parse; fall through on error.
+  // Intercept the Windows-only "status" / "set" commands before the shared
+  // handler (which has no WorkerStatus / setters). Best-effort parse.
   try {
-    const auto fields = vds::parse_jsonl_object(command, "control status");
-    if (vds::require_jsonl_string(fields, "command", "control status") ==
-        "status") {
+    const auto fields = vds::parse_jsonl_object(command, "control");
+    const std::string cmd = vds::require_jsonl_string(fields, "command", "control");
+    if (cmd == "status") {
       return build_status_json(workers);
     }
+    if (cmd == "set") {
+      const std::string param = vds::require_jsonl_string(fields, "param", "control set");
+      const std::string value = vds::require_jsonl_string(fields, "value", "control set");
+      if (param == "mic-gain") {
+        vds::win::usbip::set_mic_capture_gain(
+            static_cast<float>(std::atof(value.c_str())));
+        return "{\"OK\":true,\"param\":\"mic-gain\",\"value\":" +
+               std::to_string(vds::win::usbip::current_mic_capture_gain()) + "}\n";
+      }
+      return "{\"OK\":false,\"error\":\"unknown param\"}\n";
+    }
   } catch (...) {
-    // not a status command (or malformed) -> shared handler below
+    // not one of ours (or malformed) -> shared handler below
   }
 
   std::vector<vds::VdsdControlControllerStatus> controller_statuses;

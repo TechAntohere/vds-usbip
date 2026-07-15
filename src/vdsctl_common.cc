@@ -40,6 +40,17 @@ std::string list_request() { return "{\"command\":\"list\"}\n"; }
 
 std::string status_request() { return "{\"command\":\"status\"}\n"; }
 
+std::string set_request(std::string_view param, std::string_view value) {
+  std::string request = "{";
+  request += jsonl_string_field("command", "set");
+  request += ',';
+  request += jsonl_string_field("param", param);
+  request += ',';
+  request += jsonl_string_field("value", value);
+  request += "}\n";
+  return request;
+}
+
 std::string list_targets_request() {
   return "{\"command\":\"list-targets\"}\n";
 }
@@ -71,6 +82,7 @@ std::string vdsctl_usage(std::string_view version,
           "  vdsctl list\n"
           "  vdsctl list-targets\n"
           "  vdsctl status\n"
+          "  vdsctl set <param> <value>   (param: mic-gain)\n"
           "  vdsctl trace on|off [--scope <scope>[,<scope>...]]\n"
           "\n"
           "trace scopes:\n"
@@ -96,6 +108,9 @@ VdsctlCommand parse_vdsctl_command(std::string_view command) {
   }
   if (command == "status") {
     return VdsctlCommand::Status;
+  }
+  if (command == "set") {
+    return VdsctlCommand::Set;
   }
   throw std::runtime_error("unknown command: " + std::string(command));
 }
@@ -133,6 +148,12 @@ int run_vdsctl_app(int argc, char **argv, std::string_view version,
     case VdsctlCommand::Status:
       require_vdsctl_arg_count(argc, 2);
       std::cout << platform.request_control(status_request());
+      break;
+    case VdsctlCommand::Set:
+      if (argc != 4) {
+        throw std::runtime_error("usage: vdsctl set <param> <value>");
+      }
+      std::cout << platform.request_control(set_request(argv[2], argv[3]));
       break;
     }
     return 0;

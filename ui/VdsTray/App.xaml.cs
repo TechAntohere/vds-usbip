@@ -19,6 +19,7 @@ internal static class Log
 public partial class App : System.Windows.Application
 {
     private WinForms.NotifyIcon _tray = null!;
+    private WinForms.ToolStripMenuItem _micGainMenu = null!;
     private DispatcherTimer _poll = null!;
     private ConnectionPopup? _popup;
     private ControllerStatus? _prev;
@@ -62,6 +63,18 @@ public partial class App : System.Windows.Application
         var showItem = new WinForms.ToolStripMenuItem("Show status", null, (_, _) => ShowPopup(force: true));
         menu.Items.Add(showItem);
 
+        // Mic gain submenu (the DualSense mic is quiet; Windows can't boost it).
+        _micGainMenu = new WinForms.ToolStripMenuItem("Mic gain");
+        foreach (int g in new[] { 10, 20, 30, 40, 50, 60 })
+        {
+            var item = new WinForms.ToolStripMenuItem($"{g}×") { Tag = g };
+            item.Click += (_, _) => Task.Run(() => Vds.SetMicGain(g));
+            _micGainMenu.DropDownItems.Add(item);
+        }
+        menu.Items.Add(_micGainMenu);
+
+        menu.Items.Add(new WinForms.ToolStripSeparator());
+
         var bootItem = new WinForms.ToolStripMenuItem("Start on boot") { Checked = Autostart.IsEnabled() };
         bootItem.Click += (_, _) =>
         {
@@ -95,6 +108,13 @@ public partial class App : System.Windows.Application
         _tray.Text = cur is { Connected: true }
             ? $"DualSense — {cur.Battery}% · {cur.PollingHz} Hz"
             : "vDS — no controller";
+
+        // Reflect the active mic gain with a checkmark in the submenu.
+        if (cur is not null && cur.MicGain >= 0)
+        {
+            foreach (WinForms.ToolStripMenuItem item in _micGainMenu.DropDownItems)
+                item.Checked = item.Tag is int g && g == cur.MicGain;
+        }
 
         bool wasConnected = _prev is { Connected: true };
         bool nowConnected = cur is { Connected: true };
