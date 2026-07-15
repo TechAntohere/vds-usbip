@@ -37,8 +37,8 @@
                         </Border>
                     </StackPanel>
                 </StackPanel>
-                <Image x:Name="ControllerImage" Height="190" VerticalAlignment="Bottom"
-                       HorizontalAlignment="Left" Stretch="Uniform"/>
+                <Image x:Name="ControllerImage" Height="250" VerticalAlignment="Bottom"
+                       HorizontalAlignment="Center" Margin="0,0,0,4" Stretch="Uniform"/>
             </Grid>
 
             <!-- Right: info box + status circles -->
@@ -64,34 +64,46 @@
                     </StackPanel>
                 </Border>
 
-                <!-- Status circles -->
+                <!-- Status circles. Icon is a tintable Rectangle masked by the
+                     PNG glyph so we can recolor it for on/off states. -->
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Bottom"
                             HorizontalAlignment="Right">
-                    <Grid x:Name="HpBox" Width="78" Height="78" Margin="0,0,18,0">
+                    <Grid Width="78" Height="78" Margin="0,0,18,0">
                         <Ellipse x:Name="HpCircle" Fill="#FFEDEDED"/>
-                        <Image x:Name="HpImage" Width="40" Height="40"/>
+                        <Rectangle x:Name="HpIcon" Width="40" Height="40" Fill="#FF1A1A1A">
+                            <Rectangle.OpacityMask>
+                                <ImageBrush x:Name="HpMask"/>
+                            </Rectangle.OpacityMask>
+                        </Rectangle>
                     </Grid>
-                    <Grid x:Name="MicBox" Width="78" Height="78">
+                    <Grid Width="78" Height="78">
                         <Ellipse x:Name="MicCircle" Fill="#FFEDEDED"/>
-                        <Image x:Name="MicImage" Width="40" Height="40"/>
+                        <Rectangle x:Name="MicIcon" Width="40" Height="40" Fill="#FF1A1A1A">
+                            <Rectangle.OpacityMask>
+                                <ImageBrush x:Name="MicMask"/>
+                            </Rectangle.OpacityMask>
+                        </Rectangle>
                     </Grid>
                 </StackPanel>
             </Grid>
         </Grid>
     </Border>
 
-    <!-- MINI toast (jack/mic change) -->
-    <Border x:Name="MiniView" CornerRadius="14" Margin="12" Visibility="Collapsed"
+    <!-- MINI toast (jack/mic change): a square with just the icon. -->
+    <Border x:Name="MiniView" CornerRadius="15" Margin="12" Visibility="Collapsed"
             Background="#FF272727" BorderBrush="#FF3C3C3C" BorderThickness="1"
-            Padding="22,14" HorizontalAlignment="Right" VerticalAlignment="Bottom">
+            Width="96" Height="96" HorizontalAlignment="Right" VerticalAlignment="Bottom">
         <Border.Effect>
             <DropShadowEffect BlurRadius="20" ShadowDepth="0" Opacity="0.5" Color="#000000"/>
         </Border.Effect>
-        <StackPanel Orientation="Horizontal">
-            <Ellipse Width="9" Height="9" Fill="#FF2F6BFF" VerticalAlignment="Center" Margin="0,0,12,0"/>
-            <TextBlock x:Name="MiniText" Text="" Foreground="#FFE8E8E8" FontSize="17"
-                       FontWeight="SemiBold" VerticalAlignment="Center"/>
-        </StackPanel>
+        <Grid>
+            <Ellipse x:Name="MiniCircle" Width="66" Height="66" Fill="#FFEDEDED"/>
+            <Rectangle x:Name="MiniIcon" Width="34" Height="34" Fill="#FF1A1A1A">
+                <Rectangle.OpacityMask>
+                    <ImageBrush x:Name="MiniMask"/>
+                </Rectangle.OpacityMask>
+            </Rectangle>
+        </Grid>
     </Border>
   </Grid>
 </Window>

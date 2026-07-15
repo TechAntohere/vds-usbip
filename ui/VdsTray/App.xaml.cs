@@ -113,9 +113,9 @@ public partial class App : System.Windows.Application
         if (wasConnected && nowConnected && _prev is not null && cur is not null)
         {
             if (_prev.HeadphoneJack != cur.HeadphoneJack)
-                ShowMini(cur.HeadphoneJack ? "Headphones connected" : "Headphones disconnected");
+                ShowMini("headphones", cur.HeadphoneJack);
             if (_prev.MicMuted != cur.MicMuted)
-                ShowMini(cur.MicMuted ? "Mic muted" : "Mic unmuted");
+                ShowMini("mic", !cur.MicMuted);
         }
 
         _prev = cur;
@@ -135,10 +135,9 @@ public partial class App : System.Windows.Application
         catch (Exception ex) { Log.Write("ShowPopup EX: " + ex); }
     }
 
-    private void ShowMini(string text)
+    private void ShowMini(string kind, bool on)
     {
-        // Reuse the popup's mini-toast for jack/mic changes.
-        (_popup ??= new ConnectionPopup()).ShowMini(text);
+        (_popup ??= new ConnectionPopup()).ShowMini(kind, on);
     }
 
     private void ExitApp()
