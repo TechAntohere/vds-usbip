@@ -86,9 +86,14 @@ vds is a **wireless bridge**: it emulates a full **USB DualSense** device that g
 7. Tail `C:\ProgramData\vDS\usbip_cmd_debug.log` for BREAK/send-fail signatures. Read it with .NET FileStream + FileShare::ReadWrite and byte-seek (Get-Content -Tail hangs on the live-locked file). Note: cmd entries are separated by LITERAL "\n" text, not newlines — split on that.
 8. Real audio test: `C:\Users\Antonio\Documents\vds\wasapi_test_tone.exe` (auto-targets the DualSense render endpoint, writes 440Hz to all 4 channels — so it exercises speaker ch0/1 AND haptics ch2/3 at once). Success = tool completes, zero new BREAKs, TCP 3240 still Established, audio OUT URB count in the hundreds+.
 
-## Known open bugs (as of 2026-07-15 EOD)
-- **Mic mute LED**: mute toggle works but the button LED doesn't light when muted. Fix in the BT mic/state output report (mute-LED bit) when state.mic_muted flips. Compare win32 DsOutputState mute-LED handling vs Linux.
-- **Intermittent system-wide 1fps video stutter on mic toggle**: toggling mic on/off occasionally drops ALL system playback (YouTube etc.) to ~1fps. vdsd steady ~7% CPU so it's transient, not steady saturation. Suspects: timer-resolution thrash (audio_flush_loop HighResolutionSleeper AND iso pacer both timeBeginPeriod(1) — check imbalance/repeat on interface toggles), audio-graph glitch on mic alt re-enumeration, or pacer OUT+IN head-of-line blocking. Diagnose with per-thread CPU + clockres while reproducing.
+## Recently fixed (2026-07-15 EOD)
+- **Mic mute LED** ✅ (commit 2308b58): build_bt_mic_state_report hard-coded the mute-LED byte (offset 8) to 0; now `muted ? kMuteLedOn(1) : 0`. Shared vds_protocol.cc so fixes Linux too. User-verified.
+- **System-wide 1fps video stutter on mic toggle** ✅ (commit 2916d37): speaker OUT + mic IN shared one FIFO pacer queue; mic-start burst of IN URBs (dues up to ~1s ahead) head-of-line-blocked speaker replies → speaker audio clock stalled → browser video slaved to that endpoint dropped to ~1fps. Fixed by ordering the pacer queue by due time (std::multimap) so speaker-due-now always precedes mic-due-later. User-verified smooth.
+
+## Still-open / deferred
+- **Global timer usage in pacer**: iso_pacer_loop still calls timeBeginPeriod(1) (global) for cv.wait_until precision, unlike the rest of the codebase which uses per-object CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (HighResolutionSleeper). Not observed to cause problems after the due-order fix, but it's an architectural outlier; consider switching to a waitable-timer wait to drop the global change. Low priority.
+- **DualSense Edge (DSE)**: user does NOT own one — DSE descriptors updated in parallel but will not be tested. Deprioritized permanently.
+- **Mic gain**: 50x default is pure linear (hard-clips loud sounds). VDS_MIC_GAIN env overrides. User is building a tray/connection widget to expose mic + other settings, so gain will be driven from there (may later want a runtime/IPC way to change gain without restart — currently read once at launch).
 
 ## Operational rules learned 2026-07-15
 - **NEVER start the daemon inside an MCP command that could time out** — a timed-out call kills its child process tree, silently taking vdsd with it (looked like a mystery crash; Windows Event Log had no fault = external kill). Start vdsd in its own short command, test in separate short commands.
