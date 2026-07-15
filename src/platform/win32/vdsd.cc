@@ -835,9 +835,21 @@ std::string input_report_summary(const vds::UsbInputReport &report) {
          " b1=" + hex_u8(report[9]) + " b2=" + hex_u8(report[10]);
 }
 
+// Feature reports at 0x80 and above are the DualSense command channel:
+// 0x80/0x84 carry a request, 0x81/0x85 carry the *response* to whatever
+// command was last written. Their contents change per command, so they must
+// never be cached -- caching 0x81 once made every later factory/diagnostic
+// query (PCBA id, serial, barcodes, usage counters -- each a distinct 0x80
+// command) read back the same stale response, so tools like the daidr
+// DualSense tester showed those fields blank. Static reports (calibration
+// 0x05, firmware 0x20, etc.) stay cacheable to save Bluetooth round-trips.
+constexpr bool is_cacheable_feature(std::uint8_t report_id) {
+  return report_id < 0x80;
+}
+
 void cache_feature_report(BridgeState &state,
                           std::span<const std::uint8_t> report) {
-  if (report.empty()) {
+  if (report.empty() || !is_cacheable_feature(report[0])) {
     return;
   }
 
@@ -848,6 +860,9 @@ void cache_feature_report(BridgeState &state,
 
 std::optional<std::vector<std::uint8_t>>
 cached_feature_report(BridgeState &state, std::uint8_t report_id) {
+  if (!is_cacheable_feature(report_id)) {
+    return std::nullopt; // always read command-channel reports fresh from BT
+  }
   std::lock_guard guard(state.mutex);
   if (!state.feature_cached[report_id]) {
     return std::nullopt;
