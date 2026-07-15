@@ -9,7 +9,7 @@
   <Grid>
     <!-- FULL connection card -->
     <Border x:Name="ConnectionView" CornerRadius="15" Margin="12"
-            Width="520" Height="390" Background="#FF272727"
+            Width="600" Height="420" Background="#FF272727"
             BorderBrush="#FF3C3C3C" BorderThickness="1">
         <Border.Effect>
             <DropShadowEffect BlurRadius="26" ShadowDepth="0" Opacity="0.55" Color="#000000"/>
@@ -37,12 +37,12 @@
                         </Border>
                     </StackPanel>
                 </StackPanel>
-                <Image x:Name="ControllerImage" Height="250" VerticalAlignment="Bottom"
-                       HorizontalAlignment="Center" Margin="0,0,0,4" Stretch="Uniform"/>
+                <Image x:Name="ControllerImage" Height="340" VerticalAlignment="Bottom"
+                       HorizontalAlignment="Center" Margin="0,0,0,-46" Stretch="Uniform"/>
             </Grid>
 
             <!-- Right: info box + status circles -->
-            <Grid Grid.Column="1" Width="230">
+            <Grid Grid.Column="1" Width="215">
                 <!-- Info box -->
                 <Border VerticalAlignment="Top" CornerRadius="12" BorderBrush="#FF4A4A4A"
                         BorderThickness="1" Padding="0">

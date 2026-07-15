@@ -79,9 +79,10 @@ public partial class ConnectionPopup : Window
         PollingValue.Text = s.PollingHz > 0 ? $"{s.PollingHz} Hz" : "—";
         ColorValue.Text = "White"; // TODO: real color via command-protocol
 
-        // Headphones "on" = 3.5mm jack present. Mic "on" = active and not muted.
+        // Headphones "on" = 3.5mm jack present. Mic "on" = not muted (the
+        // mute button toggles this; "recording active" almost never fires).
         SetIndicator(HpCircle, HpIcon, s.HeadphoneJack);
-        SetIndicator(MicCircle, MicIcon, s.MicActive && !s.MicMuted);
+        SetIndicator(MicCircle, MicIcon, !s.MicMuted);
     }
 
     /// <summary>Show the full connection card, then fade out after 5s.</summary>
