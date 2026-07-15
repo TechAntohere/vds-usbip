@@ -73,11 +73,38 @@ constexpr const char *kWindowsFilterProviderUnavailable =
     R"(vds_filter driver is not loaded or \\.\vds_filter is unavailable)";
 constexpr DWORD kDeviceShareMode =
     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-constexpr std::size_t kMaxPendingAudioChunks = 64;
-constexpr std::size_t kAudioPrimeChunks = 24;
-constexpr std::size_t kAudioFreshQueueChunks = 48;
+// Audio latency buffers. Each chunk is one 10ms Opus block, so N chunks ≈
+// N*10ms of speaker/haptic latency. These were tuned large back when Windows
+// over-delivered audio ~5x real time (pre-pacing) and needed a deep cushion.
+// Now that ISO OUT is paced to real time (vds_usbip pacer), production ≈
+// consumption and the buffer only needs to absorb Bluetooth write jitter, so
+// they can be far smaller. Env-tunable to dial the latency-vs-crackle
+// tradeoff by ear without rebuilding:
+//   VDS_AUDIO_PRIME_CHUNKS  - cushion built before playback starts / held in
+//                             steady state (dominant latency term)
+//   VDS_AUDIO_QUEUE_CHUNKS  - max queue depth before dropping stale chunks
+std::size_t env_chunks(const char *name, std::size_t def, std::size_t lo,
+                       std::size_t hi) {
+  char buf[16]{};
+  const DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
+  if (n > 0 && n < sizeof(buf)) {
+    char *end = nullptr;
+    const unsigned long v = std::strtoul(buf, &end, 10);
+    if (end != buf && v >= lo && v <= hi) {
+      return static_cast<std::size_t>(v);
+    }
+  }
+  return def;
+}
+const std::size_t kAudioPrimeChunks =
+    env_chunks("VDS_AUDIO_PRIME_CHUNKS", 6, 1, 64);   // ~60ms default
+const std::size_t kAudioFreshQueueChunks =
+    env_chunks("VDS_AUDIO_QUEUE_CHUNKS", 12, 2, 128); // ~120ms cap default
+const std::size_t kMaxPendingAudioChunks =
+    std::max<std::size_t>(kAudioFreshQueueChunks * 2, 24);
 constexpr std::size_t kAudioLowWatermarkChunks = 0;
-constexpr std::size_t kAudioHighWatermarkChunks = 44;
+const std::size_t kAudioHighWatermarkChunks =
+    std::max<std::size_t>(kAudioFreshQueueChunks - 2, 1);
 constexpr std::size_t kWindowsPcmWindowFrames = vds::kPcmWindowFrames;
 constexpr int kWindowsHapticsSampleMin = -128;
 constexpr int kWindowsHapticsSampleMax = 127;
@@ -85,7 +112,7 @@ constexpr auto kAudioOutputBaseInterval = std::chrono::microseconds(
     (static_cast<std::int64_t>(kWindowsPcmWindowFrames) * 1000000 +
      VDS_AUDIO_SAMPLE_RATE / 2) /
     VDS_AUDIO_SAMPLE_RATE);
-constexpr auto kAudioJitterBufferMaxDelay = std::chrono::milliseconds(300);
+constexpr auto kAudioJitterBufferMaxDelay = std::chrono::milliseconds(120);
 constexpr auto kAudioUnderflowKeepaliveDelay = std::chrono::milliseconds(25);
 constexpr auto kAudioLowWatermarkPaceDelay = std::chrono::microseconds(0);
 constexpr auto kAudioHighWatermarkCatchupDelay = std::chrono::microseconds(0);
@@ -398,6 +425,51 @@ struct BridgeState {
   bool audio_queue_empty_reported = false;
   bool audio_underflow_reported = false;
 };
+
+// Live per-connection state published by the worker thread for the UI
+// (tray app / connection widget) to read via `vdsctl status`. All atomics so
+// the supervisor's control-pipe thread can read it without locking the
+// session. A pointer to the owning worker's instance is threaded down into
+// the bridge handlers; nullptr when running outside a supervised worker.
+struct WorkerStatus {
+  std::atomic<int> battery_percent{-1};   // 0..100, -1 = unknown
+  std::atomic<int> charge_status{-1};     // 0 discharging,1 charging,2 full,-1 unknown
+  std::atomic_bool headphone_jack{false}; // 3.5mm jack present
+  std::atomic_bool mic_detected{false};   // physical mic present (headset)
+  std::atomic_bool mic_muted{false};
+  std::atomic_bool mic_active{false};     // Windows opened the mic (recording)
+  std::atomic_bool speaker_active{false}; // Windows opened the speaker
+  std::atomic<int> polling_hz{0};         // measured live input rate
+  std::atomic_bool has_input{false};      // at least one input report seen
+  // Rolling-window rate measurement (touched only by the input thread).
+  std::uint64_t rate_window_count = 0;
+  Clock::time_point rate_window_start{};
+};
+
+// Parse battery %, charge status, headphone-jack and mic-detect from a
+// DualSense USB input report (report id + 63-byte payload). Offsets are the
+// real-hardware layout: payload byte 52 = status0 (battery/charge nibbles),
+// payload byte 53 = status1 (bit0 jack, bit1 mic). report[0] is the id, so
+// the payload starts at report[1].
+void publish_input_status(WorkerStatus &status,
+                          const vds::UsbInputReport &report) {
+  const std::uint8_t status0 = report[1 + 52];
+  const std::uint8_t status1 = report[1 + 53];
+  const int level = status0 & 0x0F;              // 0..10 (or 0..0x0A)
+  const int charge = (status0 & 0xF0) >> 4;      // 0 discharging,1 charging,2 full
+  int percent = level * 10;
+  if (charge == 2) {
+    percent = 100; // charge complete
+  }
+  if (percent > 100) {
+    percent = 100;
+  }
+  status.battery_percent.store(percent);
+  status.charge_status.store(charge);
+  status.headphone_jack.store((status1 & 0x01) != 0);
+  status.mic_detected.store((status1 & 0x02) != 0);
+  status.has_input.store(true);
+}
 
 std::array<int, VDS_AUDIO_CHANNELS>
 pcm_channel_peaks(std::span<const std::uint8_t> payload) {
@@ -2392,6 +2464,7 @@ struct BridgeWorker {
   std::thread thread;
   std::atomic_bool stop_requested = false;
   std::atomic_bool done = false;
+  WorkerStatus status;
 };
 
 class ControlPipeServer {
