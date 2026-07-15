@@ -47,6 +47,9 @@ constexpr std::size_t kOutputSpeakerVolumeOffset = 5;
 constexpr std::size_t kOutputMicVolumeOffset = 6;
 constexpr std::size_t kOutputAudioControlOffset = 7;
 constexpr std::size_t kOutputMuteLedOffset = 8;
+// Mic mute LED (button ring) values: 0=off, 1=solid on, 2=pulsing.
+constexpr std::uint8_t kMuteLedOff = 0x00;
+constexpr std::uint8_t kMuteLedOn = 0x01;
 constexpr std::size_t kOutputPowerSaveControlOffset = 9;
 constexpr std::size_t kOutputAudioControl2Offset = 37;
 constexpr std::size_t kOutputLightBrightnessOffset =
@@ -766,7 +769,11 @@ BtStateReport DsOutputState::build_bt_mic_state_report(bool active,
   state_[kOutputMicVolumeOffset] = active && !muted ? mic_volume_ : 0;
   state_[kOutputAudioControlOffset] = audio_control;
   state_[kOutputAudioControl2Offset] = audio_control2_;
-  state_[kOutputMuteLedOffset] = 0;
+  // Light the mute-button ring LED (solid) whenever the mic is muted. The
+  // mute-LED-control-enable flag above hands LED control to us, so this
+  // byte must reflect mute state -- previously it was hard-coded to 0, so
+  // the LED never lit even though muting worked.
+  state_[kOutputMuteLedOffset] = muted ? kMuteLedOn : kMuteLedOff;
   state_[kOutputPowerSaveControlOffset] = power_save_control;
 
   BtStateReport report{};
@@ -782,7 +789,7 @@ BtStateReport DsOutputState::build_bt_mic_state_report(bool active,
   report[kBtStateOffset + kOutputMicVolumeOffset] =
       active && !muted ? mic_volume_ : 0;
   report[kBtStateOffset + kOutputAudioControlOffset] = audio_control;
-  report[kBtStateOffset + kOutputMuteLedOffset] = 0;
+  report[kBtStateOffset + kOutputMuteLedOffset] = muted ? kMuteLedOn : kMuteLedOff;
   report[kBtStateOffset + kOutputPowerSaveControlOffset] = power_save_control;
   report[kBtStateOffset + kOutputAudioControl2Offset] = audio_control2_;
   fill_output_report_checksum(report);
