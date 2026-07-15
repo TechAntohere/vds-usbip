@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -55,6 +56,63 @@ constexpr std::uint32_t kDirIn = 1;
 
 constexpr char kBusId[32] = "1-1";
 constexpr char kPath[256] = "/vds/virtual/dualsense";
+
+// Mic jitter buffer sizing. Mic endpoint is 48kHz / 2ch / 16-bit =
+// 192 bytes per millisecond of audio.
+constexpr std::size_t kMicBytesPerMs = 192;
+// Cushion accumulated before delivering real audio. Bluetooth mic delivery
+// jitters by roughly a report interval; ~40ms comfortably absorbs the
+// 10ms burst granularity plus radio jitter without adding much latency.
+constexpr std::size_t kMicPrimeBytes = 40 * kMicBytesPerMs;
+// Hard cap on buffered mic audio, to bound added latency if production
+// ever briefly outpaces consumption (oldest bytes dropped past this).
+constexpr std::size_t kMicMaxBufferBytes = 120 * kMicBytesPerMs;
+
+// Per-URB debug logging opens/writes/closes a file on the hot session
+// thread for every URB (~hundreds/sec). That synchronous disk I/O competes
+// with the very audio/mic timing we care about, so it is off unless
+// VDS_USBIP_DEBUG is set in the environment. Evaluated once.
+bool usbip_debug_logging() {
+  static const bool enabled = [] {
+    char buf[8]{};
+    return GetEnvironmentVariableA("VDS_USBIP_DEBUG", buf, sizeof(buf)) > 0;
+  }();
+  return enabled;
+}
+
+// Digital boost applied to mic capture. The DualSense mic is quiet at
+// distance; a modest linear boost makes normal speech usable. Tunable via
+// VDS_MIC_GAIN (linear multiplier, e.g. 4.0 ~= +12dB). Evaluated once.
+float mic_capture_gain() {
+  static const float gain = [] {
+    char buf[16]{};
+    const DWORD n = GetEnvironmentVariableA("VDS_MIC_GAIN", buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf)) {
+      const float v = static_cast<float>(std::atof(buf));
+      if (v > 0.0f && v <= 64.0f) return v;
+    }
+    return 50.0f; // DualSense mic is extremely quiet; heavy boost needed
+                  // (user-tuned on real hardware). Override with VDS_MIC_GAIN.
+  }();
+  return gain;
+}
+
+// Apply a linear gain to interleaved 16-bit little-endian PCM in place,
+// clamping to int16 range.
+void apply_pcm_gain_i16(std::vector<std::uint8_t> &pcm, float gain) {
+  if (gain == 1.0f) return;
+  for (std::size_t i = 0; i + 1 < pcm.size(); i += 2) {
+    const auto s = static_cast<std::int16_t>(
+        static_cast<std::uint16_t>(pcm[i]) |
+        (static_cast<std::uint16_t>(pcm[i + 1]) << 8));
+    float v = static_cast<float>(s) * gain;
+    if (v > 32767.0f) v = 32767.0f;
+    if (v < -32768.0f) v = -32768.0f;
+    const auto o = static_cast<std::int16_t>(v);
+    pcm[i] = static_cast<std::uint8_t>(o & 0xff);
+    pcm[i + 1] = static_cast<std::uint8_t>((o >> 8) & 0xff);
+  }
+}
 
 std::uint16_t hton16(std::uint16_t v) { return htons(v); }
 std::uint32_t hton32(std::uint32_t v) { return htonl(v); }
@@ -360,6 +418,21 @@ struct VirtualPort::Impl {
   // can exceed the URB's declared transfer_buffer_length, which is a wire
   // protocol violation that makes usbip-win2 abort the TCP connection.
   std::vector<std::uint8_t> mic_ring_buffer;
+  // Mic jitter-buffer state (guarded by demux_mutex, like mic_ring_buffer).
+  // vdsd forwards mic PCM in 10ms (1920-byte) bursts tied to the Bluetooth
+  // input-report cadence, but Windows pulls the isoc IN endpoint every 1ms
+  // at a fixed packet size. Returning whatever happens to be buffered on
+  // each pull (the old behavior) means most pulls hit an empty buffer and
+  // get zero-padded -> the audible crackle. We instead accumulate a small
+  // cushion before delivering, then stream continuously; on underrun we
+  // re-prime rather than glitch on every subsequent pull. Rates match on
+  // average (192 bytes/ms both sides) so the cushion only absorbs burst.
+  bool mic_primed_ = false;
+  std::uint64_t mic_pull_count_ = 0;
+  std::uint64_t mic_underrun_count_ = 0;
+  std::uint64_t mic_zero_pad_bytes_ = 0;
+  std::uint64_t mic_received_bytes_ = 0; // total PCM bytes vdsd forwarded
+  std::uint64_t mic_requested_bytes_ = 0; // total bytes Windows pulled
 
   void pipe_reader_loop();
   bool wait_for_hid_in_frame(Frame &out, DWORD timeout_ms);
@@ -389,6 +462,7 @@ struct VirtualPort::Impl {
   std::condition_variable pacer_cv;
   std::deque<PacedReply> paced_replies;
   std::chrono::steady_clock::time_point iso_out_next_due{};
+  std::chrono::steady_clock::time_point iso_in_next_due{}; // mic (audio IN)
   // Both the session thread and the pacer thread write complete wire
   // messages to the same socket; this keeps them from interleaving
   // mid-message.
@@ -682,14 +756,16 @@ void VirtualPort::Impl::handle_import_session(SOCKET client) {
     cmd.number_of_packets = static_cast<std::int32_t>(
         ntoh32(static_cast<std::uint32_t>(cmd.number_of_packets)));
 
-    if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_cmd_debug.log", "a")) {
-      std::fprintf(dbg,
-                    "cmd command=%u seqnum=%u ep=%u dir=%u xfer_len=%d "
-                    "npackets=%d\\n",
-                    cmd.base.command, cmd.base.seqnum, cmd.base.ep,
-                    cmd.base.direction, cmd.transfer_buffer_length,
-                    cmd.number_of_packets);
-      std::fclose(dbg);
+    if (usbip_debug_logging()) {
+      if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_cmd_debug.log", "a")) {
+        std::fprintf(dbg,
+                      "cmd command=%u seqnum=%u ep=%u dir=%u xfer_len=%d "
+                      "npackets=%d\\n",
+                      cmd.base.command, cmd.base.seqnum, cmd.base.ep,
+                      cmd.base.direction, cmd.transfer_buffer_length,
+                      cmd.number_of_packets);
+        std::fclose(dbg);
+      }
     }
 
     if (cmd.base.command == kCmdUnlink) {
@@ -778,6 +854,7 @@ void VirtualPort::Impl::handle_import_session(SOCKET client) {
     std::lock_guard<std::mutex> guard(pacer_mutex);
     paced_replies.clear();
     iso_out_next_due = {};
+    iso_in_next_due = {};
   }
   DisconnectNamedPipe(pipe_server.get());
 }
@@ -821,17 +898,20 @@ void VirtualPort::Impl::pipe_reader_loop() {
         feature_reply_queue.push_back(std::move(frame));
         break;
       case VDS_FRAME_USB_AUDIO_IN: {
+        mic_received_bytes_ += frame.payload.size();
+        // Boost quiet mic samples once here, as they arrive (before any
+        // chunking by the URB consumer), so gain is applied exactly once.
+        apply_pcm_gain_i16(frame.payload, mic_capture_gain());
         mic_ring_buffer.insert(mic_ring_buffer.end(), frame.payload.begin(),
                                frame.payload.end());
-        // Cap growth if the mic URB side isn't draining yet (interface not
-        // opened by Windows, or transfer_buffer_length is smaller than
-        // the incoming rate) so this doesn't grow unbounded.
-        constexpr std::size_t kMaxMicBuffer = 64 * 1024;
-        if (mic_ring_buffer.size() > kMaxMicBuffer) {
+        // Cap growth to bound added latency if production briefly outpaces
+        // consumption (or the interface isn't being drained yet). Drop the
+        // oldest bytes past the cap.
+        if (mic_ring_buffer.size() > kMicMaxBufferBytes) {
           mic_ring_buffer.erase(
               mic_ring_buffer.begin(),
               mic_ring_buffer.begin() +
-                  static_cast<std::ptrdiff_t>(mic_ring_buffer.size() - kMaxMicBuffer));
+                  static_cast<std::ptrdiff_t>(mic_ring_buffer.size() - kMicMaxBufferBytes));
         }
         break;
       }
@@ -873,16 +953,54 @@ bool VirtualPort::Impl::wait_for_feature_reply(Frame &out, DWORD timeout_ms) {
 std::vector<std::uint8_t> VirtualPort::Impl::take_mic_bytes(std::size_t count) {
   std::lock_guard<std::mutex> lk(demux_mutex);
   std::vector<std::uint8_t> out;
-  const std::size_t avail = (std::min)(count, mic_ring_buffer.size());
-  out.assign(mic_ring_buffer.begin(),
-            mic_ring_buffer.begin() + static_cast<std::ptrdiff_t>(avail));
-  mic_ring_buffer.erase(mic_ring_buffer.begin(),
-                        mic_ring_buffer.begin() + static_cast<std::ptrdiff_t>(avail));
-  // Zero-pad on underrun so the caller always gets exactly count bytes --
-  // this keeps the URB actual_length and iso descriptor math consistent
-  // with what was declared, which is what usbip-win2 requires to not
-  // abort the connection.
+  ++mic_pull_count_;
+  mic_requested_bytes_ += count;
+  if (usbip_debug_logging() && mic_pull_count_ % 1000 == 0) {
+    if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_mic_debug.log", "a")) {
+      std::fprintf(dbg,
+                   "mic pulls=%llu count=%zu recv_bytes=%llu req_bytes=%llu "
+                   "ratio=%.2f underruns=%llu buffered=%zu primed=%d\\n",
+                   static_cast<unsigned long long>(mic_pull_count_), count,
+                   static_cast<unsigned long long>(mic_received_bytes_),
+                   static_cast<unsigned long long>(mic_requested_bytes_),
+                   mic_requested_bytes_ ? (double)mic_received_bytes_ / (double)mic_requested_bytes_ : 0.0,
+                   static_cast<unsigned long long>(mic_underrun_count_),
+                   mic_ring_buffer.size(), mic_primed_ ? 1 : 0);
+      std::fclose(dbg);
+    }
+  }
+
+  // Not yet primed: return silence until a cushion has accumulated. This is
+  // what removes the crackle -- without it, the very first pulls (and every
+  // pull between 10ms BT bursts) drain the buffer to empty and zero-pad.
+  if (!mic_primed_) {
+    if (mic_ring_buffer.size() >= kMicPrimeBytes) {
+      mic_primed_ = true;
+    } else {
+      out.assign(count, 0);
+      return out;
+    }
+  }
+
+  if (mic_ring_buffer.size() >= count) {
+    out.assign(mic_ring_buffer.begin(),
+               mic_ring_buffer.begin() + static_cast<std::ptrdiff_t>(count));
+    mic_ring_buffer.erase(
+        mic_ring_buffer.begin(),
+        mic_ring_buffer.begin() + static_cast<std::ptrdiff_t>(count));
+    return out;
+  }
+
+  // Underrun while primed: hand over what we have, zero-pad the remainder
+  // (usbip-win2 requires exactly transfer_buffer_length bytes back), and
+  // drop back to unprimed so we rebuild the cushion instead of glitching on
+  // every pull until the next burst arrives.
+  out.assign(mic_ring_buffer.begin(), mic_ring_buffer.end());
+  mic_zero_pad_bytes_ += count - out.size();
   out.resize(count, 0);
+  mic_ring_buffer.clear();
+  mic_primed_ = false;
+  ++mic_underrun_count_;
   return out;
 }
 
@@ -987,6 +1105,14 @@ bool VirtualPort::Impl::handle_cmd_submit(SOCKET client, const UsbipCmdSubmit &c
         event.interface_type = VDS_USB_INTERFACE_AUDIO_OUT;
       } else if (wIndex == VDS_USB_AUDIO_IN_INTERFACE) {
         event.interface_type = VDS_USB_INTERFACE_AUDIO_IN;
+        // Flush the mic jitter buffer on every mic start/stop so a fresh
+        // recording session doesn't inherit stale audio or a half-full
+        // cushion from a previous one; re-prime from empty.
+        {
+          std::lock_guard<std::mutex> lk(demux_mutex);
+          mic_ring_buffer.clear();
+          mic_primed_ = false;
+        }
       } else {
         event.interface_type = VDS_USB_INTERFACE_HID;
       }
@@ -1125,11 +1251,16 @@ bool VirtualPort::Impl::handle_cmd_submit(SOCKET client, const UsbipCmdSubmit &c
     // (An earlier blocking-sleep pacing attempt was removed as it stalled
     // the shared session thread; the dedicated pacer avoids that.)
   } else if (cmd.base.ep == kEpAudioIn && cmd.base.direction == kDirIn) {
-    // Mic is not currently a priority; the goal here is only to answer
-    // every URB with a wire-consistent reply (never violating the
-    // declared transfer_buffer_length) so Windows probing this endpoint
-    // during audio-class enumeration cannot kill the shared USB/IP
-    // connection out from under HID and audio-OUT (haptics).
+    // Isochronous IN (mic). Answer with exactly transfer_buffer_length bytes
+    // from the jitter buffer (zero-padded on underrun) so the reply is
+    // wire-consistent. Crucially, this reply is PACED at the send stage
+    // below, exactly like audio OUT: without pacing, Windows completes and
+    // resubmits isoc IN URBs as fast as the loopback allows (~10x real
+    // time), draining the buffer far faster than the Bluetooth mic can fill
+    // it -- so ~90% of every reply was zero-pad (measured recv/req ratio
+    // ~0.09) and the mic was pure stutter. Pacing throttles Windows to the
+    // real 48kHz rate so each URB carries the audio that actually arrived in
+    // that interval.
     reply_data = take_mic_bytes(static_cast<std::size_t>(cmd.transfer_buffer_length));
     ret.status = 0;
     ret.number_of_packets = cmd.number_of_packets;
@@ -1190,34 +1321,47 @@ bool VirtualPort::Impl::handle_cmd_submit(SOCKET client, const UsbipCmdSubmit &c
   ret.start_frame = hton32(0);
   ret.error_count = hton32(0);
 
-  // Audio OUT replies are paced instead of sent inline -- see the
-  // PacedReply member comments. Serialize the complete RET_SUBMIT
-  // (header + iso descriptors; OUT replies carry no data payload) and
-  // hand it to the pacer with a real-time due moment: 1ms of audio per
-  // iso packet, anchored to the previous audio URB's due time so a burst
-  // of early submissions from Windows drains at exactly real time. If the
-  // stream pauses (>250ms since the last due), the anchor resets so a new
-  // stream does not inherit stale lateness or a far-future anchor.
-  if (cmd.base.ep == kEpAudioOut && cmd.base.direction == kDirOut &&
-      cmd.number_of_packets > 0) {
+  // Isochronous replies (audio OUT = speaker/haptics, audio IN = mic) are
+  // paced instead of sent inline -- see the PacedReply member comments.
+  // Serialize the complete RET_SUBMIT and hand it to the pacer with a
+  // real-time due moment: 1ms of audio per iso packet, anchored to the
+  // previous URB's due time in that direction so a burst of early
+  // submissions from Windows drains at exactly real time. If the stream
+  // pauses (>250ms since the last due), the anchor resets so a new stream
+  // does not inherit stale lateness or a far-future anchor.
+  // Wire layout differs by direction: OUT carries header + iso descriptors
+  // (no data); IN carries header + data payload + iso descriptors.
+  const bool pace_out =
+      cmd.base.ep == kEpAudioOut && cmd.base.direction == kDirOut &&
+      cmd.number_of_packets > 0;
+  const bool pace_in =
+      cmd.base.ep == kEpAudioIn && cmd.base.direction == kDirIn &&
+      cmd.number_of_packets > 0;
+  if (pace_out || pace_in) {
     PacedReply paced{};
     paced.client = client;
-    paced.bytes.resize(sizeof(ret) +
-                       reply_iso.size() * sizeof(UsbipIsoPacketDescriptor));
+    const std::size_t data_len = pace_in ? reply_data.size() : 0;
+    const std::size_t iso_len =
+        reply_iso.size() * sizeof(UsbipIsoPacketDescriptor);
+    paced.bytes.resize(sizeof(ret) + data_len + iso_len);
     std::memcpy(paced.bytes.data(), &ret, sizeof(ret));
-    if (!reply_iso.empty()) {
-      std::memcpy(paced.bytes.data() + sizeof(ret), reply_iso.data(),
-                  reply_iso.size() * sizeof(UsbipIsoPacketDescriptor));
+    if (data_len > 0) {
+      std::memcpy(paced.bytes.data() + sizeof(ret), reply_data.data(), data_len);
+    }
+    if (iso_len > 0) {
+      std::memcpy(paced.bytes.data() + sizeof(ret) + data_len, reply_iso.data(),
+                  iso_len);
     }
     {
       std::lock_guard<std::mutex> guard(pacer_mutex);
+      auto &anchor = pace_out ? iso_out_next_due : iso_in_next_due;
       const auto now = std::chrono::steady_clock::now();
-      if (iso_out_next_due == std::chrono::steady_clock::time_point{} ||
-          iso_out_next_due < now - std::chrono::milliseconds(250)) {
-        iso_out_next_due = now; // stream (re)start: first URB completes now
+      if (anchor == std::chrono::steady_clock::time_point{} ||
+          anchor < now - std::chrono::milliseconds(250)) {
+        anchor = now; // stream (re)start: first URB completes now
       }
-      paced.due = iso_out_next_due;
-      iso_out_next_due += std::chrono::milliseconds(cmd.number_of_packets);
+      paced.due = anchor;
+      anchor += std::chrono::milliseconds(cmd.number_of_packets);
       paced_replies.push_back(std::move(paced));
     }
     pacer_cv.notify_all();
