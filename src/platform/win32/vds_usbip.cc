@@ -1143,6 +1143,15 @@ bool VirtualPort::Impl::handle_cmd_submit(SOCKET client, const UsbipCmdSubmit &c
       wait_for_feature_reply(reply, 500);
       if (reply.header.type == VDS_FRAME_USB_FEATURE_REPLY) {
         reply_data = reply.payload;
+        // Never return more than the host asked for. A control-IN reply whose
+        // actual_length exceeds the requested wLength is a wire violation that
+        // makes usbip-win2 reset the whole TCP connection (dropping every
+        // interface incl. audio, then persistent-reattach restores it). The
+        // Bluetooth feature reply can be a different size than the USB GET_REPORT
+        // requested (e.g. a WebHID app reading firmware report 0x20), so clamp.
+        if (reply_data.size() > wLength) {
+          reply_data.resize(wLength);
+        }
       }
       ret.status = 0;
     } else if ((bmRequestType & 0x60) == 0x20 && bRequest == 0x09) {
@@ -1207,6 +1216,13 @@ bool VirtualPort::Impl::handle_cmd_submit(SOCKET client, const UsbipCmdSubmit &c
     } else {
       // Unhandled/unknown control request: STALL.
       ret.status = -32; // -EPIPE
+    }
+    // Defensive net: no control-IN reply may exceed the requested wLength.
+    // An oversize actual_length is a wire violation that resets the whole
+    // USB/IP connection (all interfaces incl. audio drop). The individual
+    // handlers above clamp, but this guarantees it for any future path too.
+    if (device_to_host && reply_data.size() > wLength) {
+      reply_data.resize(wLength);
     }
   } else if (cmd.base.ep == kEpHidIn && cmd.base.direction == kDirIn) {
     Frame frame;
