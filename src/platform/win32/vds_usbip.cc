@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -453,14 +454,22 @@ struct VirtualPort::Impl {
   // due moment (number_of_packets x 1ms per URB), so the session thread
   // never blocks and HID replies are unaffected.
   struct PacedReply {
-    std::chrono::steady_clock::time_point due;
     SOCKET client;
     std::vector<std::uint8_t> bytes; // complete serialized RET_SUBMIT
   };
   std::thread iso_pacer_thread;
-  std::mutex pacer_mutex; // guards paced_replies + iso_out_next_due
+  std::mutex pacer_mutex; // guards paced_replies + iso_*_next_due
   std::condition_variable pacer_cv;
-  std::deque<PacedReply> paced_replies;
+  // Keyed and drained in DUE-TIME order (not insertion order). This matters
+  // when speaker (audio OUT) and mic (audio IN) are both streaming: on mic
+  // start, Windows submits a burst of mic IN URBs whose due times span up to
+  // ~1s into the future. With a FIFO queue, a speaker reply enqueued behind
+  // that burst would wait the whole ~1s before being sent -- stalling the
+  // speaker endpoint's audio clock and dropping any video slaved to it (a
+  // browser playing through the controller) to ~1 fps. Ordering by due time
+  // means a speaker reply due now always jumps ahead of mic replies due
+  // later, so neither stream can head-of-line-block the other.
+  std::multimap<std::chrono::steady_clock::time_point, PacedReply> paced_replies;
   std::chrono::steady_clock::time_point iso_out_next_due{};
   std::chrono::steady_clock::time_point iso_in_next_due{}; // mic (audio IN)
   // Both the session thread and the pacer thread write complete wire
@@ -563,14 +572,17 @@ void VirtualPort::Impl::iso_pacer_loop() {
       pacer_cv.wait(lk);
       continue;
     }
-    const auto due = paced_replies.front().due;
+    // Earliest-due entry (multimap is ordered by key = due time).
+    auto it = paced_replies.begin();
+    const auto due = it->first;
     const auto now = std::chrono::steady_clock::now();
     if (now < due) {
+      // Wake early if a sooner-due reply is inserted (notify on enqueue).
       pacer_cv.wait_until(lk, due);
-      continue; // re-check front/stop after any wakeup
+      continue; // re-check earliest/stop after any wakeup
     }
-    PacedReply reply = std::move(paced_replies.front());
-    paced_replies.pop_front();
+    PacedReply reply = std::move(it->second);
+    paced_replies.erase(it);
     lk.unlock();
     {
       std::lock_guard<std::mutex> send_guard(socket_send_mutex);
@@ -1360,9 +1372,9 @@ bool VirtualPort::Impl::handle_cmd_submit(SOCKET client, const UsbipCmdSubmit &c
           anchor < now - std::chrono::milliseconds(250)) {
         anchor = now; // stream (re)start: first URB completes now
       }
-      paced.due = anchor;
+      const auto due = anchor;
       anchor += std::chrono::milliseconds(cmd.number_of_packets);
-      paced_replies.push_back(std::move(paced));
+      paced_replies.emplace(due, std::move(paced));
     }
     pacer_cv.notify_all();
     return true;
