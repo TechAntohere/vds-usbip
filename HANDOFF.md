@@ -112,7 +112,18 @@ WPF tray app DONE (foundation, commit f35aa7c) at `ui/VdsTray/` (C#/.NET 10, `do
 - Controller art: `ui/VdsTray/assets/dualsense.png` + `dualsense edge.png` (user's, committed; will be re-rendered higher-res). Loaded at runtime from assets next to exe.
 - KEY FIXES during build: `Application`/`Color` ambiguity (WPF+WinForms) -> fully-qualify; opacity stuck at 0 -> explicit From=0→1 DoubleAnimation with BeginAnimation(null) reset; position must be set AFTER layout (SizeToContent) via SizeChanged handler, else off-screen.
 - gitignore: repo is DENY-BY-DEFAULT (root `*`); ui/ whitelisted in root .gitignore (bin/obj auto-excluded).
-REMAINING UI: user will redesign the popup visuals in Figma. Settings window (mic gain/mute + speaker/haptic volume + speaker/mic toggle) — needs the SETTER side of the data layer (task #12b, not built): `vdsctl set <param> <value>` -> vdsd applies (mic gain currently launch-time env only; needs runtime setter). Player-LED-once-on-connect + lightbar-off-on-connect also pending. Edge profile art unused (user has no Edge).
+SETTER side DONE (commit f9ea415): mic gain is now runtime-settable — `vdsctl set mic-gain <N>` -> vdsd -> vds::win::usbip::set_mic_capture_gain (global atomic, init from VDS_MIC_GAIN, effective next mic frame). mic_gain added to `vdsctl status`. Tray app has a "Mic gain" submenu (10-60x) with a checkmark on the active level. User decided: speaker/haptic volume = handled by Windows (no widget control needed), jack detection self-manages. So the interactive surface is minimal (mic gain). Widget is READ-ONLY status; interactive bits live in the tray menu.
+Old autostart Startup shortcut REMOVED — tray app is the sole manager (starts vdsd windowless via Process.Start, no PowerShell window; "Start on boot" = per-user Run key).
+Widget design (user's Figma, iterated): 600x420 card #272727 corner 15; big centered controller (PNG has ~17% bottom padding -> nudged with negative margin; cleanest fix = user re-exports controller PNG tightly cropped); right info box = Polling Rate + Color; two status circles (headphones=jack, mic=NOT muted) tinted via OpacityMask (white circle+dark glyph when on, dark circle+grey glyph off); mini toast = square with icon. Assets in ui/VdsTray/assets (dualsense.png, mic.png, headphones.png, battery.png; edge unused).
+
+## REMAINING WORK (as of 2026-07-16)
+1. Installer — package usbip-win2 (signed) drivers + HidHide + tray app + vdsd; register/whitelist; the BIG remaining piece for distribution.
+2. Player-LED-once-on-connect (1st ctrl=1 light) + lightbar-off-on-connect — pending.
+3. "Connecting…" widget state during the few-second attach/enumerate delay.
+4. Color field — shows "White" default; real value needs the command-protocol feature-report forwarding fix.
+5. Release hardening — verify all debug logs gated (usbip_cmd/ctrl/mic behind VDS_USBIP_DEBUG; vdstray.log), remove temp scripts (strip_*.py, run_vdsd_gain.ps1, vds-autostart.ps1 now that tray manages), gate the FU SET_CUR ctrl log.
+6. Widget visual polish (ongoing Figma) + tight-cropped controller PNG.
+7. DSE (Edge) profile — deprioritized, no hardware.
 
 ## WebHID / feature-report fix (2026-07-15, commit b984606)
 - HID GET_REPORT (feature) reply was forwarded from BT verbatim without clamping to wLength. A WebHID app (daidr DualSense tester) reading firmware report 0x20 got a reply larger than requested → control-IN actual_length > transfer_buffer_length → usbip-win2 reset the whole connection (all interfaces incl. audio dropped, persistent-reattach restored = "endpoints go down then back up"). Fixed: clamp feature-GET reply to wLength + defensive clamp on all control-IN. daidr now stays connected and renders properly (user-verified).
