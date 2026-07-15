@@ -349,8 +349,13 @@ audio_output_interval_for_pending(std::size_t pending_chunks,
   return kAudioOutputBaseInterval;
 }
 
+struct WorkerStatus; // defined below; BridgeState only holds a pointer
+
 struct BridgeState {
   std::mutex mutex;
+  // Live status sink for the UI, owned by the supervising BridgeWorker.
+  // nullptr when running outside a supervised worker (e.g. unit paths).
+  WorkerStatus *worker_status = nullptr;
   vds::DsOutputState output_state;
   vds::PcmAudioExtractor extractor{kWindowsPcmWindowFrames};
   vds::PcmAudioExtractor waveout_extractor{kWindowsPcmWindowFrames};
@@ -469,6 +474,24 @@ void publish_input_status(WorkerStatus &status,
   status.headphone_jack.store((status1 & 0x01) != 0);
   status.mic_detected.store((status1 & 0x02) != 0);
   status.has_input.store(true);
+
+  // Measure the live input (polling) rate over a rolling ~1s window. These
+  // fields are touched only by this (single) input thread, so no lock.
+  const auto now = Clock::now();
+  if (status.rate_window_start == Clock::time_point{}) {
+    status.rate_window_start = now;
+    status.rate_window_count = 0;
+  }
+  ++status.rate_window_count;
+  const auto elapsed = now - status.rate_window_start;
+  if (elapsed >= std::chrono::milliseconds(1000)) {
+    const double secs =
+        std::chrono::duration<double>(elapsed).count();
+    status.polling_hz.store(
+        static_cast<int>(status.rate_window_count / secs + 0.5));
+    status.rate_window_start = now;
+    status.rate_window_count = 0;
+  }
 }
 
 std::array<int, VDS_AUDIO_CHANNELS>
@@ -1591,6 +1614,10 @@ void handle_bluetooth_frame(HANDLE virtual_device,
                                      *report, "virtual",
                                      handle_io_cancellation());
       }
+      // Publish live battery/jack/mic-detect + polling rate for the UI.
+      if (state.worker_status) {
+        publish_input_status(*state.worker_status, *report);
+      }
       const std::uint8_t headset_status = report->at(kUsbInputHeadsetOffset);
       const bool headset_plugged =
           (headset_status & kUsbInputHeadphonesPluggedMask) != 0;
@@ -1637,6 +1664,13 @@ void handle_bluetooth_frame(HANDLE virtual_device,
         }
         state.mute_button_down = mute_button_down;
         mic_muted = state.mic_muted;
+        // Publish mic/speaker state for the UI (under the same lock).
+        if (state.worker_status) {
+          state.worker_status->mic_muted.store(state.mic_muted);
+          state.worker_status->mic_active.store(state.audio_in_stream_active);
+          state.worker_status->speaker_active.store(
+              state.audio_out_stream_active);
+        }
         send_mic_state = mic_mute_changed ||
                          (headset_mic_changed && state.audio_in_stream_active);
         if (send_mic_state) {
@@ -2329,7 +2363,8 @@ void run_bridge_session(const std::string &device_address,
                         const vds::ControllerConfig *selected_config,
                         vds::Logger &logger,
                         std::atomic_bool *session_stop_requested = nullptr,
-                        const std::atomic_uint32_t *trace_flags = nullptr) {
+                        const std::atomic_uint32_t *trace_flags = nullptr,
+                        WorkerStatus *worker_status = nullptr) {
   if (selected_config == nullptr) {
     throw std::runtime_error("Windows bridge session requires config");
   }
@@ -2359,6 +2394,7 @@ void run_bridge_session(const std::string &device_address,
   }
 
   BridgeState state;
+  state.worker_status = worker_status; // publish live state to the UI sink
   std::mutex virtual_write_mutex; // serializes writes to virtual_device across to_bluetooth/to_virtual threads
   std::mutex bluetooth_mutex;
   UniqueHandle virtual_device_handle = open_device(device_handle_path);
@@ -2761,11 +2797,61 @@ bool worker_is_connected(const BridgeWorker &worker) {
   return !worker.done.load() && !worker.stop_requested.load();
 }
 
+// Windows-only rich per-connection status for the UI (tray app / connection
+// widget). One JSON object per line (jsonl), matching `list`. Includes the
+// live WorkerStatus fields (battery/jack/mic/rate) the shared list command
+// doesn't carry.
+std::string build_status_json(
+    const std::vector<std::unique_ptr<BridgeWorker>> &workers) {
+  std::string out;
+  for (const auto &worker : workers) {
+    const WorkerStatus &s = worker->status;
+    std::string line = "{";
+    line += vds::jsonl_string_field("address", worker->address);
+    line += ",";
+    line += vds::jsonl_bool_field("connected", worker_is_connected(*worker));
+    line += ",\"port\":" + std::to_string(worker->port);
+    line += ",\"battery\":" + std::to_string(s.battery_percent.load());
+    line += ",\"charge_status\":" + std::to_string(s.charge_status.load());
+    line += ",";
+    line += vds::jsonl_bool_field("headphone_jack", s.headphone_jack.load());
+    line += ",";
+    line += vds::jsonl_bool_field("mic_detected", s.mic_detected.load());
+    line += ",";
+    line += vds::jsonl_bool_field("mic_muted", s.mic_muted.load());
+    line += ",";
+    line += vds::jsonl_bool_field("mic_active", s.mic_active.load());
+    line += ",";
+    line += vds::jsonl_bool_field("speaker_active", s.speaker_active.load());
+    line += ",\"polling_hz\":" + std::to_string(s.polling_hz.load());
+    line += ",";
+    line += vds::jsonl_bool_field("has_input", s.has_input.load());
+    line += "}\n";
+    out += line;
+  }
+  if (out.empty()) {
+    out = "{\"connected\":false}\n"; // no controller
+  }
+  return out;
+}
+
 std::string handle_supervisor_control_command(
     const std::string &command,
     const std::vector<std::unique_ptr<BridgeWorker>> &workers,
     const std::string &db_path, std::uint32_t &trace_flags,
     bool &reload_requested, vds::Logger &logger) {
+  // Intercept the Windows-only "status" command before the shared handler
+  // (which has no WorkerStatus). Best-effort parse; fall through on error.
+  try {
+    const auto fields = vds::parse_jsonl_object(command, "control status");
+    if (vds::require_jsonl_string(fields, "command", "control status") ==
+        "status") {
+      return build_status_json(workers);
+    }
+  } catch (...) {
+    // not a status command (or malformed) -> shared handler below
+  }
+
   std::vector<vds::VdsdControlControllerStatus> controller_statuses;
   controller_statuses.reserve(workers.size());
   for (const auto &worker : workers) {
@@ -2815,7 +2901,8 @@ void run_configured_bridge_worker(vds::ControllerConfig config,
                                   std::atomic_bool &stop_requested,
                                   std::atomic_bool &done,
                                   std::string &last_error,
-                                  const std::atomic_uint32_t &trace_flags) {
+                                  const std::atomic_uint32_t &trace_flags,
+                                  WorkerStatus *worker_status = nullptr) {
   try {
     if (config.ports.size() != 1) {
       throw std::runtime_error("bridge worker requires one reserved port");
@@ -2823,7 +2910,8 @@ void run_configured_bridge_worker(vds::ControllerConfig config,
     const std::string virtual_device =
         vds::port_path_for_index(config.ports[0]);
     run_bridge_session(device_address, virtual_device, config.ports[0],
-                       &config, logger, &stop_requested, &trace_flags);
+                       &config, logger, &stop_requested, &trace_flags,
+                       worker_status);
     if (!g_stop_requested && !stop_requested.load()) {
       last_error = "bridge session ended";
       logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
@@ -3159,7 +3247,8 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
             run_configured_bridge_worker(worker_config, device_address, logger,
                                          worker_ptr->stop_requested,
                                          worker_ptr->done,
-                                         worker_ptr->last_error, trace_flags);
+                                         worker_ptr->last_error, trace_flags,
+                                         &worker_ptr->status);
             SetEvent(worker_ptr->done_event.get());
           });
           logger.log(

@@ -38,6 +38,8 @@ std::string detach_request(std::string_view address) {
 
 std::string list_request() { return "{\"command\":\"list\"}\n"; }
 
+std::string status_request() { return "{\"command\":\"status\"}\n"; }
+
 std::string list_targets_request() {
   return "{\"command\":\"list-targets\"}\n";
 }
@@ -68,6 +70,7 @@ std::string vdsctl_usage(std::string_view version,
           "  vdsctl detach <address>\n"
           "  vdsctl list\n"
           "  vdsctl list-targets\n"
+          "  vdsctl status\n"
           "  vdsctl trace on|off [--scope <scope>[,<scope>...]]\n"
           "\n"
           "trace scopes:\n"
@@ -90,6 +93,9 @@ VdsctlCommand parse_vdsctl_command(std::string_view command) {
   }
   if (command == "trace") {
     return VdsctlCommand::Trace;
+  }
+  if (command == "status") {
+    return VdsctlCommand::Status;
   }
   throw std::runtime_error("unknown command: " + std::string(command));
 }
@@ -123,6 +129,10 @@ int run_vdsctl_app(int argc, char **argv, std::string_view version,
       break;
     case VdsctlCommand::Trace:
       std::cout << run_vdsctl_trace(argc, argv, platform.request_control);
+      break;
+    case VdsctlCommand::Status:
+      require_vdsctl_arg_count(argc, 2);
+      std::cout << platform.request_control(status_request());
       break;
     }
     return 0;
