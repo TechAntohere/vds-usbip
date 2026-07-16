@@ -51,6 +51,11 @@
 !/packaging/windows/wix/*.wxs
 !/packaging/windows/wix/*.xml
 
+!/installer/
+!/installer/*.iss
+!/installer/redist/
+!/installer/redist/*.md
+
 !/ui/
 !/ui/VdsTray/
 !/ui/VdsTray/*.cs

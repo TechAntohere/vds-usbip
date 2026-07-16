@@ -4,15 +4,26 @@ using System.Text.Json;
 
 namespace VdsTray;
 
-/// <summary>Paths to the vDS binaries. Adjust here (or later read from config).</summary>
+/// <summary>Paths to the vDS binaries. Resolves vdsd/vdsctl next to the tray
+/// exe first (installed layout: everything under one folder), falling back to
+/// the dev build tree so it still works when run from the repo.</summary>
 internal static class Paths
 {
-    public static string RepoRoot = @"C:\Users\Antonio\Documents\vds";
-    public static string Build => System.IO.Path.Combine(RepoRoot, "build");
-    public static string Vdsd => System.IO.Path.Combine(Build, "vdsd.exe");
-    public static string Vdsctl => System.IO.Path.Combine(Build, "vdsctl.exe");
+    private const string DevBuild = @"C:\Users\Antonio\Documents\vds\build";
+    private static readonly string ExeDir = AppContext.BaseDirectory;
+
+    private static string Tool(string name)
+    {
+        string local = System.IO.Path.Combine(ExeDir, name);
+        return File.Exists(local) ? local : System.IO.Path.Combine(DevBuild, name);
+    }
+
+    public static string Vdsd => Tool("vdsd.exe");
+    public static string Vdsctl => Tool("vdsctl.exe");
     public static string Usbip = @"C:\Program Files\USBip\usbip.exe";
     public static string BusId = "1-1";
+    // Working directory for vdsd = wherever vdsd.exe actually lives.
+    public static string VdsdDir => System.IO.Path.GetDirectoryName(Vdsd) ?? ExeDir;
 }
 
 /// <summary>One controller's live status, parsed from `vdsctl status` JSON.</summary>
@@ -126,7 +137,7 @@ internal static class Vds
             var psi = new ProcessStartInfo
             {
                 FileName = Paths.Vdsd,
-                WorkingDirectory = Paths.Build,
+                WorkingDirectory = Paths.VdsdDir,
                 UseShellExecute = false,
                 CreateNoWindow = true,
             };
