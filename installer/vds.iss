@@ -91,6 +91,16 @@ Filename: "taskkill.exe"; Parameters: "/IM VdsTray.exe /F"; Flags: runhidden; Ru
 Filename: "taskkill.exe"; Parameters: "/IM vdsd.exe /F"; Flags: runhidden; RunOnceId: "KillVdsd"
 
 [Code]
+{ Stop a running tray/bridge before copying files, so an upgrade/reinstall
+  doesn't fail on locked binaries (VdsTray.exe / vdsd.exe). }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var rc: Integer;
+begin
+  Exec('taskkill.exe', '/IM VdsTray.exe /F', '', SW_HIDE, ewWaitUntilTerminated, rc);
+  Exec('taskkill.exe', '/IM vdsd.exe /F',    '', SW_HIDE, ewWaitUntilTerminated, rc);
+  Result := '';
+end;
+
 { Skip a bundled driver install if that driver is already present, so re-running
   the setup on a machine that already has usbip-win2 / HidHide doesn't trigger a
   disruptive uninstall-then-reinstall of the kernel driver. }
