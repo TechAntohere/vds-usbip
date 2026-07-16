@@ -1061,6 +1061,7 @@ bool VirtualPort::Impl::handle_cmd_submit(SOCKET client, const UsbipCmdSubmit &c
     // TEMP DIAGNOSTIC: dump every control transfer so we can see exactly
     // what Windows asks for during enumeration. Remove once the stall is
     // diagnosed.
+    if (usbip_debug_logging())
     if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_ctrl_debug.log", "a")) {
       std::fprintf(dbg,
                     "ep0 bmRequestType=0x%02x bRequest=0x%02x wValue=0x%04x "
@@ -1218,6 +1219,7 @@ bool VirtualPort::Impl::handle_cmd_submit(SOCKET client, const UsbipCmdSubmit &c
               (static_cast<std::uint16_t>(out_data[1]) << 8));
           update_speaker_gain();
         }
+        if (usbip_debug_logging())
         if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_ctrl_debug.log", "a")) {
           std::fprintf(dbg, "FU SET_CUR selector=%u muted=%d vol_db256=%d gain_q15=%d\\n",
                        control_selector, fu_muted.load() ? 1 : 0,
@@ -1309,7 +1311,7 @@ bool VirtualPort::Impl::handle_cmd_submit(SOCKET client, const UsbipCmdSubmit &c
     ret.status = -32; // -EPIPE: unknown endpoint
   }
 
-  if (cmd.base.ep == 0) {
+  if (cmd.base.ep == 0 && usbip_debug_logging()) {
     if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_ctrl_debug.log", "a")) {
       std::fprintf(dbg, "  -> status=%d actual_length=%zu\\n",
                     static_cast<int>(ret.status), reply_data.size());

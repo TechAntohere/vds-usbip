@@ -8,10 +8,14 @@ namespace VdsTray;
 
 internal static class Log
 {
+    // Off unless VDS_TRAY_DEBUG is set (avoids continuous file writes in release).
+    private static readonly bool Enabled =
+        Environment.GetEnvironmentVariable("VDS_TRAY_DEBUG") is not null;
     private static readonly string Path =
         System.IO.Path.Combine(AppContext.BaseDirectory, "vdstray.log");
     public static void Write(string m)
     {
+        if (!Enabled) return;
         try { File.AppendAllText(Path, $"{DateTime.Now:HH:mm:ss.fff}  {m}\n"); } catch { }
     }
 }
