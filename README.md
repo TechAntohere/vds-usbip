@@ -4,7 +4,7 @@
 
 ## Purpose of this fork
 This fork is dedicated to porting usbip as the default kernel driver for the Windows version of Vds.
-It allows installation of the project without a restart aswell as removing the need of enabling test signing on windows as it removes the use of unsigned kernel drivers.
+It allows installation of the project without the need of enabling test signing on Windows.
 Other changes include the addition of the status widget reporting the live polling rate, headphone jack and microphone status aswell as the color of the controller.
 
 Virtual USB-to-Bluetooth bridge for DualSense and DualSense Edge Wireless
