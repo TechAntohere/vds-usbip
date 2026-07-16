@@ -10,7 +10,7 @@
     <!-- Uniform scale of the whole widget (LayoutTransform so SizeToContent
          shrinks the window too). Tweak this one value to resize. -->
     <Grid.LayoutTransform>
-        <ScaleTransform ScaleX="0.5" ScaleY="0.5"/>
+        <ScaleTransform ScaleX="0.75" ScaleY="0.75"/>
     </Grid.LayoutTransform>
     <!-- FULL connection card -->
     <Border x:Name="ConnectionView" CornerRadius="15" Margin="12"
