@@ -446,6 +446,9 @@ struct WorkerStatus {
   std::atomic_bool speaker_active{false}; // Windows opened the speaker
   std::atomic<int> polling_hz{0};         // measured live input rate
   std::atomic_bool has_input{false};      // at least one input report seen
+  // Controller color code (2 ASCII chars packed: (c0<<8)|c1), -1 = unknown.
+  // Read once on connect from the DualSense serial number.
+  std::atomic<int> color_code{-1};
   // UI -> session mic mute request: -1 none, 0 unmute, 1 mute. The bridge's
   // input thread consumes it (applies to state.mic_muted + sends the BT mic
   // state report) then resets to -1.
@@ -2373,6 +2376,58 @@ bool usbip_transport_enabled() {
   return length > 0 && std::string_view(buffer, length) == "usbip";
 }
 
+// Read the DualSense controller color from its serial number via the
+// command-protocol feature reports (send 0x80 [deviceId=SYSTEM, actionId=
+// READ_SERIAL_NUMBER], poll 0x81 for the response). Returns the 2 ASCII
+// color-code chars packed as (c0<<8)|c1, or -1 if unavailable. Best-effort:
+// any failure just yields unknown. Layout matches HidD_GetFeature: byte 0 =
+// report id, 1 = deviceId, 2 = actionId, 3 = status, 4.. = serial; the color
+// code is serial chars 4-5 (bytes 8-9).
+int read_controller_color(BluetoothTransport &bluetooth, std::mutex &bt_mutex) {
+  constexpr std::uint8_t kCmdReport = 0x80;
+  constexpr std::uint8_t kRespReport = 0x81;
+  constexpr std::uint8_t kDeviceSystem = 1;
+  constexpr std::uint8_t kActionReadSerial = 19;
+  // NOTE: the DualSense command channel (0x80 request / 0x81 response) does
+  // not work over Bluetooth through this HID feature interface -- HidD_SetFeature
+  // for report 0x80 returns ERROR_INVALID_PARAMETER (the same gap that leaves
+  // daidr's serial/PCBA fields blank through vds; WebHID reaches it a different
+  // way). So this currently yields -1 (unknown color). Kept as best-effort so
+  // it lights up automatically if/when the command channel is bridged.
+  try {
+    {
+      std::lock_guard guard(bt_mutex);
+      const std::array<std::uint8_t, 3> cmd{kCmdReport, kDeviceSystem,
+                                            kActionReadSerial};
+      bluetooth.write_feature_report(cmd);
+    }
+    for (int attempt = 0; attempt < 12; ++attempt) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(8));
+      std::optional<std::vector<std::uint8_t>> resp;
+      {
+        std::lock_guard guard(bt_mutex);
+        resp = bluetooth.read_feature_report(kRespReport);
+      }
+      if (!resp || resp->size() < 10) {
+        continue;
+      }
+      const auto &r = *resp;
+      if (r[0] == kRespReport && r[1] == kDeviceSystem &&
+          r[2] == kActionReadSerial) {
+        const std::uint8_t c0 = r[8];
+        const std::uint8_t c1 = r[9];
+        if (c0 != 0 && c1 != 0) {
+          return (static_cast<int>(c0) << 8) | static_cast<int>(c1);
+        }
+        return -1;
+      }
+    }
+  } catch (...) {
+    // best-effort; unknown color on any failure
+  }
+  return -1;
+}
+
 void run_bridge_session(const std::string &device_address,
                         const std::string &virtual_device,
                         unsigned port_index,
@@ -2450,6 +2505,13 @@ void run_bridge_session(const std::string &device_address,
   logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
              "Windows bridge started virtual=" + virtual_device +
                  " bluetooth=" + bluetooth->description());
+
+  // Read the controller color from its serial (best-effort, once, before the
+  // I/O loops start so the feature-report exchange isn't racing them).
+  if (worker_status) {
+    worker_status->color_code.store(
+        read_controller_color(*bluetooth, bluetooth_mutex));
+  }
 
   std::thread to_bluetooth([&] {
     try {
@@ -2840,6 +2902,16 @@ std::string build_status_json(
     line += ",";
     line += vds::jsonl_bool_field("speaker_active", s.speaker_active.load());
     line += ",\"polling_hz\":" + std::to_string(s.polling_hz.load());
+    {
+      const int cc = s.color_code.load();
+      std::string color = "unknown";
+      if (cc >= 0) {
+        color.clear();
+        color.push_back(static_cast<char>((cc >> 8) & 0xff));
+        color.push_back(static_cast<char>(cc & 0xff));
+      }
+      line += "," + vds::jsonl_string_field("color", color);
+    }
     line += ",\"mic_gain\":" +
             std::to_string(
                 static_cast<int>(vds::win::usbip::current_mic_capture_gain() + 0.5f));
