@@ -157,4 +157,7 @@ internal static class Vds
 
     /// <summary>Set the runtime mic gain (linear multiplier) via vdsctl.</summary>
     public static void SetMicGain(int gain) => Run(Paths.Vdsctl, $"set mic-gain {gain}");
+
+    /// <summary>Mute/unmute the mic via vdsctl (mirrors the controller button).</summary>
+    public static void SetMicMute(bool muted) => Run(Paths.Vdsctl, $"set mic-mute {(muted ? 1 : 0)}");
 }

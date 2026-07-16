@@ -20,6 +20,7 @@ public partial class App : System.Windows.Application
 {
     private WinForms.NotifyIcon _tray = null!;
     private WinForms.ToolStripMenuItem _micGainMenu = null!;
+    private WinForms.ToolStripMenuItem _micMuteItem = null!;
     private DispatcherTimer _poll = null!;
     private ConnectionPopup? _popup;
     private ControllerStatus? _prev;
@@ -73,6 +74,12 @@ public partial class App : System.Windows.Application
         }
         menu.Items.Add(_micGainMenu);
 
+        // Mic mute toggle (mirrors the controller mute button).
+        _micMuteItem = new WinForms.ToolStripMenuItem("Mute mic");
+        _micMuteItem.Click += (_, _) =>
+            Task.Run(() => Vds.SetMicMute(!_micMuteItem.Checked));
+        menu.Items.Add(_micMuteItem);
+
         menu.Items.Add(new WinForms.ToolStripSeparator());
 
         var bootItem = new WinForms.ToolStripMenuItem("Start on boot") { Checked = Autostart.IsEnabled() };
@@ -115,6 +122,9 @@ public partial class App : System.Windows.Application
             foreach (WinForms.ToolStripMenuItem item in _micGainMenu.DropDownItems)
                 item.Checked = item.Tag is int g && g == cur.MicGain;
         }
+        // Reflect mic mute state.
+        _micMuteItem.Checked = cur is { MicMuted: true };
+        _micMuteItem.Enabled = cur is { Connected: true };
 
         bool wasConnected = _prev is { Connected: true };
         bool nowConnected = cur is { Connected: true };

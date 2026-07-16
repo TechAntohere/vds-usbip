@@ -446,6 +446,10 @@ struct WorkerStatus {
   std::atomic_bool speaker_active{false}; // Windows opened the speaker
   std::atomic<int> polling_hz{0};         // measured live input rate
   std::atomic_bool has_input{false};      // at least one input report seen
+  // UI -> session mic mute request: -1 none, 0 unmute, 1 mute. The bridge's
+  // input thread consumes it (applies to state.mic_muted + sends the BT mic
+  // state report) then resets to -1.
+  std::atomic<int> mic_mute_request{-1};
   // Rolling-window rate measurement (touched only by the input thread).
   std::uint64_t rate_window_count = 0;
   Clock::time_point rate_window_start{};
@@ -1662,6 +1666,18 @@ void handle_bluetooth_frame(HANDLE virtual_device,
           state.mic_muted = !state.mic_muted;
           mic_mute_changed = true;
         }
+        // Software mute request from the UI (tray toggle) -- apply it like a
+        // button press that lands on the requested state, then clear it.
+        if (state.worker_status) {
+          const int req = state.worker_status->mic_mute_request.exchange(-1);
+          if (req == 0 || req == 1) {
+            const bool want = (req == 1);
+            if (state.mic_muted != want) {
+              state.mic_muted = want;
+              mic_mute_changed = true;
+            }
+          }
+        }
         state.mute_button_down = mute_button_down;
         mic_muted = state.mic_muted;
         // Publish mic/speaker state for the UI (under the same lock).
@@ -2859,6 +2875,16 @@ std::string handle_supervisor_control_command(
             static_cast<float>(std::atof(value.c_str())));
         return "{\"OK\":true,\"param\":\"mic-gain\",\"value\":" +
                std::to_string(vds::win::usbip::current_mic_capture_gain()) + "}\n";
+      }
+      if (param == "mic-mute") {
+        const int want = (value == "1" || value == "true" || value == "on") ? 1 : 0;
+        for (const auto &worker : workers) {
+          if (worker_is_connected(*worker)) {
+            worker->status.mic_mute_request.store(want);
+          }
+        }
+        return "{\"OK\":true,\"param\":\"mic-mute\",\"value\":" +
+               std::to_string(want) + "}\n";
       }
       return "{\"OK\":false,\"error\":\"unknown param\"}\n";
     }
