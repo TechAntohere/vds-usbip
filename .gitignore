@@ -53,6 +53,7 @@
 
 !/installer/
 !/installer/*.iss
+!/installer/*.md
 !/installer/redist/
 !/installer/redist/*.md
 
