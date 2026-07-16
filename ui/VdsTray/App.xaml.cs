@@ -129,8 +129,12 @@ public partial class App : System.Windows.Application
             _popup.Update(cur!); // live-update an already-visible popup
         }
 
-        // Small transient popups on jack / mic changes.
-        if (wasConnected && nowConnected && _prev is not null && cur is not null)
+        // Small transient popups on jack / mic changes -- but ONLY when the
+        // full connection card isn't already on screen. When it is, its own
+        // status circles update (via Update above) and the mini would just
+        // cover the card, so we suppress it.
+        bool cardUp = _popup is { IsCardVisible: true };
+        if (wasConnected && nowConnected && _prev is not null && cur is not null && !cardUp)
         {
             if (_prev.HeadphoneJack != cur.HeadphoneJack)
                 ShowMini("headphones", cur.HeadphoneJack);

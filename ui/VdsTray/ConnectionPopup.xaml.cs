@@ -86,6 +86,10 @@ public partial class ConnectionPopup : Window
     }
 
     /// <summary>Show the full connection card, then fade out after 5s.</summary>
+    /// <summary>True when the full connection card (not the mini toast) is on screen.</summary>
+    public bool IsCardVisible =>
+        IsVisible && ConnectionView.Visibility == Visibility.Visible;
+
     public void ShowFading()
     {
         ConnectionView.Visibility = Visibility.Visible;
