@@ -28,7 +28,7 @@ DefaultDirName={autopf}\vDS
 DefaultGroupName=vDS
 DisableProgramGroupPage=yes
 OutputDir=output
-OutputBaseFilename=vDS-Setup-{#AppVersion}
+OutputBaseFilename=vDS-Setup-{#AppVersion}-usbip
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
@@ -91,16 +91,6 @@ Filename: "taskkill.exe"; Parameters: "/IM VdsTray.exe /F"; Flags: runhidden; Ru
 Filename: "taskkill.exe"; Parameters: "/IM vdsd.exe /F"; Flags: runhidden; RunOnceId: "KillVdsd"
 
 [Code]
-{ Stop a running tray/bridge before copying files, so an upgrade/reinstall
-  doesn't fail on locked binaries (VdsTray.exe / vdsd.exe). }
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-var rc: Integer;
-begin
-  Exec('taskkill.exe', '/IM VdsTray.exe /F', '', SW_HIDE, ewWaitUntilTerminated, rc);
-  Exec('taskkill.exe', '/IM vdsd.exe /F',    '', SW_HIDE, ewWaitUntilTerminated, rc);
-  Result := '';
-end;
-
 { Skip a bundled driver install if that driver is already present, so re-running
   the setup on a machine that already has usbip-win2 / HidHide doesn't trigger a
   disruptive uninstall-then-reinstall of the kernel driver. }
@@ -112,4 +102,17 @@ end;
 function HidHideMissing: Boolean;
 begin
   Result := not FileExists(ExpandConstant('{commonpf}\Nefarius Software Solutions\HidHide\x64\HidHideCLI.exe'));
+end;
+
+{ Stop a running tray/bridge before copying files (avoid locked binaries). When a
+  driver is being installed fresh, ask Setup to recommend a restart at the end --
+  the usbip UDE virtual host controller only attaches cleanly after a reboot. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var rc: Integer;
+begin
+  Exec('taskkill.exe', '/IM VdsTray.exe /F', '', SW_HIDE, ewWaitUntilTerminated, rc);
+  Exec('taskkill.exe', '/IM vdsd.exe /F',    '', SW_HIDE, ewWaitUntilTerminated, rc);
+  if UsbipMissing or HidHideMissing then
+    NeedsRestart := True;
+  Result := '';
 end;
