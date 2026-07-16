@@ -6,7 +6,7 @@
 ; (run from this folder)
 
 #define AppName "vDS"
-#define AppVersion "0.3.0"
+#define AppVersion "0.1.0"
 #define AppPublisher "vDS"
 #define BuildDir "..\build"
 #define PublishDir "..\ui\VdsTray\bin\Release\net10.0-windows\win-x64\publish"
@@ -50,6 +50,15 @@ Source: "{#UsbipExe}";  DestDir: "{tmp}"; DestName: "usbip-win2.exe"; Flags: del
 #if FileExists(AddBackslash(SourcePath) + HidHideExe)
 Source: "{#HidHideExe}"; DestDir: "{tmp}"; DestName: "HidHide.exe"; Flags: deleteafterinstall
 #endif
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
+
+[Icons]
+; Manual launch entries (the tray app starts the bridge).
+Name: "{group}\vDS";           Filename: "{app}\VdsTray.exe"; Comment: "Start vDS (DualSense over USB/IP)"
+Name: "{group}\Uninstall vDS"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\vDS";     Filename: "{app}\VdsTray.exe"; Tasks: desktopicon
 
 [Registry]
 ; Launch the tray app (which starts the bridge) at logon.
