@@ -116,6 +116,27 @@ SETTER side DONE (commit f9ea415): mic gain is now runtime-settable — `vdsctl 
 Old autostart Startup shortcut REMOVED — tray app is the sole manager (starts vdsd windowless via Process.Start, no PowerShell window; "Start on boot" = per-user Run key).
 Widget design (user's Figma, iterated): 600x420 card #272727 corner 15; big centered controller (PNG has ~17% bottom padding -> nudged with negative margin; cleanest fix = user re-exports controller PNG tightly cropped); right info box = Polling Rate + Color; two status circles (headphones=jack, mic=NOT muted) tinted via OpacityMask (white circle+dark glyph when on, dark circle+grey glyph off); mini toast = square with icon. Assets in ui/VdsTray/assets (dualsense.png, mic.png, headphones.png, battery.png; edge unused).
 
+## Installer DONE (2026-07-16, commit 7af2fc2)
+Inno Setup 6.7.3 (winget, per-user at %LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe). `installer/vds.iss` compiles to `installer/output/vDS-Setup-0.3.0.exe`. Bundles: vdsd.exe, vdsctl.exe (from build/), self-contained single-file VdsTray.exe + assets (from ui/VdsTray/.../win-x64/publish), hidhide_setup/teardown.ps1. Runs (post-install): silent MSI installs of usbip-win2 + HidHide IF present in installer/redist/ (ISPP #if FileExists, names usbip-win2.msi / HidHide.msi — see redist/README.md), then hidhide_setup.ps1 -VdsdPath {app}\vdsd.exe (whitelist+hide), sets HKCU Run key for VdsTray autostart, launches tray. Uninstall runs hidhide_teardown + kills tray/vdsd.
+- Tray app Paths now resolve vdsd/vdsctl next to VdsTray.exe (installed layout) with dev fallback to build/ — commit 7af2fc2. So it works from Program Files.
+- Self-contained publish: `dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true` (~165MB single exe, bundles .NET).
+- CAVEATS: (1) HKCU Run under admin install = installing user's profile (fine single-user; use HKLM or tray toggle for multi-user). (2) Third-party MSI silent flags assume msiexec /qn; verify once real files dropped (HidHide exe uses /VERYSILENT if not MSI). (3) NOT yet test-installed (would modify Program Files + HidHide + autostart; user to run when ready). (4) I can't fetch the MSIs (binary-download restriction) — user drops them in redist/.
+- Timing measured: cold launch (vdsd start->both audio endpoints OK) = ~2.9s; server-ready ~0.9s. Mid-game reconnect ≈ ~1s detect (scan cadence 1000ms) + ~2.6s re-enumerate. launch.ps1 = manual timed launcher.
+
+## Verified working config note
+HidHide cloak ON + vdsd whitelisted = vds binds fine (validated). Earlier "cannot open device / file not found" was the controller ASLEEP/transitional BT state, not a bug — vds waits for the pad to connect. Whitelist is by INSTALLED path, so installer must whitelist {app}\vdsd.exe (it does).
+
+## GitHub fork (pending token)
+User forked to **TechAntohere/vds-usbip** and is issuing a fine-grained PAT (Contents: R/W + Metadata: R/O = correct minimal set; add Workflows R/W only if editing .github/workflows). Once provided: add remote, push all commits. Handle token carefully (remote URL/credential, never echo).
+
+## Newer follow-ups (user-requested 2026-07-16)
+- Mic mute/unmute toggle in tray menu (task #17) — needs `vdsctl set mic-mute 0/1` setter -> vdsd sets state.mic_muted + sends BT mic state report.
+- "Connecting…" widget state for the ~3s init.
+- Color-from-serial: vdsd issues DualSense cmd-protocol READ_SERIAL_NUMBER over BT (send feat 0x80 [deviceId=SYSTEM=1, actionId=19], read 0x81; serial data at resp byte 4; color code = serial chars 4-5 = resp bytes 8-9; map via DualSenseColorMap 00=white/01=midnight_black/02=cosmic_red/...). Report in vdsctl status; widget shows it. No USB/IP passthrough needed (vds does the BT read directly).
+- Multi-controller player-LED numbering (currently all Player 1).
+- Audio latency: ~60ms buffer (prime=6); can try VDS_AUDIO_PRIME_CHUNKS=3-4 (~30-40ms) if crackle-free; floor from Windows+BT.
+- Optional: persistent virtual device to make mid-game reconnect near-instant (phantom pad when idle; could be a toggle).
+
 ## REMAINING WORK (as of 2026-07-16)
 1. Installer — package usbip-win2 (signed) drivers + HidHide + tray app + vdsd; register/whitelist; the BIG remaining piece for distribution.
 2. Player-LED-once-on-connect (1st ctrl=1 light) + lightbar-off-on-connect — pending.
