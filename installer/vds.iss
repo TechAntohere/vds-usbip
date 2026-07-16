@@ -12,11 +12,12 @@
 #define PublishDir "..\ui\VdsTray\bin\Release\net10.0-windows\win-x64\publish"
 
 ; Drop the signed third-party installers here to bundle them (rename to match):
-;   redist\usbip-win2.msi   (from github.com/vadimgrn/usbip-win2 releases)
-;   redist\HidHide.msi      (from github.com/nefarius/HidHide releases)
+;   redist\usbip-win2.exe   (from github.com/vadimgrn/usbip-win2 releases, x64)
+;   redist\HidHide.exe      (from github.com/nefarius/HidHide releases, x64)
 ; If absent, the installer skips them and assumes they are already installed.
-#define UsbipMsi "redist\usbip-win2.msi"
-#define HidHideMsi "redist\HidHide.msi"
+; usbip-win2 is an Inno Setup installer; HidHide is an Advanced Installer.
+#define UsbipExe "redist\usbip-win2.exe"
+#define HidHideExe "redist\HidHide.exe"
 
 [Setup]
 AppId={{7C2B9E4A-9E2F-4B7C-9C1E-VDS0DUALSENSE}}
@@ -43,11 +44,11 @@ Source: "{#PublishDir}\VdsTray.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PublishDir}\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\hidhide_setup.ps1";    DestDir: "{app}"; Flags: ignoreversion
 Source: "..\hidhide_teardown.ps1"; DestDir: "{app}"; Flags: ignoreversion
-#if FileExists(AddBackslash(SourcePath) + UsbipMsi)
-Source: "{#UsbipMsi}";  DestDir: "{tmp}"; DestName: "usbip-win2.msi"; Flags: deleteafterinstall
+#if FileExists(AddBackslash(SourcePath) + UsbipExe)
+Source: "{#UsbipExe}";  DestDir: "{tmp}"; DestName: "usbip-win2.exe"; Flags: deleteafterinstall
 #endif
-#if FileExists(AddBackslash(SourcePath) + HidHideMsi)
-Source: "{#HidHideMsi}"; DestDir: "{tmp}"; DestName: "HidHide.msi"; Flags: deleteafterinstall
+#if FileExists(AddBackslash(SourcePath) + HidHideExe)
+Source: "{#HidHideExe}"; DestDir: "{tmp}"; DestName: "HidHide.exe"; Flags: deleteafterinstall
 #endif
 
 [Registry]
@@ -57,12 +58,12 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
   Flags: uninsdeletevalue
 
 [Run]
-#if FileExists(AddBackslash(SourcePath) + UsbipMsi)
-Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\usbip-win2.msi"" /qn /norestart"; \
+#if FileExists(AddBackslash(SourcePath) + UsbipExe)
+Filename: "{tmp}\usbip-win2.exe"; Parameters: "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"; \
   StatusMsg: "Installing USB/IP driver..."; Flags: waituntilterminated
 #endif
-#if FileExists(AddBackslash(SourcePath) + HidHideMsi)
-Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\HidHide.msi"" /qn /norestart"; \
+#if FileExists(AddBackslash(SourcePath) + HidHideExe)
+Filename: "{tmp}\HidHide.exe"; Parameters: "/exenoui /qn"; \
   StatusMsg: "Installing HidHide..."; Flags: waituntilterminated
 #endif
 ; Configure HidHide: whitelist vdsd + hide the Bluetooth DualSense (dynamic).
