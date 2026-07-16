@@ -2,6 +2,10 @@
 
 [![Sponsor](https://img.shields.io/badge/Sponsor-hurryman2212-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/hurryman2212)
 
+This fork is dedicated to porting usbip as the default kernel driver for the Windows version of Vds.
+It allows installation of the project without a restart aswell as removing the need of enabling test signing on windows as it removes the use of unsigned kernel drivers
+Other changes include the addition of the status widget reporting the live polling rate, headphone jack and microphone status aswell as the color of the controller.
+
 Virtual USB-to-Bluetooth bridge for DualSense and DualSense Edge Wireless
 Controllers. vDS currently supports all USB-based DualSense features over
 Bluetooth (except firmware update), including quadraphonic haptic feedback
