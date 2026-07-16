@@ -45,10 +45,10 @@ Source: "{#PublishDir}\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion 
 Source: "..\hidhide_setup.ps1";    DestDir: "{app}"; Flags: ignoreversion
 Source: "..\hidhide_teardown.ps1"; DestDir: "{app}"; Flags: ignoreversion
 #if FileExists(AddBackslash(SourcePath) + UsbipExe)
-Source: "{#UsbipExe}";  DestDir: "{tmp}"; DestName: "usbip-win2.exe"; Flags: deleteafterinstall
+Source: "{#UsbipExe}";  DestDir: "{tmp}"; DestName: "usbip-win2.exe"; Flags: deleteafterinstall; Check: UsbipMissing
 #endif
 #if FileExists(AddBackslash(SourcePath) + HidHideExe)
-Source: "{#HidHideExe}"; DestDir: "{tmp}"; DestName: "HidHide.exe"; Flags: deleteafterinstall
+Source: "{#HidHideExe}"; DestDir: "{tmp}"; DestName: "HidHide.exe"; Flags: deleteafterinstall; Check: HidHideMissing
 #endif
 
 [Tasks]
@@ -69,11 +69,11 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
 [Run]
 #if FileExists(AddBackslash(SourcePath) + UsbipExe)
 Filename: "{tmp}\usbip-win2.exe"; Parameters: "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"; \
-  StatusMsg: "Installing USB/IP driver..."; Flags: waituntilterminated
+  StatusMsg: "Installing USB/IP driver..."; Flags: waituntilterminated; Check: UsbipMissing
 #endif
 #if FileExists(AddBackslash(SourcePath) + HidHideExe)
 Filename: "{tmp}\HidHide.exe"; Parameters: "/exenoui /qn"; \
-  StatusMsg: "Installing HidHide..."; Flags: waituntilterminated
+  StatusMsg: "Installing HidHide..."; Flags: waituntilterminated; Check: HidHideMissing
 #endif
 ; Configure HidHide: whitelist vdsd + hide the Bluetooth DualSense (dynamic).
 Filename: "powershell.exe"; \
@@ -89,3 +89,17 @@ Filename: "powershell.exe"; \
   Flags: runhidden waituntilterminated; RunOnceId: "HidHideTeardown"
 Filename: "taskkill.exe"; Parameters: "/IM VdsTray.exe /F"; Flags: runhidden; RunOnceId: "KillTray"
 Filename: "taskkill.exe"; Parameters: "/IM vdsd.exe /F"; Flags: runhidden; RunOnceId: "KillVdsd"
+
+[Code]
+{ Skip a bundled driver install if that driver is already present, so re-running
+  the setup on a machine that already has usbip-win2 / HidHide doesn't trigger a
+  disruptive uninstall-then-reinstall of the kernel driver. }
+function UsbipMissing: Boolean;
+begin
+  Result := not FileExists(ExpandConstant('{commonpf}\USBip\usbip.exe'));
+end;
+
+function HidHideMissing: Boolean;
+begin
+  Result := not FileExists(ExpandConstant('{commonpf}\Nefarius Software Solutions\HidHide\x64\HidHideCLI.exe'));
+end;
