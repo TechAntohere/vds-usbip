@@ -137,9 +137,13 @@ constexpr std::array<std::uint8_t, kSetStateSize> kInitialSetStateData{
     0x00,
     0x02,
     0x01,
+    // player_light byte: 0x04 = center LED = Player 1 (games override on
+    // their first output report). led_red/green/blue = 0 = lightbar off on
+    // connect (was 0xff,0xd7,0x00 = amber). allow_led_color +
+    // allow_player_indicators are already enabled in the flag bytes above.
+    0x04,
     0x00,
-    0xff,
-    0xd7,
+    0x00,
     0x00};
 
 constexpr DsState initial_ds_state() {
