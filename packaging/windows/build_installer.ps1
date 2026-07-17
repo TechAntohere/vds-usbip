@@ -4,6 +4,10 @@ param(
   [string]$OutputDir = "",
   [string]$ToolsDir = "",
   [string]$DriverPackageRoot = "",
+  # Optional: directory holding the published tray app (VdsTray.exe + assets\).
+  # When present, the installer offers an opt-out "Install the vDS tray app"
+  # checkbox. When absent, the tray is simply not part of the build.
+  [string]$TrayDir = "",
   [string]$PkgRel = "",
   [string]$Arch = "x64",
   [string]$Wix = ""
@@ -92,6 +96,51 @@ function Resolve-VdsToolsDir {
   }
 
   throw "tools directory was not found. Build vdsd.exe/vdsctl.exe first or pass -ToolsDir."
+}
+
+function Test-VdsTrayDir {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Path)) {
+    return $false
+  }
+
+  $RequiredFiles = @(
+    "VdsTray.exe",
+    "assets\dualsense.png",
+    "assets\dualsense_edge.png",
+    "assets\headphones.png",
+    "assets\mic.png",
+    "assets\battery.png"
+  )
+  foreach ($FileName in $RequiredFiles) {
+    if (!(Test-Path -LiteralPath (Join-Path $Path $FileName) -PathType Leaf)) {
+      return $false
+    }
+  }
+  return $true
+}
+
+# Resolve the published tray directory. Returns "" when the tray isn't available
+# (explicit -TrayDir that's incomplete throws; auto-discovery just opts out).
+function Resolve-VdsTrayDir {
+  if (![string]::IsNullOrWhiteSpace($TrayDir)) {
+    $Resolved = Resolve-VdsPath -Path $TrayDir
+    if (!(Test-VdsTrayDir -Path $Resolved)) {
+      throw "tray directory must contain VdsTray.exe and assets\*.png: $Resolved"
+    }
+    return $Resolved
+  }
+
+  $Candidate = Join-Path $RepoRoot "ui\VdsTray\bin\Release\net10.0-windows\win-x64\publish"
+  if (Test-VdsTrayDir -Path $Candidate) {
+    return Resolve-VdsPath -Path $Candidate
+  }
+
+  return ""
 }
 
 function Test-VdsDriverPackageRoot {
@@ -547,6 +596,7 @@ if ([string]::IsNullOrWhiteSpace($ResolvedDisplayVersion)) {
 $ResolvedWix = Resolve-Wix
 $ResolvedToolsDir = Resolve-VdsToolsDir
 $ResolvedDriverPackageRoot = Resolve-VdsDriverPackageRoot
+$ResolvedTrayDir = Resolve-VdsTrayDir
 
 $PackageFileNameArgs = @{
   Name = "vDSSetup"
@@ -621,18 +671,26 @@ Invoke-WixBuild `
 ) `
   -FailureMessage "wix filter driver MSI build failed"
 
-Invoke-WixBuild `
-  -Arguments @(
-  (Join-Path $WixDir "Product.wxs"),
+$MainMsiArguments = [System.Collections.Generic.List[string]]::new()
+$MainMsiArguments.Add((Join-Path $WixDir "Product.wxs"))
+$MainMsiArguments.AddRange([string[]]@(
   "-arch", $Arch,
   "-d", "VdsVersion=$ResolvedVersion",
   "-d", "VdsDisplayVersion=$ResolvedDisplayVersion",
   "-d", "LicenseRtf=$LicenseRtf",
   "-d", "ToolsDir=$ResolvedToolsDir",
   "-d", "SetupActions=$SetupActionsPath",
-  "-d", "UninstallRunner=$UninstallRunnerPath",
-  "-out", $MainMsiPath
-) `
+  "-d", "UninstallRunner=$UninstallRunnerPath"
+))
+# Only define TrayDir when a published tray is available; Product.wxs gates the
+# optional tray feature behind <?ifdef TrayDir?>.
+if (![string]::IsNullOrWhiteSpace($ResolvedTrayDir)) {
+  $MainMsiArguments.AddRange([string[]]@("-d", "TrayDir=$ResolvedTrayDir"))
+}
+$MainMsiArguments.AddRange([string[]]@("-out", $MainMsiPath))
+
+Invoke-WixBuild `
+  -Arguments $MainMsiArguments.ToArray() `
   -FailureMessage "wix main MSI build failed"
 
 New-SetupPayloadHeader `

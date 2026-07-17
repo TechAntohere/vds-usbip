@@ -9,6 +9,12 @@
     <Property Id="INSTALL_PATH" Value="1" Secure="yes"/>
     <Property Id="INSTALL_VDS_USB" Value="1"/>
     <Property Id="INSTALL_VDS_FILTER" Value="1"/>
+    <?ifdef TrayDir?>
+    <!-- Optional tray app (status widget). Default opt-out: no default value so
+         the ComponentsDlg checkbox starts unchecked. Only present when the build
+         was given a TrayDir (the published VdsTray). -->
+    <Property Id="INSTALL_TRAY" Secure="yes"/>
+    <?endif?>
     <Property Id="ADDLOCAL" Value="MainFeature" Secure="yes"/>
     <Property Id="REMOVE_PROGRAMDATA" Secure="yes"/>
     <Property Id="REINSTALL" Secure="yes"/>
@@ -42,6 +48,24 @@
           <Environment Id="env_machine_path" Name="Path" Value="[INSTALLFOLDER]" Action="set" Part="last" System="yes"/>
           <RegistryValue Root="HKLM" Key="Software\vDS\Setup" Name="PathEntry" Type="string" Value="1" KeyPath="yes"/>
         </Component>
+        <?ifdef TrayDir?>
+        <!-- Optional tray app: the self-contained VdsTray + its assets, plus a
+             per-machine logon autostart. Installed only when INSTALL_TRAY = 1.
+             vdsd already runs as a service, so the tray is a pure status UI. -->
+        <Component Id="cmp_vdstray_exe" Guid="{A1F3C2D4-5E6B-47A8-9C0D-1E2F3A4B5C6D}" Condition="INSTALL_TRAY = &quot;1&quot;">
+          <File Id="fil_vdstray_exe" Source="$(var.TrayDir)\VdsTray.exe" KeyPath="yes"/>
+          <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="VdsTray" Type="string" Value="&quot;[INSTALLFOLDER]VdsTray.exe&quot;"/>
+        </Component>
+        <Directory Id="dir_vdstray_assets" Name="assets">
+          <Component Id="cmp_vdstray_assets" Guid="{B2E4D3C5-6F7A-48B9-B0D1-2F3A4B5C6D7E}" Condition="INSTALL_TRAY = &quot;1&quot;">
+            <File Id="fil_asset_dualsense" Source="$(var.TrayDir)\assets\dualsense.png" KeyPath="yes"/>
+            <File Id="fil_asset_dualsense_edge" Source="$(var.TrayDir)\assets\dualsense_edge.png"/>
+            <File Id="fil_asset_headphones" Source="$(var.TrayDir)\assets\headphones.png"/>
+            <File Id="fil_asset_mic" Source="$(var.TrayDir)\assets\mic.png"/>
+            <File Id="fil_asset_battery" Source="$(var.TrayDir)\assets\battery.png"/>
+          </Component>
+        </Directory>
+        <?endif?>
       </Directory>
     </StandardDirectory>
     <Feature Id="MainFeature" Title="vDS" Level="1">
@@ -49,6 +73,10 @@
       <ComponentRef Id="cmp_vdsctl_exe"/>
       <ComponentRef Id="cmp_opus_dll"/>
       <ComponentRef Id="cmp_machine_path"/>
+      <?ifdef TrayDir?>
+      <ComponentRef Id="cmp_vdstray_exe"/>
+      <ComponentRef Id="cmp_vdstray_assets"/>
+      <?endif?>
     </Feature>
     <CustomAction Id="SetVdsRepair" Property="VDS_REPAIR" Value="1"/>
     <CustomAction Id="SetVdsRerunInstall" Property="VDS_RERUN_INSTALL" Value="1"/>
@@ -188,6 +216,9 @@
         <Control Id="VdsFilterDriver" Type="CheckBox" X="58" Y="180" Width="160" Height="18" CheckBoxValue="1" Property="INSTALL_VDS_FILTER" Disabled="yes" Text="vds_filter.sys"/>
         <Control Id="UserspaceDetails" Type="Text" X="244" Y="84" Width="104" Height="62" NoPrefix="yes" Text="Installs vdsd.exe, vdsctl.exe, the runtime DLL, and the vdsd Windows service."/>
         <Control Id="DriverDetails" Type="Text" X="244" Y="154" Width="104" Height="48" NoPrefix="yes" Text="Installs the required Windows kernel driver packages."/>
+        <?ifdef TrayDir?>
+        <Control Id="TrayApp" Type="CheckBox" X="25" Y="208" Width="330" Height="18" CheckBoxValue="1" Property="INSTALL_TRAY" Text="Install the vDS tray app (status widget: battery, polling rate, mic controls)"/>
+        <?endif?>
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0"/>
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="Back">
           <Publish Event="NewDialog" Value="WarningDlg"/>
