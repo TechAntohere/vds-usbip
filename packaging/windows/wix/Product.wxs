@@ -44,6 +44,25 @@
         <Component Id="cmp_opus_dll" Guid="{06CE51BC-AD78-46B4-AFAF-F52025B326F1}">
           <File Id="fil_opus_dll" Source="$(var.ToolsDir)\opus.dll" KeyPath="yes"/>
         </Component>
+        <?ifdef UsbipInstaller?>
+        <!-- DRAFT (USB/IP backend): bundle the signed usbip-win2 + HidHide
+             installers and the HidHide config script; run vdsd in usbip mode.
+             Replaces the test-signed vds_usb/vds_filter path. Needs maintainer
+             review + a build for validation (see notes at the bottom). -->
+        <Component Id="cmp_usbip_installer" Guid="{C3D5E6F7-8A9B-4C0D-A1E2-3F4A5B6C7D8E}">
+          <File Id="fil_usbip_installer" Source="$(var.UsbipInstaller)" KeyPath="yes"/>
+        </Component>
+        <Component Id="cmp_hidhide_installer" Guid="{D4E6F7A8-9B0C-4D1E-B2F3-4A5B6C7D8E9F}">
+          <File Id="fil_hidhide_installer" Source="$(var.HidHideInstaller)" KeyPath="yes"/>
+        </Component>
+        <Component Id="cmp_hidhide_setup" Guid="{E5F7A8B9-0C1D-4E2F-C3A4-5B6C7D8E9F0A}">
+          <File Id="fil_hidhide_setup" Source="$(var.HidHideSetup)" KeyPath="yes"/>
+        </Component>
+        <!-- Make the vdsd service use the USB/IP transport. -->
+        <Component Id="cmp_vdsd_usbip_env" Guid="{F6A8B9C0-1D2E-4F3A-D4B5-6C7D8E9F0A1B}">
+          <RegistryValue Root="HKLM" Key="SYSTEM\CurrentControlSet\Services\vdsd" Name="Environment" Type="multiString" Value="VDS_TRANSPORT=usbip" KeyPath="yes"/>
+        </Component>
+        <?endif?>
         <Component Id="cmp_machine_path" Guid="{BF2684F5-F63B-4EB6-90A0-8A9F9A0E14FD}" Condition="INSTALL_PATH = &quot;1&quot;">
           <Environment Id="env_machine_path" Name="Path" Value="[INSTALLFOLDER]" Action="set" Part="last" System="yes"/>
           <RegistryValue Root="HKLM" Key="Software\vDS\Setup" Name="PathEntry" Type="string" Value="1" KeyPath="yes"/>
@@ -73,6 +92,12 @@
       <ComponentRef Id="cmp_vdsctl_exe"/>
       <ComponentRef Id="cmp_opus_dll"/>
       <ComponentRef Id="cmp_machine_path"/>
+      <?ifdef UsbipInstaller?>
+      <ComponentRef Id="cmp_usbip_installer"/>
+      <ComponentRef Id="cmp_hidhide_installer"/>
+      <ComponentRef Id="cmp_hidhide_setup"/>
+      <ComponentRef Id="cmp_vdsd_usbip_env"/>
+      <?endif?>
       <?ifdef TrayDir?>
       <ComponentRef Id="cmp_vdstray_exe"/>
       <ComponentRef Id="cmp_vdstray_assets"/>
@@ -98,8 +123,19 @@
     <CustomAction Id="RemoveVdsRegistry" BinaryRef="bin_setup_actions" DllEntry="RemoveVdsRegistry" Execute="deferred" Return="ignore" Impersonate="no"/>
     <Binary Id="bin_uninstall_runner" SourceFile="$(var.UninstallRunner)"/>
     <CustomAction Id="UninstallExistingInstall" BinaryRef="bin_uninstall_runner" ExeCommand="[ProductCode]" Execute="deferred" Return="ignore" Impersonate="no"/>
+    <?ifdef UsbipInstaller?>
+    <!-- DRAFT USB/IP backend install steps. -->
+    <CustomAction Id="ca_install_usbip" FileRef="fil_usbip_installer" ExeCommand="/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" Execute="deferred" Impersonate="no" Return="ignore"/>
+    <CustomAction Id="ca_install_hidhide" FileRef="fil_hidhide_installer" ExeCommand="/exenoui /qn" Execute="deferred" Impersonate="no" Return="ignore"/>
+    <CustomAction Id="ca_config_hidhide" Directory="INSTALLFOLDER" ExeCommand="powershell.exe -ExecutionPolicy Bypass -File &quot;hidhide_setup.ps1&quot;" Execute="deferred" Impersonate="no" Return="ignore"/>
+    <?endif?>
     <InstallExecuteSequence>
       <Custom Action="SetVdsExecuteRepair" Before="CostFinalize" Condition="Installed AND REINSTALL"/>
+      <?ifdef UsbipInstaller?>
+      <Custom Action="ca_install_usbip" After="InstallFiles" Condition="NOT Installed OR VDS_REPAIR = &quot;1&quot;"/>
+      <Custom Action="ca_install_hidhide" After="ca_install_usbip" Condition="NOT Installed OR VDS_REPAIR = &quot;1&quot;"/>
+      <Custom Action="ca_config_hidhide" After="InstallServices" Condition="NOT Installed OR VDS_REPAIR = &quot;1&quot;"/>
+      <?endif?>
       <Custom Action="UninstallExistingInstall" After="InstallInitialize" Condition="VDS_EXPLICIT_UNINSTALL = &quot;1&quot; OR VDS_RERUN_INSTALL = &quot;1&quot; OR (REMOVE &lt;&gt; &quot;ALL&quot; AND NOT Installed)"/>
       <Custom Action="ClearPathMarker" After="InstallServices" Condition="(NOT Installed OR VDS_REPAIR = &quot;1&quot;) AND INSTALL_PATH &lt;&gt; &quot;1&quot;"/>
       <Custom Action="UpdateDisplayVersion" After="InstallFinalize" Condition="REMOVE &lt;&gt; &quot;ALL&quot;"/>

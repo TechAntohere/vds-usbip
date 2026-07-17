@@ -8,6 +8,12 @@ param(
   # When present, the installer offers an opt-out "Install the vDS tray app"
   # checkbox. When absent, the tray is simply not part of the build.
   [string]$TrayDir = "",
+  # Optional USB/IP backend: paths to the signed usbip-win2 + HidHide installers.
+  # When both are provided, the installer installs the usbip-win2 + HidHide stack
+  # (WHLK-signed, no test-signing) and runs vdsd in usbip transport mode, instead
+  # of the custom test-signed vds_usb/vds_filter drivers. See DRAFT notes below.
+  [string]$UsbipInstaller = "",
+  [string]$HidHideInstaller = "",
   [string]$PkgRel = "",
   [string]$Arch = "x64",
   [string]$Wix = ""
@@ -597,6 +603,11 @@ $ResolvedWix = Resolve-Wix
 $ResolvedToolsDir = Resolve-VdsToolsDir
 $ResolvedDriverPackageRoot = Resolve-VdsDriverPackageRoot
 $ResolvedTrayDir = Resolve-VdsTrayDir
+# USB/IP backend (optional). Both installers must be provided to enable it.
+$ResolvedUsbipInstaller = if (![string]::IsNullOrWhiteSpace($UsbipInstaller)) { Resolve-VdsPath -Path $UsbipInstaller } else { "" }
+$ResolvedHidHideInstaller = if (![string]::IsNullOrWhiteSpace($HidHideInstaller)) { Resolve-VdsPath -Path $HidHideInstaller } else { "" }
+$HidHideSetupPath = Join-Path $RepoRoot "hidhide_setup.ps1"
+$UsbipBackend = (![string]::IsNullOrWhiteSpace($ResolvedUsbipInstaller)) -and (![string]::IsNullOrWhiteSpace($ResolvedHidHideInstaller))
 
 $PackageFileNameArgs = @{
   Name = "vDSSetup"
@@ -686,6 +697,16 @@ $MainMsiArguments.AddRange([string[]]@(
 # optional tray feature behind <?ifdef TrayDir?>.
 if (![string]::IsNullOrWhiteSpace($ResolvedTrayDir)) {
   $MainMsiArguments.AddRange([string[]]@("-d", "TrayDir=$ResolvedTrayDir"))
+}
+# USB/IP backend: define UsbipInstaller/HidHideInstaller/HidHideSetup so
+# Product.wxs (<?ifdef UsbipInstaller?>) installs the signed usbip-win2 + HidHide
+# stack and runs vdsd in usbip mode instead of the test-signed custom drivers.
+if ($UsbipBackend) {
+  $MainMsiArguments.AddRange([string[]]@(
+    "-d", "UsbipInstaller=$ResolvedUsbipInstaller",
+    "-d", "HidHideInstaller=$ResolvedHidHideInstaller",
+    "-d", "HidHideSetup=$HidHideSetupPath"
+  ))
 }
 $MainMsiArguments.AddRange([string[]]@("-out", $MainMsiPath))
 

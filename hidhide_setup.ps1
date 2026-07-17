@@ -4,7 +4,9 @@
 # every Bluetooth-attached DualSense gaming device, and enables cloaking.
 # Idempotent. Requires HidHide to be installed.
 param(
-  [string]$VdsdPath = 'C:\Users\Antonio\Documents\vds\build\vdsd.exe',
+  # Defaults to vdsd.exe next to this script (the installed layout); callers can
+  # override for a dev build tree.
+  [string]$VdsdPath = (Join-Path $PSScriptRoot 'vdsd.exe'),
   [string]$Cli = 'C:\Program Files\Nefarius Software Solutions\HidHide\x64\HidHideCLI.exe'
 )
 $ErrorActionPreference = 'Stop'

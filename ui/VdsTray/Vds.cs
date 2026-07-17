@@ -137,13 +137,32 @@ internal static class Vds
 
     // --- Bridge management (single-manager app) ------------------------------
 
+    /// <summary>True when vdsd is installed as a Windows service (the upstream
+    /// WiX installer). In that mode the service and its kernel driver own bridge
+    /// bring-up, so the tray is a pure status UI: it must NOT start vdsd or run
+    /// usbip attach. In the standalone USB/IP install there is no vdsd service,
+    /// so the tray manages bring-up itself. Detected once via the service key.</summary>
+    public static bool ServiceManaged { get; } = DetectServiceManaged();
+
+    private static bool DetectServiceManaged()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine
+                .OpenSubKey(@"SYSTEM\CurrentControlSet\Services\vdsd");
+            return key?.GetValue("ImagePath") != null;
+        }
+        catch { return false; }
+    }
+
     public static bool VdsdRunning() =>
         Process.GetProcessesByName("vdsd").Length > 0;
 
-    /// <summary>Start vdsd (USB/IP transport) hidden if not already running.</summary>
+    /// <summary>Start vdsd (USB/IP transport) hidden if not already running.
+    /// No-op when a vdsd service manages the bridge.</summary>
     public static void EnsureVdsd()
     {
-        if (VdsdRunning()) return;
+        if (ServiceManaged || VdsdRunning()) return;
         try
         {
             var psi = new ProcessStartInfo
@@ -159,9 +178,11 @@ internal static class Vds
         catch { }
     }
 
-    /// <summary>Attach the virtual device if not already imported.</summary>
+    /// <summary>Attach the virtual device if not already imported. No-op when a
+    /// vdsd service manages the bridge (its driver provides the device, not usbip).</summary>
     public static void EnsureAttached()
     {
+        if (ServiceManaged) return;
         string port = Run(Paths.Usbip, "port");
         if (port.Contains("127.0.0.1:3240")) return;
         Run(Paths.Usbip, $"attach -r 127.0.0.1 -b {Paths.BusId}", timeoutMs: 8000);
