@@ -40,10 +40,11 @@ UninstallDisplayName=vDS (DualSense over USB/IP)
 [Files]
 Source: "{#BuildDir}\vdsd.exe";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\vdsctl.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#PublishDir}\VdsTray.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#PublishDir}\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PublishDir}\VdsTray.exe"; DestDir: "{app}"; Flags: ignoreversion; Tasks: traytask
+Source: "{#PublishDir}\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs; Tasks: traytask
 Source: "..\hidhide_setup.ps1";    DestDir: "{app}"; Flags: ignoreversion
 Source: "..\hidhide_teardown.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\bringup.ps1";          DestDir: "{app}"; Flags: ignoreversion; Check: not WillInstallTray
 #if FileExists(AddBackslash(SourcePath) + UsbipExe)
 Source: "{#UsbipExe}";  DestDir: "{tmp}"; DestName: "usbip-win2.exe"; Flags: deleteafterinstall; Check: UsbipMissing
 #endif
@@ -52,19 +53,25 @@ Source: "{#HidHideExe}"; DestDir: "{tmp}"; DestName: "HidHide.exe"; Flags: delet
 #endif
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
+Name: "traytask"; Description: "Install the vDS tray app (status widget, battery %, mic controls)"; GroupDescription: "Optional components:"
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Optional components:"; Flags: unchecked
 
 [Icons]
-; Manual launch entries (the tray app starts the bridge).
-Name: "{group}\vDS";           Filename: "{app}\VdsTray.exe"; Comment: "Start vDS (DualSense over USB/IP)"
+; Manual launch entries (only when the tray app is installed).
+Name: "{group}\vDS";           Filename: "{app}\VdsTray.exe"; Comment: "Start vDS (DualSense over USB/IP)"; Tasks: traytask
 Name: "{group}\Uninstall vDS"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\vDS";     Filename: "{app}\VdsTray.exe"; Tasks: desktopicon
+Name: "{autodesktop}\vDS";     Filename: "{app}\VdsTray.exe"; Tasks: traytask desktopicon
 
 [Registry]
-; Launch the tray app (which starts the bridge) at logon.
+; Tray installed: launch the tray (which brings up the bridge) at logon.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
   ValueType: string; ValueName: "VdsTray"; ValueData: """{app}\VdsTray.exe"""; \
-  Flags: uninsdeletevalue
+  Flags: uninsdeletevalue; Tasks: traytask
+; Tray NOT installed: bring the bridge up headlessly at logon.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
+  ValueType: string; ValueName: "VdsBridge"; \
+  ValueData: "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\bringup.ps1"""; \
+  Flags: uninsdeletevalue; Check: not WillInstallTray
 
 [Run]
 #if FileExists(AddBackslash(SourcePath) + UsbipExe)
@@ -79,9 +86,13 @@ Filename: "{tmp}\HidHide.exe"; Parameters: "/exenoui /qn"; \
 Filename: "powershell.exe"; \
   Parameters: "-ExecutionPolicy Bypass -File ""{app}\hidhide_setup.ps1"" -VdsdPath ""{app}\vdsd.exe"""; \
   StatusMsg: "Configuring controller hiding..."; Flags: runhidden waituntilterminated
-; Launch now.
+; Tray NOT installed: start the bridge now (best-effort; the logon entry covers reboots).
+Filename: "powershell.exe"; \
+  Parameters: "-WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\bringup.ps1"""; \
+  Flags: runhidden nowait; Check: not WillInstallTray
+; Tray installed: launch it now.
 Filename: "{app}\VdsTray.exe"; Description: "Launch vDS now"; \
-  Flags: nowait postinstall skipifsilent
+  Flags: nowait postinstall skipifsilent; Tasks: traytask
 
 [UninstallRun]
 Filename: "powershell.exe"; \
@@ -91,6 +102,13 @@ Filename: "taskkill.exe"; Parameters: "/IM VdsTray.exe /F"; Flags: runhidden; Ru
 Filename: "taskkill.exe"; Parameters: "/IM vdsd.exe /F"; Flags: runhidden; RunOnceId: "KillVdsd"
 
 [Code]
+{ Whether the user opted to install the tray app. When false, the installer
+  wires up a headless logon bring-up (bringup.ps1) instead. }
+function WillInstallTray: Boolean;
+begin
+  Result := WizardIsTaskSelected('traytask');
+end;
+
 { Skip a bundled driver install if that driver is already present, so re-running
   the setup on a machine that already has usbip-win2 / HidHide doesn't trigger a
   disruptive uninstall-then-reinstall of the kernel driver. }
