@@ -6,7 +6,7 @@
 ; (run from this folder)
 
 #define AppName "vDS"
-#define AppVersion "0.2.0"
+#define AppVersion "0.2.1"
 #define AppPublisher "vDS"
 #define BuildDir "..\build"
 #define PublishDir "..\ui\VdsTray\bin\Release\net10.0-windows\win-x64\publish"
@@ -18,6 +18,9 @@
 ; usbip-win2 is an Inno Setup installer; HidHide is an Advanced Installer.
 #define UsbipExe "redist\usbip-win2.exe"
 #define HidHideExe "redist\HidHide.exe"
+; Visual C++ 2015-2022 x64 runtime (vdsd + opus.dll need it). Drop the official
+; redist\vc_redist.x64.exe here (from aka.ms/vs/17/release/vc_redist.x64.exe).
+#define VcRedistExe "redist\vc_redist.x64.exe"
 
 [Setup]
 AppId={{7C2B9E4A-9E2F-4B7C-9C1E-VDS0DUALSENSE}}
@@ -40,6 +43,9 @@ UninstallDisplayName=vDS (DualSense over USB/IP)
 [Files]
 Source: "{#BuildDir}\vdsd.exe";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\vdsctl.exe"; DestDir: "{app}"; Flags: ignoreversion
+; opus.dll is a runtime dependency of vdsd -- the DualSense speaker audio is
+; Opus-encoded. Without it vdsd cannot start on a machine that lacks it.
+Source: "{#BuildDir}\opus.dll";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PublishDir}\VdsTray.exe"; DestDir: "{app}"; Flags: ignoreversion; Tasks: traytask
 Source: "{#PublishDir}\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs; Tasks: traytask
 Source: "..\hidhide_setup.ps1";    DestDir: "{app}"; Flags: ignoreversion
@@ -50,6 +56,9 @@ Source: "{#UsbipExe}";  DestDir: "{tmp}"; DestName: "usbip-win2.exe"; Flags: del
 #endif
 #if FileExists(AddBackslash(SourcePath) + HidHideExe)
 Source: "{#HidHideExe}"; DestDir: "{tmp}"; DestName: "HidHide.exe"; Flags: deleteafterinstall; Check: HidHideMissing
+#endif
+#if FileExists(AddBackslash(SourcePath) + VcRedistExe)
+Source: "{#VcRedistExe}"; DestDir: "{tmp}"; DestName: "vc_redist.x64.exe"; Flags: deleteafterinstall; Check: VcRedistMissing
 #endif
 
 [Tasks]
@@ -74,6 +83,11 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
   Flags: uninsdeletevalue; Check: not WillInstallTray
 
 [Run]
+; Visual C++ runtime first -- vdsd + opus.dll depend on it.
+#if FileExists(AddBackslash(SourcePath) + VcRedistExe)
+Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; \
+  StatusMsg: "Installing Visual C++ runtime..."; Flags: waituntilterminated; Check: VcRedistMissing
+#endif
 #if FileExists(AddBackslash(SourcePath) + UsbipExe)
 Filename: "{tmp}\usbip-win2.exe"; Parameters: "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"; \
   StatusMsg: "Installing USB/IP driver..."; Flags: waituntilterminated; Check: UsbipMissing
@@ -120,6 +134,18 @@ end;
 function HidHideMissing: Boolean;
 begin
   Result := not FileExists(ExpandConstant('{commonpf}\Nefarius Software Solutions\HidHide\x64\HidHideCLI.exe'));
+end;
+
+{ True when the Visual C++ 2015-2022 x64 runtime isn't registered. The redist is
+  idempotent, so a false "missing" just triggers a quick no-op reinstall. }
+function VcRedistMissing: Boolean;
+var v: Cardinal;
+begin
+  Result := True;
+  if RegQueryDWordValue(HKLM, 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64', 'Installed', v) and (v = 1) then
+    Result := False;
+  if Result and RegQueryDWordValue(HKLM, 'SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64', 'Installed', v) and (v = 1) then
+    Result := False;
 end;
 
 { Stop a running tray/bridge before copying files (avoid locked binaries). When a
