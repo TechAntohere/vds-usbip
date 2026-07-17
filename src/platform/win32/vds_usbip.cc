@@ -767,7 +767,6 @@ void VirtualPort::Impl::handle_import_session(SOCKET client) {
   while (!stop_requested.load()) {
     UsbipCmdSubmit cmd{};
     if (!recv_exact(client, &cmd, sizeof(cmd))) {
-      if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_cmd_debug.log", "a")) { std::fprintf(dbg, "BREAK: recv header failed\n"); std::fclose(dbg); }
       break;
     }
     cmd.base.command = ntoh32(cmd.base.command);
@@ -809,7 +808,6 @@ void VirtualPort::Impl::handle_import_session(SOCKET client) {
       continue;
     }
     if (cmd.base.command != kCmdSubmit) {
-      if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_cmd_debug.log", "a")) { std::fprintf(dbg, "BREAK: unexpected command\n"); std::fclose(dbg); }
       break;
     }
 
@@ -835,7 +833,6 @@ void VirtualPort::Impl::handle_import_session(SOCKET client) {
     if (cmd.base.direction == kDirOut && cmd.transfer_buffer_length > 0) {
       out_data.resize(static_cast<std::size_t>(cmd.transfer_buffer_length));
       if (!recv_exact(client, out_data.data(), out_data.size())) {
-        if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_cmd_debug.log", "a")) { std::fprintf(dbg, "BREAK: recv out_data failed\n"); std::fclose(dbg); }
         break;
       }
     }
@@ -843,7 +840,6 @@ void VirtualPort::Impl::handle_import_session(SOCKET client) {
       iso_descriptors.resize(static_cast<std::size_t>(cmd.number_of_packets));
       if (!recv_exact(client, iso_descriptors.data(),
                       iso_descriptors.size() * sizeof(UsbipIsoPacketDescriptor))) {
-        if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_cmd_debug.log", "a")) { std::fprintf(dbg, "BREAK: recv iso descriptors failed\n"); std::fclose(dbg); }
         break;
       }
       // recv_exact() above copies the raw wire bytes verbatim -- these
@@ -860,14 +856,9 @@ void VirtualPort::Impl::handle_import_session(SOCKET client) {
 
     try {
       if (!handle_cmd_submit(client, cmd, out_data, iso_scratch, iso_descriptors)) {
-        if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_cmd_debug.log", "a")) { std::fprintf(dbg, "BREAK: handle_cmd_submit failed\n"); std::fclose(dbg); }
         break;
       }
-    } catch (const std::exception &ex) {
-      if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_cmd_debug.log", "a")) {
-        std::fprintf(dbg, "BREAK: handle_cmd_submit threw: %s\n", ex.what());
-        std::fclose(dbg);
-      }
+    } catch (const std::exception &) {
       break;
     }
   }
@@ -1413,11 +1404,9 @@ bool VirtualPort::Impl::handle_cmd_submit(SOCKET client, const UsbipCmdSubmit &c
 
   std::lock_guard<std::mutex> send_guard(socket_send_mutex);
   if (!send_exact(client, &ret, sizeof(ret))) {
-    if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_cmd_debug.log", "a")) { std::fprintf(dbg, "BREAK: send ret header failed seqnum=%u ep=%u\n", cmd.base.seqnum, cmd.base.ep); std::fclose(dbg); }
     return false;
   }
   if (!reply_data.empty() && !send_exact(client, reply_data.data(), reply_data.size())) {
-    if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_cmd_debug.log", "a")) { std::fprintf(dbg, "BREAK: send reply_data failed seqnum=%u ep=%u len=%zu\n", cmd.base.seqnum, cmd.base.ep, reply_data.size()); std::fclose(dbg); }
     return false;
   }
   if (cmd.number_of_packets > 0) {
@@ -1427,7 +1416,6 @@ bool VirtualPort::Impl::handle_cmd_submit(SOCKET client, const UsbipCmdSubmit &c
     if (!reply_iso.empty() &&
         !send_exact(client, reply_iso.data(),
                     reply_iso.size() * sizeof(UsbipIsoPacketDescriptor))) {
-      if (FILE *dbg = std::fopen("C:\\\\ProgramData\\\\vDS\\\\usbip_cmd_debug.log", "a")) { std::fprintf(dbg, "BREAK: send reply_iso failed seqnum=%u ep=%u npkts=%zu\n", cmd.base.seqnum, cmd.base.ep, reply_iso.size()); std::fclose(dbg); }
       return false;
     }
   }

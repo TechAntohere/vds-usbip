@@ -1084,15 +1084,7 @@ std::vector<HidBluetoothDevice> list_hid_bluetooth_devices() {
     }
     const std::string device_path = detail->DevicePath;
 
-    if (FILE *dbg = std::fopen("C:\\ProgramData\\vDS\\hid_discover_debug.log", "a")) {
-      std::fprintf(dbg, "candidate path=%s\n", device_path.c_str());
-      std::fclose(dbg);
-    }
     if (!hid_device_path_matches(device_path, std::string{}, true)) {
-      if (FILE *dbg = std::fopen("C:\\ProgramData\\vDS\\hid_discover_debug.log", "a")) {
-        std::fprintf(dbg, "  -> rejected by hid_device_path_matches\n");
-        std::fclose(dbg);
-      }
       continue;
     }
 
@@ -1100,19 +1092,11 @@ std::vector<HidBluetoothDevice> list_hid_bluetooth_devices() {
         device_path.c_str(), 0, kDeviceShareMode, nullptr, OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL, nullptr));
     if (!query_handle) {
-      if (FILE *dbg = std::fopen("C:\\ProgramData\\vDS\\hid_discover_debug.log", "a")) {
-        std::fprintf(dbg, "  -> CreateFileA failed err=%lu\n", GetLastError());
-        std::fclose(dbg);
-      }
       continue;
     }
     HIDD_ATTRIBUTES attributes{};
     attributes.Size = sizeof(attributes);
     if (!HidD_GetAttributes(query_handle.get(), &attributes)) {
-      if (FILE *dbg = std::fopen("C:\\ProgramData\\vDS\\hid_discover_debug.log", "a")) {
-        std::fprintf(dbg, "  -> HidD_GetAttributes failed\n");
-        std::fclose(dbg);
-      }
       continue;
     }
 
@@ -1125,15 +1109,7 @@ std::vector<HidBluetoothDevice> list_hid_bluetooth_devices() {
       address = extract_bluetooth_address_from_devinst(devinfo_data.DevInst);
     }
     if (!address) {
-      if (FILE *dbg = std::fopen("C:\\ProgramData\\vDS\\hid_discover_debug.log", "a")) {
-        std::fprintf(dbg, "  -> address extraction failed vid=0x%04x pid=0x%04x\n", attributes.VendorID, attributes.ProductID);
-        std::fclose(dbg);
-      }
       continue;
-    }
-    if (FILE *dbg = std::fopen("C:\\ProgramData\\vDS\\hid_discover_debug.log", "a")) {
-      std::fprintf(dbg, "  -> SUCCESS address=%s vid=0x%04x pid=0x%04x\n", address->c_str(), attributes.VendorID, attributes.ProductID);
-      std::fclose(dbg);
     }
     // Extraction yields a compact 12-hex address; the rest of vds (config
     // parsing, control-pipe JSON) expects canonical colon-separated form.
