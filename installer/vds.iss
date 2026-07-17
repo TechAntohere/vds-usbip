@@ -6,7 +6,7 @@
 ; (run from this folder)
 
 #define AppName "vDS"
-#define AppVersion "0.1.0"
+#define AppVersion "0.2.0"
 #define AppPublisher "vDS"
 #define BuildDir "..\build"
 #define PublishDir "..\ui\VdsTray\bin\Release\net10.0-windows\win-x64\publish"
