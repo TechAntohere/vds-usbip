@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <unordered_map>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -471,18 +472,68 @@ private:
 
     HIDP_CAPS caps{};
     const NTSTATUS status = HidP_GetCaps(preparsed, &caps);
-    HidD_FreePreparsedData(preparsed);
     if (status != HIDP_STATUS_SUCCESS) {
+      HidD_FreePreparsedData(preparsed);
       throw std::runtime_error("HidP_GetCaps failed for " + path_);
     }
     input_report_length_ = caps.InputReportByteLength;
     output_report_length_ = caps.OutputReportByteLength;
     feature_report_length_ = caps.FeatureReportByteLength;
+
+    // Per-report feature lengths. HidD_SetFeature requires the buffer to be the
+    // *specific* report's byte length, not the max (caps.FeatureReportByteLength)
+    // -- some devices (e.g. the DualSense command channel, report 0x80) reject a
+    // max-sized buffer with ERROR_INVALID_PARAMETER. Sum each report's value +
+    // button caps' bits and round up to bytes (+1 for the report-id prefix).
+    feature_report_lengths_.clear();
+    {
+      std::unordered_map<std::uint8_t, std::size_t> report_bits;
+      if (caps.NumberFeatureValueCaps > 0) {
+        USHORT n = caps.NumberFeatureValueCaps;
+        std::vector<HIDP_VALUE_CAPS> vc(n);
+        if (HidP_GetValueCaps(HidP_Feature, vc.data(), &n, preparsed) ==
+            HIDP_STATUS_SUCCESS) {
+          for (USHORT i = 0; i < n; ++i) {
+            report_bits[static_cast<std::uint8_t>(vc[i].ReportID)] +=
+                static_cast<std::size_t>(vc[i].BitSize) * vc[i].ReportCount;
+          }
+        }
+      }
+      if (caps.NumberFeatureButtonCaps > 0) {
+        USHORT n = caps.NumberFeatureButtonCaps;
+        std::vector<HIDP_BUTTON_CAPS> bc(n);
+        if (HidP_GetButtonCaps(HidP_Feature, bc.data(), &n, preparsed) ==
+            HIDP_STATUS_SUCCESS) {
+          for (USHORT i = 0; i < n; ++i) {
+            const std::size_t count =
+                bc[i].IsRange
+                    ? static_cast<std::size_t>(bc[i].Range.UsageMax -
+                                               bc[i].Range.UsageMin + 1)
+                    : 1u;
+            report_bits[static_cast<std::uint8_t>(bc[i].ReportID)] += count;
+          }
+        }
+      }
+      for (const auto &[id, bits] : report_bits) {
+        feature_report_lengths_[id] =
+            static_cast<USHORT>(1 + (bits + 7) / 8);
+      }
+    }
+    HidD_FreePreparsedData(preparsed);
     if (input_report_length_ == 0 || output_report_length_ == 0 ||
         feature_report_length_ == 0) {
       throw std::runtime_error("HID device has incomplete report caps: " +
                                path_);
     }
+  }
+
+  // Exact byte length for a specific feature report id (falls back to the max).
+  USHORT feature_length_for(std::uint8_t report_id) const {
+    const auto it = feature_report_lengths_.find(report_id);
+    if (it != feature_report_lengths_.end() && it->second > 0) {
+      return it->second;
+    }
+    return feature_report_length_;
   }
 
   DWORD overlapped_io(HANDLE handle, bool write, std::uint8_t *data,
@@ -628,13 +679,14 @@ private:
     if (report.empty()) {
       throw std::runtime_error("empty HID feature report");
     }
-    if (report.size() > feature_report_length_) {
+    const USHORT report_len = feature_length_for(report[0]);
+    if (report.size() > report_len) {
       throw std::runtime_error(
           "HID feature report too large: " + std::to_string(report.size()) +
-          " > " + std::to_string(feature_report_length_));
+          " > " + std::to_string(report_len));
     }
 
-    std::vector<std::uint8_t> buffer(feature_report_length_);
+    std::vector<std::uint8_t> buffer(report_len);
     std::copy(report.begin(), report.end(), buffer.begin());
     fill_feature_report_checksum(buffer);
     if (!HidD_SetFeature(feature_handle_.get(), buffer.data(),
@@ -643,6 +695,10 @@ private:
           "HidD_SetFeature report=" + std::to_string(buffer[0]) +
           " failed: " + win32_error_message(GetLastError()));
     }
+  }
+
+  std::size_t feature_report_length() const override {
+    return feature_report_length_;
   }
 
   QueuedOutputWrite make_output_write(std::span<const std::uint8_t> report) {
@@ -804,6 +860,7 @@ private:
   USHORT input_report_length_ = 0;
   USHORT output_report_length_ = 0;
   USHORT feature_report_length_ = 0;
+  std::unordered_map<std::uint8_t, USHORT> feature_report_lengths_;
   std::mutex queue_mutex_;
   std::deque<Frame> queued_frames_;
   std::uint64_t sequence_ = 0;

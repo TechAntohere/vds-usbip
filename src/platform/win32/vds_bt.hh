@@ -26,6 +26,9 @@ public:
     return std::nullopt;
   }
   virtual void write_feature_report(std::span<const std::uint8_t> report) = 0;
+  // Full HID feature-report byte length (caps.FeatureReportByteLength), 0 if
+  // unknown. Needed to build fixed-length command-channel reports (0x80).
+  virtual std::size_t feature_report_length() const { return 0; }
   virtual void write_interrupt_packet(std::span<const std::uint8_t> packet) = 0;
   virtual bool
   try_write_interrupt_packet(std::span<const std::uint8_t> packet) = 0;

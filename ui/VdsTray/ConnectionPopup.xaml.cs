@@ -77,7 +77,14 @@ public partial class ConnectionPopup : Window
         }
 
         PollingValue.Text = s.PollingHz > 0 ? $"{s.PollingHz} Hz" : "—";
-        ColorValue.Text = "White"; // TODO: real color via command-protocol
+        ColorValue.Text = string.IsNullOrEmpty(s.Color) || s.Color == "unknown"
+            ? "Unknown" : s.Color;
+
+        // Model: title + controller art. Prefer an Edge-specific asset when it
+        // exists, else fall back to the standard DualSense art.
+        TitleText.Text = s.IsEdge ? "DualSense Edge" : "Dualsense";
+        ControllerImage.Source =
+            (s.IsEdge ? Load("dualsense_edge.png") : null) ?? Load("dualsense.png");
 
         // Headphones "on" = 3.5mm jack present. Mic "on" = not muted (the
         // mute button toggles this; "recording active" almost never fires).

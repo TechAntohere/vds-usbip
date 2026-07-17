@@ -449,6 +449,8 @@ struct WorkerStatus {
   // Controller color code (2 ASCII chars packed: (c0<<8)|c1), -1 = unknown.
   // Read once on connect from the DualSense serial number.
   std::atomic<int> color_code{-1};
+  // Controller model: true = DualSense Edge, false = standard DualSense.
+  std::atomic_bool is_edge{false};
   // UI -> session mic mute request: -1 none, 0 unmute, 1 mute. The bridge's
   // input thread consumes it (applies to state.mic_muted + sends the BT mic
   // state report) then resets to -1.
@@ -2383,35 +2385,71 @@ bool usbip_transport_enabled() {
 // any failure just yields unknown. Layout matches HidD_GetFeature: byte 0 =
 // report id, 1 = deviceId, 2 = actionId, 3 = status, 4.. = serial; the color
 // code is serial chars 4-5 (bytes 8-9).
+// Diagnostic logging for the color read, off unless VDS_COLOR_PROBE is set.
+bool color_probe_logging() {
+  static const bool enabled = [] {
+    char buf[8]{};
+    return GetEnvironmentVariableA("VDS_COLOR_PROBE", buf, sizeof(buf)) > 0;
+  }();
+  return enabled;
+}
+
 int read_controller_color(BluetoothTransport &bluetooth, std::mutex &bt_mutex) {
   constexpr std::uint8_t kCmdReport = 0x80;
   constexpr std::uint8_t kRespReport = 0x81;
   constexpr std::uint8_t kDeviceSystem = 1;
   constexpr std::uint8_t kActionReadSerial = 19;
-  // NOTE: the DualSense command channel (0x80 request / 0x81 response) does
-  // not work over Bluetooth through this HID feature interface -- HidD_SetFeature
-  // for report 0x80 returns ERROR_INVALID_PARAMETER (the same gap that leaves
-  // daidr's serial/PCBA fields blank through vds; WebHID reaches it a different
-  // way). So this currently yields -1 (unknown color). Kept as best-effort so
-  // it lights up automatically if/when the command channel is bridged.
+  // Read the controller color from the factory serial via the DualSense command
+  // channel: send report 0x80 [deviceId=SYSTEM, actionId=READ_SERIAL_NUMBER],
+  // poll report 0x81 for the matching reply, and take the 2-char color code at
+  // serial offset 4-5 (reply bytes 8-9). Matches daidr/dualsense-tester. The BT
+  // feature CRC is added by write_feature_report. Best-effort; -1 = unknown.
+  auto probe = [](const std::string &m) {
+    if (!color_probe_logging()) return;
+    if (FILE *f = std::fopen("C:\\ProgramData\\vDS\\color_probe.log", "a")) {
+      std::fprintf(f, "%s\n", m.c_str());
+      std::fclose(f);
+    }
+  };
   try {
+    probe("frbl=" + std::to_string(bluetooth.feature_report_length()));
     {
       std::lock_guard guard(bt_mutex);
       const std::array<std::uint8_t, 3> cmd{kCmdReport, kDeviceSystem,
                                             kActionReadSerial};
-      bluetooth.write_feature_report(cmd);
+      try {
+        bluetooth.write_feature_report(cmd);
+        probe("write 0x80 ok");
+      } catch (const std::exception &e) {
+        probe(std::string("write 0x80 threw: ") + e.what());
+        throw;
+      }
     }
     for (int attempt = 0; attempt < 12; ++attempt) {
       std::this_thread::sleep_for(std::chrono::milliseconds(8));
       std::optional<std::vector<std::uint8_t>> resp;
       {
         std::lock_guard guard(bt_mutex);
-        resp = bluetooth.read_feature_report(kRespReport);
+        try {
+          resp = bluetooth.read_feature_report(kRespReport);
+        } catch (const std::exception &e) {
+          probe(std::string("read 0x81 threw: ") + e.what());
+          continue;
+        }
       }
       if (!resp || resp->size() < 10) {
+        probe("resp short/none sz=" +
+              std::to_string(resp ? resp->size() : 0));
         continue;
       }
       const auto &r = *resp;
+      {
+        char b[80];
+        std::snprintf(b, sizeof(b),
+                      "0x81 hdr=[%02x %02x %02x %02x] code=[%02x %02x]", r[0],
+                      r[1], r[2], r[3], r[8], r[9]);
+        probe(b);
+      }
       if (r[0] == kRespReport && r[1] == kDeviceSystem &&
           r[2] == kActionReadSerial) {
         const std::uint8_t c0 = r[8];
@@ -2426,6 +2464,30 @@ int read_controller_color(BluetoothTransport &bluetooth, std::mutex &bt_mutex) {
     // best-effort; unknown color on any failure
   }
   return -1;
+}
+
+// Map a packed 2-char color code (from read_controller_color) to a human name.
+// Codes/names mirror daidr/dualsense-tester's DualSenseColorMap.
+std::string dualsense_color_name(int cc) {
+  if (cc < 0) {
+    return "unknown";
+  }
+  const char code[3] = {static_cast<char>((cc >> 8) & 0xff),
+                        static_cast<char>(cc & 0xff), '\0'};
+  static const std::unordered_map<std::string, std::string> kColors{
+      {"00", "White"},          {"01", "Midnight Black"},
+      {"02", "Cosmic Red"},     {"03", "Nova Pink"},
+      {"04", "Galactic Purple"},{"05", "Starlight Blue"},
+      {"06", "Grey Camouflage"},{"07", "Volcanic Red"},
+      {"08", "Sterling Silver"},{"09", "Cobalt Blue"},
+      {"10", "Chroma Teal"},    {"11", "Chroma Indigo"},
+      {"12", "Chroma Pearl"},   {"30", "30th Anniversary"},
+      {"Z1", "God of War Ragnarok"}, {"Z2", "Spider-Man 2"},
+      {"Z3", "Astro Bot"},      {"Z4", "Fortnite"},
+      {"Z6", "The Last of Us"}, {"Z7", "Ghost of Yotei"},
+  };
+  const auto it = kColors.find(code);
+  return it != kColors.end() ? it->second : "unknown";
 }
 
 void run_bridge_session(const std::string &device_address,
@@ -2507,10 +2569,12 @@ void run_bridge_session(const std::string &device_address,
                  " bluetooth=" + bluetooth->description());
 
   // Read the controller color from its serial (best-effort, once, before the
-  // I/O loops start so the feature-report exchange isn't racing them).
+  // I/O loops start so the feature-report exchange isn't racing them). Also
+  // publish the model (Edge vs standard) from the resolved profile.
   if (worker_status) {
     worker_status->color_code.store(
         read_controller_color(*bluetooth, bluetooth_mutex));
+    worker_status->is_edge.store(profile == VDS_PROFILE_DSE);
   }
 
   std::thread to_bluetooth([&] {
@@ -2902,16 +2966,10 @@ std::string build_status_json(
     line += ",";
     line += vds::jsonl_bool_field("speaker_active", s.speaker_active.load());
     line += ",\"polling_hz\":" + std::to_string(s.polling_hz.load());
-    {
-      const int cc = s.color_code.load();
-      std::string color = "unknown";
-      if (cc >= 0) {
-        color.clear();
-        color.push_back(static_cast<char>((cc >> 8) & 0xff));
-        color.push_back(static_cast<char>(cc & 0xff));
-      }
-      line += "," + vds::jsonl_string_field("color", color);
-    }
+    line += "," + vds::jsonl_string_field(
+                      "color", dualsense_color_name(s.color_code.load()));
+    line += "," + vds::jsonl_string_field(
+                      "model", s.is_edge.load() ? "dualsense_edge" : "dualsense");
     line += ",\"mic_gain\":" +
             std::to_string(
                 static_cast<int>(vds::win::usbip::current_mic_capture_gain() + 0.5f));

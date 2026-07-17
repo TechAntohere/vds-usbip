@@ -49,6 +49,8 @@ public sealed record ControllerStatus
     public int PollingHz { get; init; }
     public int MicGain { get; init; } = -1;
     public bool HasInput { get; init; }
+    public string Color { get; init; } = "";
+    public bool IsEdge { get; init; }
 
     public bool Charging => ChargeStatus == 1;
     public bool ChargeComplete => ChargeStatus == 2;
@@ -126,6 +128,8 @@ internal static class Vds
                 PollingHz = GetInt("polling_hz"),
                 MicGain = GetInt("mic_gain", -1),
                 HasInput = GetBool("has_input"),
+                Color = GetStr("color"),
+                IsEdge = GetStr("model") == "dualsense_edge",
             };
         }
         catch { return null; }
