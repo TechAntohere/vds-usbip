@@ -9,13 +9,21 @@ namespace VdsTray;
 /// the dev build tree so it still works when run from the repo.</summary>
 internal static class Paths
 {
-    private const string DevBuild = @"C:\Users\Antonio\Documents\vds\build";
     private static readonly string ExeDir = AppContext.BaseDirectory;
 
+    // Installed layout: vdsd/vdsctl sit next to the tray exe. When running from a
+    // dev build tree, set VDS_BIN_DIR to the folder holding vdsd.exe / vdsctl.exe.
     private static string Tool(string name)
     {
         string local = System.IO.Path.Combine(ExeDir, name);
-        return File.Exists(local) ? local : System.IO.Path.Combine(DevBuild, name);
+        if (File.Exists(local)) return local;
+        string? devDir = Environment.GetEnvironmentVariable("VDS_BIN_DIR");
+        if (!string.IsNullOrEmpty(devDir))
+        {
+            string dev = System.IO.Path.Combine(devDir, name);
+            if (File.Exists(dev)) return dev;
+        }
+        return local;
     }
 
     public static string Vdsd => Tool("vdsd.exe");
