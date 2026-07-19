@@ -1437,6 +1437,10 @@ VirtualPort::~VirtualPort() {
 
 bool VirtualPort::usb_attached() const { return impl_->attached.load(); }
 
+const char *VirtualPort::busid() const { return kBusId; }
+
+std::uint16_t VirtualPort::tcp_port() const { return impl_->tcp_port; }
+
 std::unique_ptr<VirtualPort> open_usbip_virtual_port(std::uint32_t profile,
                                                      unsigned port_index) {
   return std::make_unique<VirtualPort>(

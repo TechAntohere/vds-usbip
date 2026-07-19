@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+﻿# SPDX-License-Identifier: MIT
 
 param(
   [string]$OutputDir = "",
@@ -178,6 +178,11 @@ function Test-VdsDriverPackageRoot {
 }
 
 function Resolve-VdsDriverPackageRoot {
+  # Legacy vds_usb.sys/vds_filter.sys drivers are now OPTIONAL. USB/IP is the
+  # permanent runtime transport (fix #6); the legacy test-signed driver
+  # package is only useful as a dev fallback. A missing/invalid driver
+  # package root now degrades to $null instead of throwing, so a USB/IP-only
+  # build no longer requires a WDK install.
   if (![string]::IsNullOrWhiteSpace($DriverPackageRoot)) {
     $Resolved = Resolve-VdsPath -Path $DriverPackageRoot
     if (!(Test-VdsDriverPackageRoot -Path $Resolved)) {
@@ -191,7 +196,8 @@ function Resolve-VdsDriverPackageRoot {
     return Resolve-VdsPath -Path $Candidate
   }
 
-  throw "driver package root was not found. Build Windows drivers first or pass -DriverPackageRoot."
+  Write-Warning "legacy driver package root not found under 'windrv' and -DriverPackageRoot was not passed. Building a USB/IP-only installer without the legacy vds_usb.sys/vds_filter.sys fallback."
+  return $null
 }
 
 function ConvertTo-RtfEscapedText {
@@ -337,31 +343,37 @@ function New-SetupPayloadHeader {
     [string]$OutputPath,
     [Parameter(Mandatory = $true)]
     [string]$MainMsiPath,
-    [Parameter(Mandatory = $true)]
     [string]$UsbMsiPath,
-    [Parameter(Mandatory = $true)]
     [string]$FilterMsiPath,
     [Parameter(Mandatory = $true)]
     [string]$DisplayVersion
   )
 
-  $Payloads = @(
-    [pscustomobject]@{
-      Symbol = "kPayloadMainMsi"
-      FileName = "vDS-setup.msi"
-      SourcePath = $MainMsiPath
-    },
-    [pscustomobject]@{
+  $Payloads = [System.Collections.Generic.List[object]]::new()
+  $Payloads.Add([pscustomobject]@{
+    Symbol = "kPayloadMainMsi"
+    FileName = "vDS-setup.msi"
+    SourcePath = $MainMsiPath
+  })
+
+  # Legacy vds_usb.sys/vds_filter.sys driver MSIs are optional now (fix: make
+  # WDK-signed legacy driver bundle non-mandatory). Only embed them if they
+  # were actually built; kVdsLegacyDriversBundled tells the native launcher
+  # whether to expect and install them at all.
+  $LegacyDriversBundled = (![string]::IsNullOrWhiteSpace($UsbMsiPath) -and (Test-Path -LiteralPath $UsbMsiPath)) -and
+                          (![string]::IsNullOrWhiteSpace($FilterMsiPath) -and (Test-Path -LiteralPath $FilterMsiPath))
+  if ($LegacyDriversBundled) {
+    $Payloads.Add([pscustomobject]@{
       Symbol = "kPayloadUsbMsi"
       FileName = "vDS-usb-setup.msi"
       SourcePath = $UsbMsiPath
-    },
-    [pscustomobject]@{
+    })
+    $Payloads.Add([pscustomobject]@{
       Symbol = "kPayloadFilterMsi"
       FileName = "vDS-filter-setup.msi"
       SourcePath = $FilterMsiPath
-    }
-  )
+    })
+  }
 
   $Builder = [System.Text.StringBuilder]::new()
   [void]$Builder.AppendLine("#pragma once")
@@ -371,6 +383,7 @@ function New-SetupPayloadHeader {
   [void]$Builder.AppendLine()
   $EscapedDisplayVersion = $DisplayVersion.Replace("\", "\\").Replace('"', '\"')
   [void]$Builder.AppendLine("inline constexpr const wchar_t *kVdsSetupVersion = L`"$EscapedDisplayVersion`";")
+  [void]$Builder.AppendLine("inline constexpr bool kVdsLegacyDriversBundled = $(if ($LegacyDriversBundled) { "true" } else { "false" });")
   [void]$Builder.AppendLine()
   [void]$Builder.AppendLine("struct VdsSetupPayload {")
   [void]$Builder.AppendLine("  const wchar_t *file_name;")
@@ -603,11 +616,22 @@ $ResolvedWix = Resolve-Wix
 $ResolvedToolsDir = Resolve-VdsToolsDir
 $ResolvedDriverPackageRoot = Resolve-VdsDriverPackageRoot
 $ResolvedTrayDir = Resolve-VdsTrayDir
-# USB/IP backend (optional). Both installers must be provided to enable it.
-$ResolvedUsbipInstaller = if (![string]::IsNullOrWhiteSpace($UsbipInstaller)) { Resolve-VdsPath -Path $UsbipInstaller } else { "" }
-$ResolvedHidHideInstaller = if (![string]::IsNullOrWhiteSpace($HidHideInstaller)) { Resolve-VdsPath -Path $HidHideInstaller } else { "" }
+# USB/IP + HidHide is the permanent transport for this installer -- no
+# longer optional. A build without both paths used to silently produce a
+# legacy-only MSI (no usbip-win2, no HidHide, no working transport at all
+# for a fresh user) instead of failing loudly, which was the actual root
+# cause behind "fresh install does not work for any user". Fail the build
+# instead of shipping that silently-broken installer.
+if ([string]::IsNullOrWhiteSpace($UsbipInstaller) -or [string]::IsNullOrWhiteSpace($HidHideInstaller)) {
+  throw "UsbipInstaller and HidHideInstaller are both required: USB/IP is the " + `
+        "permanent transport for this build and the installer no longer " + `
+        "supports shipping without the usbip-win2 + HidHide bundle. Pass " + `
+        "-UsbipInstaller <path> -HidHideInstaller <path>."
+}
+$ResolvedUsbipInstaller = Resolve-VdsPath -Path $UsbipInstaller
+$ResolvedHidHideInstaller = Resolve-VdsPath -Path $HidHideInstaller
 $HidHideSetupPath = Join-Path $RepoRoot "hidhide_setup.ps1"
-$UsbipBackend = (![string]::IsNullOrWhiteSpace($ResolvedUsbipInstaller)) -and (![string]::IsNullOrWhiteSpace($ResolvedHidHideInstaller))
+$UsbipBackend = $true
 
 $PackageFileNameArgs = @{
   Name = "vDSSetup"
@@ -657,30 +681,41 @@ Build-NativeDll `
   -SourcePath $SetupActionsSource `
   -OutputPath $SetupActionsPath
 
-Invoke-WixBuild `
-  -Arguments @(
-  (Join-Path $WixDir "DriverUsb.wxs"),
-  "-arch", $Arch,
-  "-d", "VdsVersion=$ResolvedVersion",
-  "-d", "DriverPackageRoot=$ResolvedDriverPackageRoot",
-  "-d", "WindrvDir=$(Join-Path $RepoRoot "windrv")",
-  "-d", "DriverScriptRunner=$DriverScriptRunnerPath",
-  "-d", "RootDeviceInstaller=$RootDeviceInstallerPath",
-  "-out", $UsbMsiPath
-) `
-  -FailureMessage "wix USB driver MSI build failed"
+# Legacy vds_usb.sys/vds_filter.sys MSIs are only built when a signed driver
+# package root is actually available. USB/IP is the permanent transport
+# (fix #6), so these are a dev-only fallback now, not a hard requirement --
+# this is what lets a USB/IP-only build skip needing WDK installed at all.
+$LegacyDriversAvailable = ![string]::IsNullOrWhiteSpace($ResolvedDriverPackageRoot)
+if ($LegacyDriversAvailable) {
+  Invoke-WixBuild `
+    -Arguments @(
+    (Join-Path $WixDir "DriverUsb.wxs"),
+    "-arch", $Arch,
+    "-d", "VdsVersion=$ResolvedVersion",
+    "-d", "DriverPackageRoot=$ResolvedDriverPackageRoot",
+    "-d", "WindrvDir=$(Join-Path $RepoRoot "windrv")",
+    "-d", "DriverScriptRunner=$DriverScriptRunnerPath",
+    "-d", "RootDeviceInstaller=$RootDeviceInstallerPath",
+    "-out", $UsbMsiPath
+  ) `
+    -FailureMessage "wix USB driver MSI build failed"
 
-Invoke-WixBuild `
-  -Arguments @(
-  (Join-Path $WixDir "DriverFilter.wxs"),
-  "-arch", $Arch,
-  "-d", "VdsVersion=$ResolvedVersion",
-  "-d", "DriverPackageRoot=$ResolvedDriverPackageRoot",
-  "-d", "WindrvDir=$(Join-Path $RepoRoot "windrv")",
-  "-d", "DriverScriptRunner=$DriverScriptRunnerPath",
-  "-out", $FilterMsiPath
-) `
-  -FailureMessage "wix filter driver MSI build failed"
+  Invoke-WixBuild `
+    -Arguments @(
+    (Join-Path $WixDir "DriverFilter.wxs"),
+    "-arch", $Arch,
+    "-d", "VdsVersion=$ResolvedVersion",
+    "-d", "DriverPackageRoot=$ResolvedDriverPackageRoot",
+    "-d", "WindrvDir=$(Join-Path $RepoRoot "windrv")",
+    "-d", "DriverScriptRunner=$DriverScriptRunnerPath",
+    "-out", $FilterMsiPath
+  ) `
+    -FailureMessage "wix filter driver MSI build failed"
+} else {
+  Write-Warning "skipping legacy vds_usb.sys/vds_filter.sys MSI build -- no driver package root available. This setup.exe will be USB/IP-only."
+  $UsbMsiPath = $null
+  $FilterMsiPath = $null
+}
 
 $MainMsiArguments = [System.Collections.Generic.List[string]]::new()
 $MainMsiArguments.Add((Join-Path $WixDir "Product.wxs"))

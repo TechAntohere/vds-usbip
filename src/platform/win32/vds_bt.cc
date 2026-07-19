@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -345,6 +346,12 @@ Frame make_bluetooth_frame(std::uint16_t type,
   return frame;
 }
 
+// Forward declaration: re-resolves the current Windows Bluetooth HID
+// interface path for an address. Used by HidBluetoothTransport to recover
+// from transient BT re-enumeration (see reopen_input_handle()) without
+// tearing down the whole bridge session.
+std::string find_hid_bluetooth_device_path(const std::string &address);
+
 class HidBluetoothTransport final : public BluetoothTransport {
 public:
   HidBluetoothTransport(std::string path, std::string match_label)
@@ -593,7 +600,47 @@ private:
     return frame;
   }
 
+  // Reads one input frame, transparently recovering from a transient BT HID
+  // disconnect/re-enumeration (common with DualSense over Bluetooth) by
+  // re-resolving the device path via match_label_ (the BT address) and
+  // reopening the handle, instead of letting the exception kill the whole
+  // bridge session. Falls through to a real throw only if reconnect itself
+  // repeatedly fails.
   Frame read_input_frame() {
+    constexpr int kMaxReconnectAttempts = 5;
+    constexpr DWORD kReconnectBackoffMs = 150;
+    for (int attempt = 0;; ++attempt) {
+      try {
+        return read_input_frame_once();
+      } catch (const std::exception &error) {
+        if (attempt >= kMaxReconnectAttempts || !reopen_input_handle()) {
+          throw;
+        }
+        Sleep(kReconnectBackoffMs);
+      }
+    }
+  }
+
+  // Re-resolves match_label_ (the BT address) to a fresh HID interface path
+  // and reopens the input handle. Returns false (leaving the old handle
+  // untouched) if the device cannot currently be found/opened, so the
+  // caller can retry rather than crash.
+  bool reopen_input_handle() {
+    try {
+      std::string new_path = find_hid_bluetooth_device_path(match_label_);
+      UniqueHandle new_handle = open_hid_device(new_path, true);
+      if (!new_handle) {
+        return false;
+      }
+      path_ = std::move(new_path);
+      handle_ = std::move(new_handle);
+      return true;
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  Frame read_input_frame_once() {
     UniqueHandle event(CreateEventA(nullptr, TRUE, FALSE, nullptr));
     if (!event) {
       throw std::runtime_error("failed to create HID read event: " +
@@ -1038,22 +1085,34 @@ extract_bluetooth_address_from_hid_path(const std::string &path) {
 std::optional<std::string>
 extract_bluetooth_address_from_devinst(DEVINST devinst) {
   DEVINST current = devinst;
+  // BUG FIX: only "&c&<12hex>" was recognized, but some BT stacks (e.g.
+  // VM/passthrough Bluetooth radios) expose the address as "dev_<12hex>"
+  // on the parent BTHENUM node instead, e.g.
+  //   BTHENUM\DEV_A0FA9C39053E\8&11883DF9&0&BLUETOOTHDEVICE_A0FA9C39053E
+  // Note "&0&" immediately precedes "bluetoothdevice_<addr>" in that same
+  // string, NOT the address itself -- a prior attempt at this fix added
+  // "&0&" as a marker, which does NOT actually match this device (the 12
+  // chars after "&0&" there are "bluetoothdev", not hex). The real fix is
+  // matching "dev_" directly. Keeping "&0&" too in case some other stack
+  // genuinely uses it, but "dev_" is what fixes the VM/passthrough case.
+  static constexpr std::string_view markers[] = {"&c&", "&0&", "dev_"};
   for (int depth = 0; depth < 6; ++depth) {
     char id_buffer[MAX_DEVICE_ID_LEN]{};
     if (CM_Get_Device_IDA(current, id_buffer, MAX_DEVICE_ID_LEN, 0) ==
         CR_SUCCESS) {
       const std::string id_lower = lowercase_ascii(id_buffer);
-      constexpr std::string_view marker = "&c&";
-      auto pos = id_lower.find(marker);
-      while (pos != std::string::npos) {
-        const auto candidate_pos = pos + marker.size();
-        if (candidate_pos + 12 <= id_lower.size()) {
-          const std::string candidate = id_lower.substr(candidate_pos, 12);
-          if (is_compact_bluetooth_address(candidate)) {
-            return candidate;
+      for (const auto &marker : markers) {
+        auto pos = id_lower.find(marker);
+        while (pos != std::string::npos) {
+          const auto candidate_pos = pos + marker.size();
+          if (candidate_pos + 12 <= id_lower.size()) {
+            const std::string candidate = id_lower.substr(candidate_pos, 12);
+            if (is_compact_bluetooth_address(candidate)) {
+              return candidate;
+            }
           }
+          pos = id_lower.find(marker, pos + marker.size());
         }
-        pos = id_lower.find(marker, pos + marker.size());
       }
     }
 
@@ -1096,7 +1155,7 @@ UniqueHandle open_filter_control_handle(DWORD desired_access = GENERIC_READ,
 // (that required vds_filter's exclusive-access tracking; a HidHide-based
 // equivalent is still unwritten), so `access_restricted` is left false and
 // callers must not gate on it for this source.
-std::vector<HidBluetoothDevice> list_hid_bluetooth_devices() {
+std::vector<HidBluetoothDevice> list_hid_bluetooth_devices(Logger *logger) {
   std::vector<HidBluetoothDevice> devices;
 
   GUID hid_guid{};
@@ -1166,6 +1225,16 @@ std::vector<HidBluetoothDevice> list_hid_bluetooth_devices() {
       address = extract_bluetooth_address_from_devinst(devinfo_data.DevInst);
     }
     if (!address) {
+      // BUG FIX: this used to fall through silently -- a HID Bluetooth
+      // device that passed every other filter (VID/PID, usage page,
+      // service UUID) could vanish here with zero trace, which is exactly
+      // what made the DEV_<12hex> address-extraction bug so slow to find.
+      if (logger != nullptr) {
+        logger->log(LogScope::Bluetooth, LogLevel::Warn,
+                    "HID Bluetooth device found but address could not be "
+                    "extracted, skipping path=" +
+                        device_path);
+      }
       continue;
     }
     // Extraction yields a compact 12-hex address; the rest of vds (config

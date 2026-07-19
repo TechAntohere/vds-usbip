@@ -608,13 +608,14 @@ find_connected_bluetooth_device(const std::string &address,
 
 std::optional<HidBluetoothDevice>
 find_connected_bluetooth_device(const std::string &address,
-                                std::string *failure_reason = nullptr) {
+                                std::string *failure_reason = nullptr,
+                                vds::Logger *logger = nullptr) {
   try {
     // vds_filter.sys is optional: fall back to plain-HID discovery when
     // it is not loaded, consistent with list_windows_controller_targets().
     const std::vector<HidBluetoothDevice> devices =
         filter_provider_available() ? list_filter_bluetooth_devices()
-                                    : list_hid_bluetooth_devices();
+                                    : list_hid_bluetooth_devices(logger);
     return find_connected_bluetooth_device(address, devices, failure_reason);
   } catch (const std::exception &error) {
     if (failure_reason != nullptr) {
@@ -624,14 +625,15 @@ find_connected_bluetooth_device(const std::string &address,
   }
 }
 
-std::vector<vds::ControllerTarget> list_windows_controller_targets() {
+std::vector<vds::ControllerTarget>
+list_windows_controller_targets(vds::Logger *logger = nullptr) {
   std::vector<vds::ControllerTarget> targets;
   // vds_filter.sys is optional now: fall back to plain-HID discovery when
   // it isn't loaded, so a controller can be found/configured without any
   // custom kernel driver at all.
   const std::vector<HidBluetoothDevice> discovered =
       filter_provider_available() ? list_filter_bluetooth_devices()
-                                  : list_hid_bluetooth_devices();
+                                  : list_hid_bluetooth_devices(logger);
   for (const auto &device : discovered) {
     if (!device.profile_valid || device.address.empty()) {
       continue;
@@ -845,7 +847,7 @@ std::uint32_t resolve_virtual_port_profile(const vds::ControllerConfig &config,
 
   std::string discovery_error;
   const auto device =
-      find_connected_bluetooth_device(config.address, &discovery_error);
+      find_connected_bluetooth_device(config.address, &discovery_error, &logger);
   if (!device) {
     if (discovery_error.empty()) {
       discovery_error = "no matching filter device";
@@ -2372,10 +2374,19 @@ void bluetooth_to_virtual_loop(BluetoothTransport &bluetooth,
 }
 
 bool usbip_transport_enabled() {
-  char buffer[8]{};
+  // USB/IP is the permanent transport for this installer/build -- the
+  // legacy vds_usb.sys/vds_filter.sys kernel-driver path (which needed
+  // test-signing) is intentionally left unreachable here, not deleted.
+  // VDS_TRANSPORT can still force legacy mode for local dev/debugging of
+  // that old path, but no env-var value can turn USB/IP off in a normal
+  // install.
+  char buffer[16]{};
   const DWORD length =
       GetEnvironmentVariableA("VDS_TRANSPORT", buffer, sizeof(buffer));
-  return length > 0 && std::string_view(buffer, length) == "usbip";
+  if (length > 0 && std::string_view(buffer, length) == "legacy_dev_only") {
+    return false;
+  }
+  return true;
 }
 
 // Read the DualSense controller color from its serial number via the
@@ -2490,6 +2501,221 @@ std::string dualsense_color_name(int cc) {
   return it != kColors.end() ? it->second : "unknown";
 }
 
+// Resolves the path to the bundled usbip-win2 CLI. Installer always places
+// it at "%ProgramFiles%\USBip\usbip.exe" (see installer/vds.iss,
+// UsbipMissing()); allow VDS_USBIP_EXE to override for dev/test builds
+// that run it from a non-standard location.
+std::string resolve_usbip_exe_path() {
+  if (const char *override_path = std::getenv("VDS_USBIP_EXE")) {
+    return override_path;
+  }
+  char program_files[MAX_PATH]{};
+  const DWORD len = GetEnvironmentVariableA("ProgramFiles", program_files,
+                                           sizeof(program_files));
+  const std::string base =
+      (len > 0 && len < sizeof(program_files)) ? program_files
+                                               : "C:\\Program Files";
+  return base + "\\USBip\\usbip.exe";
+}
+
+// Fix for #3: previously HidHide was only configured once, at MSI install
+// time (see Product.wxs ca_config_hidhide), which runs before any
+// controller has ever been attached via "vdsctl attach" -- so the
+// device-hiding step in hidhide_setup.ps1 found nothing to hide, and
+// nothing ever re-ran it afterward. This resolves + (re-)runs the same,
+// already-fixed script here, at actual controller enrollment time, so a
+// freshly attached BT DualSense gets whitelisted/hidden/cloaked without a
+// manual step. Idempotent (same guarantee as the script itself); guarded
+// below so it only actually shells out once per daemon process lifetime
+// rather than on every reconnect of an already-configured controller.
+std::string resolve_hidhide_setup_script_path() {
+  if (const char *override_path = std::getenv("VDS_HIDHIDE_SETUP_PS1")) {
+    return override_path;
+  }
+  char module_path[MAX_PATH]{};
+  const DWORD len =
+      GetModuleFileNameA(nullptr, module_path, sizeof(module_path));
+  if (len == 0 || len >= sizeof(module_path)) {
+    return "";
+  }
+  std::string dir(module_path, len);
+  const auto slash = dir.find_last_of('\\');
+  if (slash == std::string::npos) {
+    return "";
+  }
+  return dir.substr(0, slash) + "\\hidhide_setup.ps1";
+}
+
+void ensure_hidhide_configured(vds::Logger &logger) {
+  static std::once_flag hidhide_once_flag;
+  std::call_once(hidhide_once_flag, [&logger] {
+    const std::string script_path = resolve_hidhide_setup_script_path();
+    if (script_path.empty() ||
+        GetFileAttributesA(script_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+      logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
+                 "hidhide setup skipped: script not found at " +
+                     (script_path.empty() ? std::string("(unresolved)")
+                                           : script_path) +
+                     " -- run hidhide_setup.ps1 manually if devices are "
+                     "not cloaked correctly");
+      return;
+    }
+
+    std::string command_line =
+        "powershell.exe -ExecutionPolicy Bypass -File \"" + script_path +
+        "\"";
+
+    STARTUPINFOA startup_info{};
+    startup_info.cb = sizeof(startup_info);
+    PROCESS_INFORMATION process_info{};
+
+    std::vector<char> mutable_command_line(command_line.begin(),
+                                            command_line.end());
+    mutable_command_line.push_back('\0');
+
+    const BOOL created = CreateProcessA(
+        nullptr, mutable_command_line.data(), nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &startup_info, &process_info);
+
+    if (!created) {
+      logger.log(vds::LogScope::Daemon, vds::LogLevel::Error,
+                 "hidhide setup failed to launch script=" + script_path +
+                     " error=" + std::to_string(GetLastError()));
+      return;
+    }
+
+    CloseHandle(process_info.hThread);
+    constexpr DWORD kHidHideSetupTimeoutMs = 15000;
+    const DWORD wait_result =
+        WaitForSingleObject(process_info.hProcess, kHidHideSetupTimeoutMs);
+    DWORD exit_code = 0;
+    if (wait_result == WAIT_OBJECT_0 &&
+        GetExitCodeProcess(process_info.hProcess, &exit_code) &&
+        exit_code == 0) {
+      logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
+                 "hidhide setup completed script=" + script_path);
+    } else if (wait_result == WAIT_TIMEOUT) {
+      logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
+                 "hidhide setup did not complete within " +
+                     std::to_string(kHidHideSetupTimeoutMs / 1000) +
+                     "s script=" + script_path);
+    } else {
+      logger.log(vds::LogScope::Daemon, vds::LogLevel::Error,
+                 "hidhide setup exited non-zero exit_code=" +
+                     std::to_string(exit_code) + " script=" + script_path);
+    }
+    CloseHandle(process_info.hProcess);
+  });
+}
+
+
+// Launches `usbip attach -r 127.0.0.1 -b <busid>` detached (no console
+// window, no wait). usbip-win2's own attach command already retries
+// automatically on failure (per its --once flag description, retry is the
+// default), so a single fire-and-forget launch is enough to eventually
+// consume the export -- this just makes sure the launch actually happens,
+// which nothing did before this fix. Returns false only if the process
+// itself could not be created (e.g. usbip.exe missing).
+bool launch_usbip_client_attach(const std::string &usbip_exe_path,
+                                const std::string &busid,
+                                vds::Logger &logger) {
+  std::string command_line = "\"" + usbip_exe_path + "\" attach -r 127.0.0.1 -b " +
+                             busid;
+
+  STARTUPINFOA startup_info{};
+  startup_info.cb = sizeof(startup_info);
+  PROCESS_INFORMATION process_info{};
+
+  // CreateProcessA can write into the command line buffer; it needs a
+  // mutable char*, not a literal/const std::string::c_str().
+  std::vector<char> mutable_command_line(command_line.begin(),
+                                         command_line.end());
+  mutable_command_line.push_back('\0');
+
+  const BOOL created = CreateProcessA(
+      nullptr, mutable_command_line.data(), nullptr, nullptr, FALSE,
+      CREATE_NO_WINDOW, nullptr, nullptr, &startup_info, &process_info);
+
+  if (!created) {
+    logger.log(vds::LogScope::Daemon, vds::LogLevel::Error,
+               "usbip client attach failed to launch path=" + usbip_exe_path +
+                   " error=" + std::to_string(GetLastError()));
+    return false;
+  }
+
+  CloseHandle(process_info.hThread);
+  CloseHandle(process_info.hProcess);
+  return true;
+}
+
+// Ensures the local USB/IP client (usbip-win2) has actually imported this
+// port's export, since nothing does this automatically otherwise (vdsd only
+// starts the *server* side -- see vds_usbip.hh). Spawns the attach attempt
+// if not already attached, then polls VirtualPort::usb_attached() for up to
+// kAttachTimeout so the log records real, measured attach latency instead
+// of the daemon just assuming it worked.
+void ensure_usbip_client_attached(vds::win::usbip::VirtualPort &usbip_port,
+                                  vds::Logger &logger) {
+  using clock = std::chrono::steady_clock;
+  constexpr auto kAttachTimeout = std::chrono::seconds(8);
+  constexpr auto kPollInterval = std::chrono::milliseconds(100);
+
+  if (usbip_port.usb_attached()) {
+    return; // already attached from a previous session on this port
+  }
+
+  if (usbip_port.tcp_port() != vds::win::usbip::kDefaultPort) {
+    // The bundled usbip.exe CLI has no way to target a non-default TCP
+    // port (no -p/--port flag, and "-r host:port" is rejected as an
+    // invalid hostname). Ports beyond the first controller cannot
+    // currently be auto-attached -- surfacing this loudly rather than
+    // silently failing.
+    logger.log(vds::LogScope::Daemon, vds::LogLevel::Error,
+               "usbip client attach skipped: port=" +
+                   std::to_string(usbip_port.tcp_port()) +
+                   " is not reachable by the bundled usbip.exe CLI "
+                   "(only the default port " +
+                   std::to_string(vds::win::usbip::kDefaultPort) +
+                   " can be attached); multi-controller USB/IP attach "
+                   "needs a CLI/driver fix upstream");
+    return;
+  }
+
+  const std::string usbip_exe_path = resolve_usbip_exe_path();
+  const std::string busid = usbip_port.busid();
+  const auto attach_started_at = clock::now();
+
+  logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
+             "usbip client attach starting busid=" + busid +
+                 " exe=" + usbip_exe_path);
+
+  if (!launch_usbip_client_attach(usbip_exe_path, busid, logger)) {
+    return;
+  }
+
+  while (clock::now() - attach_started_at < kAttachTimeout) {
+    if (usbip_port.usb_attached()) {
+      const auto elapsed_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              clock::now() - attach_started_at)
+              .count();
+      logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
+                 "usbip client attach completed busid=" + busid +
+                     " elapsed_ms=" + std::to_string(elapsed_ms));
+      return;
+    }
+    std::this_thread::sleep_for(kPollInterval);
+  }
+
+  logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
+             "usbip client attach did not complete within " +
+                 std::to_string(kAttachTimeout.count()) +
+                 "s of launching busid=" + busid +
+                 " -- device may still attach later (usbip-win2 retries "
+                 "on its own), or usbip-win2/HidHide may need a reboot "
+                 "after install (see installer NeedsRestart)");
+}
+
 void run_bridge_session(const std::string &device_address,
                         const std::string &virtual_device,
                         unsigned port_index,
@@ -2521,6 +2747,19 @@ void run_bridge_session(const std::string &device_address,
     logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
                "Windows bridge using USB/IP transport pipe=" +
                    device_handle_path);
+    // BUG FIX: previously nothing ever called the client-side `usbip
+    // attach`, so the server above would come up looking completely
+    // healthy (this log line, then normal HID/BT forwarding) while no
+    // USB device or audio endpoints ever appeared in Device Manager --
+    // the export just sat there with no local consumer. This blocks
+    // until attach succeeds or times out, so attach latency/failure is
+    // visible in the log instead of silently missing.
+    ensure_usbip_client_attached(*usbip_virtual_port, logger);
+    // Fix for #3: configure HidHide (whitelist vdsd, hide the raw BT
+    // DualSense, enable cloaking) right now, at actual controller
+    // enrollment time -- not just once at MSI install time, before any
+    // controller exists to hide (see ensure_hidhide_configured for why).
+    ensure_hidhide_configured(logger);
   } else {
     virtual_port_binding = std::make_unique<VirtualPortBindingGuard>(
         virtual_device, profile, logger);
@@ -2975,6 +3214,7 @@ std::string build_status_json(
                 static_cast<int>(vds::win::usbip::current_mic_capture_gain() + 0.5f));
     line += ",";
     line += vds::jsonl_bool_field("has_input", s.has_input.load());
+    line += "," + vds::jsonl_string_field("last_error", worker->last_error);
     line += "}\n";
     out += line;
   }
@@ -3061,7 +3301,7 @@ std::string handle_supervisor_control_command(
 
   return vds::handle_vdsd_control_command(
       command, db_path, controller_statuses, port_statuses,
-      [] { return list_windows_controller_targets(); }, trace_flags,
+      [&logger] { return list_windows_controller_targets(&logger); }, trace_flags,
       reload_requested, logger);
 }
 
@@ -3243,8 +3483,9 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
           provider_retry_required = true;
           filter_driver_version_logged = false;
           if (!filter_provider_warned) {
-            logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Error,
-                       "filter provider unavailable detail=" +
+            logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Warn,
+                       "vds_filter driver not loaded, using plain-HID "
+                       "discovery fallback (expected/optional) detail=" +
                            std::string(kWindowsFilterProviderUnavailable));
             filter_provider_warned = true;
           }
@@ -3281,7 +3522,7 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
           // custom kernel drivers. Known limitation: no exclusive-access
           // enforcement (see HidBluetoothDevice::access_restricted docs).
           try {
-            filter_snapshot.devices = list_hid_bluetooth_devices();
+            filter_snapshot.devices = list_hid_bluetooth_devices(&logger);
             filter_snapshot.generation = 1;
           } catch (const std::exception &error) {
             logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Warn,

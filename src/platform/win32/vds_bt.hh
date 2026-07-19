@@ -12,6 +12,7 @@
 #include "uapi/vds.h"
 #include "unique_handle.hh"
 #include "vds_io.hh"
+#include "vds_log.hh"
 
 namespace vds::win {
 
@@ -90,7 +91,13 @@ HidBluetoothDeviceSnapshot list_filter_bluetooth_device_snapshot();
 std::vector<HidBluetoothDevice> list_filter_bluetooth_devices();
 // Plain-HID discovery, no vds_filter.sys dependency. See definition for
 // current limitations (no exclusive-access tracking yet).
-std::vector<HidBluetoothDevice> list_hid_bluetooth_devices();
+// `logger`, if non-null, receives a WARN when a HID Bluetooth device is
+// found but its address could not be extracted (previously this failed
+// completely silently -- see extract_bluetooth_address_from_hid_path /
+// extract_bluetooth_address_from_devinst -- which cost real debugging
+// time tracking down a device that was simply being skipped).
+std::vector<HidBluetoothDevice>
+list_hid_bluetooth_devices(Logger *logger = nullptr);
 std::string describe_bluetooth_lookup(const std::string &address);
 std::unique_ptr<BluetoothTransport>
 make_filter_bluetooth_transport(const std::string &address);

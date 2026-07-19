@@ -40,7 +40,7 @@ add_custom_target(
   COMMAND
     ${CMAKE_COMMAND} -DVDS_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
     -DVDS_BUILD_INFO_HEADER=${VDS_BUILD_INFO_HEADER} -P ${VDS_BUILD_INFO_SCRIPT}
-  BYPRODUCTS ${VDS_BUILD_INFO_HEADER}
+  BYPRODUCTS ${VDS_BUILD_INFO_HEADER} ${VDS_GENERATED_DIR}/vdsd_version.rc ${VDS_GENERATED_DIR}/vdsctl_version.rc
   COMMENT "Generating vDS build info header"
   VERBATIM)
 
@@ -112,7 +112,7 @@ if(WIN32)
                      ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(vds_usbip PUBLIC vds_protocol vds_win32 ws2_32)
 
-  add_executable(vdsd src/platform/win32/vdsd.cc)
+  add_executable(vdsd src/platform/win32/vdsd.cc ${VDS_GENERATED_DIR}/vdsd_version.rc)
   add_dependencies(vdsd vds_build_info_header)
   target_include_directories(vdsd PRIVATE ${VDS_GENERATED_DIR})
   target_link_libraries(
@@ -129,7 +129,7 @@ if(WIN32)
             vdsd_common
             winmm)
 
-  add_executable(vdsctl src/platform/win32/vdsctl.cc)
+  add_executable(vdsctl src/platform/win32/vdsctl.cc ${VDS_GENERATED_DIR}/vdsctl_version.rc)
   add_dependencies(vdsctl vds_build_info_header)
   target_include_directories(vdsctl PRIVATE ${VDS_GENERATED_DIR}
                                             ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -139,6 +139,7 @@ if(WIN32)
             jsonl
             vds_bt
             vds_common
+            vds_log
             vds_config
             vds_io
             vds_win32

@@ -1,4 +1,4 @@
-#include <cstdint>
+﻿#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -809,20 +809,29 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     ensure_vdsd_service_registered(install_dir);
     ensure_machine_path(install_dir);
 
-    int driver_status = run_driver_msi(work_dir / L"vDS-usb-setup.msi");
-    if (!is_success_exit_code(driver_status)) {
-      show_failed_status(L"installing vds_usb.sys", driver_status);
-      std::filesystem::remove_all(work_dir);
-      append_installer_log(L"vds_usb installer failed");
-      return driver_status;
-    }
+    // Legacy vds_usb.sys/vds_filter.sys are optional now: USB/IP is the
+    // permanent runtime transport, so a build without a driver package root
+    // no longer bundles these MSIs. kVdsLegacyDriversBundled (from the
+    // generated setup_payload.hh) reflects whether build_installer.ps1 built
+    // and embedded them for this specific setup.exe.
+    if (kVdsLegacyDriversBundled) {
+      int driver_status = run_driver_msi(work_dir / L"vDS-usb-setup.msi");
+      if (!is_success_exit_code(driver_status)) {
+        show_failed_status(L"installing vds_usb.sys", driver_status);
+        std::filesystem::remove_all(work_dir);
+        append_installer_log(L"vds_usb installer failed");
+        return driver_status;
+      }
 
-    driver_status = run_driver_msi(work_dir / L"vDS-filter-setup.msi");
-    if (!is_success_exit_code(driver_status)) {
-      show_failed_status(L"installing vds_filter.sys", driver_status);
-      std::filesystem::remove_all(work_dir);
-      append_installer_log(L"vds_filter installer failed");
-      return driver_status;
+      driver_status = run_driver_msi(work_dir / L"vDS-filter-setup.msi");
+      if (!is_success_exit_code(driver_status)) {
+        show_failed_status(L"installing vds_filter.sys", driver_status);
+        std::filesystem::remove_all(work_dir);
+        append_installer_log(L"vds_filter installer failed");
+        return driver_status;
+      }
+    } else {
+      append_installer_log(L"legacy driver MSIs not bundled in this setup.exe -- skipping (USB/IP-only build)");
     }
 
     ensure_vdsd_service_registered(install_dir);

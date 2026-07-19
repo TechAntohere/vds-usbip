@@ -79,6 +79,20 @@ public:
   // driver-based transport.
   bool usb_attached() const;
 
+  // Bus id this port's server reports via OP_REQ_DEVLIST (currently a fixed
+  // "1-1" per server instance -- see vds_usbip.cc kBusId). Exposed so the
+  // caller can drive the client-side attach step (usbip attach -r <host>
+  // -b <busid>), which usbip-win2 does not perform automatically.
+  const char *busid() const;
+
+  // TCP port this port's server is actually listening on. NOTE: the
+  // bundled usbip-win2 CLI (usbip.exe attach) has no flag to target a
+  // non-default port and rejects host:port as an invalid hostname, so
+  // only port_index 0 (kDefaultPort, 3240) can currently be attached by
+  // the stock client. Exposed here so that limitation is visible/testable
+  // rather than silently wrong for port_index > 0.
+  std::uint16_t tcp_port() const;
+
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
