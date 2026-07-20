@@ -342,6 +342,8 @@ function New-SetupPayloadHeader {
     [Parameter(Mandatory = $true)]
     [string]$OutputPath,
     [Parameter(Mandatory = $true)]
+    [string]$ResourceScriptPath,
+    [Parameter(Mandatory = $true)]
     [string]$MainMsiPath,
     [string]$UsbMsiPath,
     [string]$FilterMsiPath,
@@ -349,32 +351,36 @@ function New-SetupPayloadHeader {
     [string]$DisplayVersion
   )
 
+  # Payload MSIs are embedded as Windows RCDATA resources instead of
+  # generated C++ byte-array literals. rc.exe reads each MSI file directly
+  # and copies its bytes into the .res/.exe -- this avoids ever materializing
+  # a giant intermediate text file (the previous approach turned a 90MB MSI
+  # into a >500MB C-array literal via a slow PowerShell loop, which is what
+  # burned so much disk/CPU/memory). This function only ever writes small
+  # text files (a header and an .rc script), regardless of MSI size.
   $Payloads = [System.Collections.Generic.List[object]]::new()
   $Payloads.Add([pscustomobject]@{
-    Symbol = "kPayloadMainMsi"
+    ResourceId = 101
     FileName = "vDS-setup.msi"
     SourcePath = $MainMsiPath
   })
 
-  # Legacy vds_usb.sys/vds_filter.sys driver MSIs are optional now (fix: make
-  # WDK-signed legacy driver bundle non-mandatory). Only embed them if they
-  # were actually built; kVdsLegacyDriversBundled tells the native launcher
-  # whether to expect and install them at all.
   $LegacyDriversBundled = (![string]::IsNullOrWhiteSpace($UsbMsiPath) -and (Test-Path -LiteralPath $UsbMsiPath)) -and
                           (![string]::IsNullOrWhiteSpace($FilterMsiPath) -and (Test-Path -LiteralPath $FilterMsiPath))
   if ($LegacyDriversBundled) {
     $Payloads.Add([pscustomobject]@{
-      Symbol = "kPayloadUsbMsi"
+      ResourceId = 102
       FileName = "vDS-usb-setup.msi"
       SourcePath = $UsbMsiPath
     })
     $Payloads.Add([pscustomobject]@{
-      Symbol = "kPayloadFilterMsi"
+      ResourceId = 103
       FileName = "vDS-filter-setup.msi"
       SourcePath = $FilterMsiPath
     })
   }
 
+  # --- header (tiny: just IDs and metadata, no payload bytes) ---
   $Builder = [System.Text.StringBuilder]::new()
   [void]$Builder.AppendLine("#pragma once")
   [void]$Builder.AppendLine()
@@ -385,26 +391,14 @@ function New-SetupPayloadHeader {
   [void]$Builder.AppendLine("inline constexpr const wchar_t *kVdsSetupVersion = L`"$EscapedDisplayVersion`";")
   [void]$Builder.AppendLine("inline constexpr bool kVdsLegacyDriversBundled = $(if ($LegacyDriversBundled) { "true" } else { "false" });")
   [void]$Builder.AppendLine()
-  [void]$Builder.AppendLine("struct VdsSetupPayload {")
+  [void]$Builder.AppendLine("struct VdsSetupPayloadResource {")
   [void]$Builder.AppendLine("  const wchar_t *file_name;")
-  [void]$Builder.AppendLine("  const std::uint8_t *data;")
-  [void]$Builder.AppendLine("  std::size_t size;")
+  [void]$Builder.AppendLine("  int resource_id;")
   [void]$Builder.AppendLine("};")
   [void]$Builder.AppendLine()
-
+  [void]$Builder.AppendLine("inline constexpr VdsSetupPayloadResource kVdsSetupPayloadResources[] = {")
   foreach ($Payload in $Payloads) {
-    $Bytes = [System.IO.File]::ReadAllBytes($Payload.SourcePath)
-    [void]$Builder.AppendLine("inline constexpr std::uint8_t $($Payload.Symbol)[] = {")
-    [void]$Builder.AppendLine((ConvertTo-CxxByteArray -Bytes $Bytes))
-    [void]$Builder.AppendLine("};")
-    [void]$Builder.AppendLine()
-  }
-
-  [void]$Builder.AppendLine("inline constexpr VdsSetupPayload kVdsSetupPayloads[] = {")
-  foreach ($Payload in $Payloads) {
-    [void]$Builder.AppendLine(
-      "  {L`"$($Payload.FileName)`", $($Payload.Symbol), sizeof($($Payload.Symbol))},"
-    )
+    [void]$Builder.AppendLine("  {L`"$($Payload.FileName)`", $($Payload.ResourceId)},")
   }
   [void]$Builder.AppendLine("};")
 
@@ -412,6 +406,40 @@ function New-SetupPayloadHeader {
     $OutputPath,
     $Builder.ToString(),
     [System.Text.Encoding]::ASCII)
+
+  # --- .rc script: rc.exe reads each SourcePath binary directly ---
+  $RcBuilder = [System.Text.StringBuilder]::new()
+  foreach ($Payload in $Payloads) {
+    $EscapedSourcePath = $Payload.SourcePath.Replace("\", "\\")
+    [void]$RcBuilder.AppendLine("$($Payload.ResourceId) RCDATA `"$EscapedSourcePath`"")
+  }
+
+  [System.IO.File]::WriteAllText(
+    $ResourceScriptPath,
+    $RcBuilder.ToString(),
+    [System.Text.Encoding]::ASCII)
+}
+
+function Invoke-ResourceCompiler {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$ScriptPath,
+    [Parameter(Mandatory = $true)]
+    [string]$OutputPath
+  )
+
+  $RcExe = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "rc.exe" -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -like "*x64*" } |
+    Sort-Object FullName -Descending |
+    Select-Object -First 1 -ExpandProperty FullName
+  if ([string]::IsNullOrWhiteSpace($RcExe)) {
+    throw "rc.exe (Windows SDK resource compiler) was not found"
+  }
+
+  & $RcExe /nologo /fo $OutputPath $ScriptPath
+  if ($LASTEXITCODE -ne 0) {
+    throw "resource compilation failed (rc.exe exit code $LASTEXITCODE)"
+  }
 }
 
 function New-SetupLauncherManifest {
@@ -527,6 +555,7 @@ function Build-NativeLauncher {
     [string]$OutputPath,
     [string]$IncludeDir = "",
     [string]$ManifestPath = "",
+    [string]$ResourcePath = "",
     [string[]]$LinkLibraries = @()
   )
 
@@ -546,7 +575,12 @@ function Build-NativeLauncher {
 
   $Args += @(
     "/Fe:$OutputPath",
-    $SourcePath,
+    $SourcePath
+  )
+  if (![string]::IsNullOrWhiteSpace($ResourcePath)) {
+    $Args += $ResourcePath
+  }
+  $Args += @(
     "/link",
     "Advapi32.lib",
     "Shell32.lib",
@@ -749,17 +783,22 @@ Invoke-WixBuild `
   -Arguments $MainMsiArguments.ToArray() `
   -FailureMessage "wix main MSI build failed"
 
+$SetupPayloadResourceScript = Join-Path $GeneratedDir "setup_payload.rc"
+$SetupPayloadResourceCompiled = Join-Path $GeneratedDir "setup_payload.res"
 New-SetupPayloadHeader `
   -OutputPath $SetupPayloadHeader `
+  -ResourceScriptPath $SetupPayloadResourceScript `
   -MainMsiPath $MainMsiPath `
   -UsbMsiPath $UsbMsiPath `
   -FilterMsiPath $FilterMsiPath `
   -DisplayVersion $ResolvedDisplayVersion
+Invoke-ResourceCompiler -ScriptPath $SetupPayloadResourceScript -OutputPath $SetupPayloadResourceCompiled
 New-SetupLauncherManifest -OutputPath $SetupLauncherManifest
 Build-NativeLauncher `
   -SourcePath $SetupLauncherSource `
   -OutputPath $SetupPath `
   -IncludeDir $GeneratedDir `
-  -ManifestPath $SetupLauncherManifest
+  -ManifestPath $SetupLauncherManifest `
+  -ResourcePath $SetupPayloadResourceCompiled
 
 Write-Output $SetupPath

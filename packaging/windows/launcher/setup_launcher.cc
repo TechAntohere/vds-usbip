@@ -205,14 +205,36 @@ std::filesystem::path setup_work_dir() {
 }
 
 void write_payloads(const std::filesystem::path &dir) {
-  for (const auto &payload : kVdsSetupPayloads) {
+  // Payload MSIs are embedded as Windows RCDATA resources (rc.exe copies the
+  // binary in directly at compile time) rather than as generated C++ byte-
+  // array literals. The previous approach converted each payload into a
+  // multi-hundred-MB text file via a PowerShell loop, which was slow and
+  // burned a large amount of disk/CPU/memory for no benefit -- the resource
+  // approach avoids all of that.
+  for (const auto &payload : kVdsSetupPayloadResources) {
+    HMODULE module = GetModuleHandleW(nullptr);
+    HRSRC resource_info =
+        FindResourceW(module, MAKEINTRESOURCE(payload.resource_id), RT_RCDATA);
+    if (resource_info == nullptr) {
+      throw std::runtime_error("setup payload resource not found");
+    }
+    HGLOBAL resource_handle = LoadResource(module, resource_info);
+    if (resource_handle == nullptr) {
+      throw std::runtime_error("failed to load setup payload resource");
+    }
+    const void *data = LockResource(resource_handle);
+    const DWORD size = SizeofResource(module, resource_info);
+    if (data == nullptr || size == 0) {
+      throw std::runtime_error("setup payload resource is empty");
+    }
+
     const std::filesystem::path path = dir / payload.file_name;
     std::ofstream stream(path, std::ios::binary);
     if (!stream) {
       throw std::runtime_error("failed to create setup payload");
     }
-    stream.write(reinterpret_cast<const char *>(payload.data),
-                 static_cast<std::streamsize>(payload.size));
+    stream.write(reinterpret_cast<const char *>(data),
+                 static_cast<std::streamsize>(size));
     if (!stream) {
       throw std::runtime_error("failed to write setup payload");
     }
